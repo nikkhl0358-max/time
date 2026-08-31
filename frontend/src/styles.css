@@ -1,0 +1,548 @@
+/* v24: multi-filter and multi-level sorting for loads */
+.load-filter-panel{margin:10px 0 14px;padding:12px;border:1px solid #d9d4c8;border-radius:10px;background:#f8f6f0}
+.load-filter-grid{display:grid;grid-template-columns:minmax(260px,1fr) minmax(260px,1fr) minmax(150px,.45fr);gap:12px}
+.load-filter-block{min-width:0}.load-filter-block>b{display:block;margin-bottom:6px}
+.load-filter-actions{display:flex;gap:5px;margin-bottom:6px}
+.load-filter-checks{max-height:180px;overflow:auto;border:1px solid #ded9ce;border-radius:7px;background:#fff;padding:6px}
+.load-filter-checks label{display:flex;align-items:center;gap:7px;padding:4px 5px;cursor:pointer;border-radius:5px}
+.load-filter-checks label:hover{background:#f2f5f8}.load-filter-checks input{width:auto;flex:0 0 auto}
+.load-sort-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;padding-top:10px;border-top:1px solid #ded9ce}
+.load-sort-level{display:flex;align-items:center;gap:5px}.load-sort-level>span{display:inline-flex;width:22px;height:22px;align-items:center;justify-content:center;border-radius:50%;background:#23466f;color:#fff;font-size:12px;font-weight:700}
+.load-sort-level select{width:auto;min-width:155px}
+@media(max-width:900px){.load-filter-grid{grid-template-columns:1fr}.load-filter-checks{max-height:130px}}
+
+/* v25: global semester rollover */
+.sidebar-new-semester{display:flex;align-items:center;gap:8px;width:calc(100% - 20px);margin:10px 10px 6px;padding:10px 12px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(255,255,255,.07);color:#fff;font:inherit;font-weight:700;cursor:pointer;text-align:left}.sidebar-new-semester:hover{background:rgba(255,255,255,.14)}
+.new-semester-modal{min-width:min(760px,82vw)}.new-semester-columns{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:14px 0}.new-semester-columns>div{border:1px solid #ddd7ca;border-radius:10px;padding:14px;background:#faf8f2}.new-semester-columns h3{margin:0 0 8px}.new-semester-columns ul{margin:0;padding-left:20px;line-height:1.55}.new-semester-check{display:flex;gap:10px;align-items:flex-start;border:1px solid #d8d2c5;border-radius:10px;padding:12px;margin:12px 0;cursor:pointer}.new-semester-check input{margin-top:3px}.new-semester-check span{display:flex;flex-direction:column;gap:3px}.new-semester-check small{color:#6b7280}.notice.warning{background:#fff7df;border-color:#ead49b;color:#6b5517}.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}@media(max-width:760px){.new-semester-columns{grid-template-columns:1fr}.new-semester-modal{min-width:0}}
+
+/* v27: отчёт импорта и массовое удаление нагрузки */
+.import-report { margin: 10px 0 14px; padding: 12px 14px; border: 1px solid #d9dee7; border-radius: 10px; background: #f8fafc; }
+.import-report.has-errors { border-color: #e5b7b7; }
+.import-report-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.import-report-summary { margin-top: 4px; font-size: 13px; color: #53606f; }
+.import-report-actions { display: flex; gap: 6px; align-items: center; flex: 0 0 auto; }
+.import-report-details { margin-top: 10px; padding-top: 10px; border-top: 1px solid #dfe4ea; max-height: 430px; overflow: auto; font-size: 13px; }
+.import-report-details > div + div { margin-top: 14px; }
+.import-report-details ol { margin: 7px 0 0 20px; padding: 0; }
+.import-report-details li { margin: 3px 0; overflow-wrap: anywhere; }
+.import-help { margin-top: 5px; color: #687586; line-height: 1.4; }
+.row-selected > td { background: rgba(44, 108, 180, 0.07); }
+.import-report-time { color: #8a95a3; white-space: nowrap; }
+
+
+/* v28: compact loads filters */
+.load-toolbar-card{margin:10px 0 14px;padding:12px;border:1px solid #d9dee7;border-radius:12px;background:#fff;box-shadow:0 1px 2px rgba(16,24,40,.03)}
+.load-toolbar-main{display:grid;grid-template-columns:minmax(260px,1.5fr) minmax(190px,.9fr) minmax(170px,.75fr) minmax(190px,.85fr) minmax(135px,.55fr) auto auto;gap:8px;align-items:stretch}
+.load-main-search{width:100%!important;min-width:0!important}.load-filter-select{width:100%;min-width:0}
+.mf-select{position:relative;min-width:0}.mf-select>summary{list-style:none;display:flex;align-items:center;gap:7px;height:100%;min-height:36px;padding:6px 9px;border:1px solid #cfd6df;border-radius:7px;background:#fff;cursor:pointer;user-select:none}.mf-select>summary::-webkit-details-marker{display:none}.mf-select>summary:after{content:"⌄";margin-left:auto;color:#667085;font-size:13px}.mf-select[open]>summary{border-color:#8da8c8;box-shadow:0 0 0 2px rgba(35,70,111,.08)}.mf-select>summary.active{background:#f5f8fc;border-color:#9db2cc}.mf-label{font-size:11px;text-transform:uppercase;letter-spacing:.035em;color:#667085;flex:0 0 auto}.mf-value{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:#1f2937}.mf-count{display:inline-flex;min-width:20px;height:20px;padding:0 5px;align-items:center;justify-content:center;border-radius:10px;background:#23466f;color:#fff;font-size:11px;font-weight:700}.mf-popover{position:absolute;z-index:80;top:calc(100% + 5px);left:0;width:min(360px,80vw);padding:9px;border:1px solid #cfd6df;border-radius:9px;background:#fff;box-shadow:0 10px 28px rgba(15,23,42,.15)}.mf-select.compact .mf-popover{width:220px}.mf-search{width:100%;margin-bottom:7px}.mf-actions{display:flex;gap:5px;margin-bottom:7px}.mf-options{max-height:260px;overflow:auto;border-top:1px solid #eef1f4;padding-top:5px}.mf-options label{display:flex;align-items:center;gap:8px;padding:6px 7px;border-radius:6px;cursor:pointer;font-size:13px}.mf-options label:hover,.mf-options label.selected{background:#f4f7fb}.mf-options input{width:auto;flex:0 0 auto}
+.load-toolbar-meta{display:flex;align-items:center;gap:10px;min-height:30px;margin-top:8px;padding-top:8px;border-top:1px solid #edf0f3}.load-active-filters{display:flex;flex-wrap:wrap;gap:5px}.load-active-filters>span{display:inline-flex;align-items:center;gap:5px;padding:4px 7px;border-radius:14px;background:#eef4fb;color:#34506f;font-size:12px}.load-active-filters button{display:inline-flex;border:0;background:transparent;padding:0;color:inherit;cursor:pointer}
+.load-sort-panel{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin-top:8px;padding:10px;border:1px solid #e2e7ec;border-radius:9px;background:#f8fafc}.load-sort-title{display:flex;flex-direction:column;gap:2px;min-width:180px}.load-sort-title span{font-size:12px;color:#697586}.load-sort-controls{display:flex;align-items:flex-end;gap:7px;flex-wrap:wrap}.load-sort-level{display:flex;flex-direction:column;align-items:stretch;gap:3px}.load-sort-level>span{width:auto;height:auto;background:none;color:#667085;font-size:11px;font-weight:600;text-transform:uppercase}.load-sort-level select{min-width:145px}
+.load-toolbar-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid #edf0f3}.load-toolbar-spacer{flex:1 1 auto}
+@media(max-width:1250px){.load-toolbar-main{grid-template-columns:minmax(240px,1.4fr) minmax(180px,1fr) repeat(3,minmax(150px,.8fr));}.load-sort-toggle{grid-column:auto}.load-toolbar-main>.btn:last-child{grid-column:auto}}
+@media(max-width:900px){.load-toolbar-main{display:flex;flex-wrap:wrap}.load-main-search{flex:1 1 100%}.load-filter-select,.mf-select{flex:1 1 220px}.load-sort-panel{align-items:stretch;flex-direction:column}.load-sort-controls{align-items:stretch}.load-sort-level{flex:1 1 160px}.load-toolbar-meta{align-items:flex-start;flex-direction:column}.mf-popover{position:fixed;left:5vw;right:5vw;top:18vh;width:90vw;max-height:65vh}}
+
+/* v44: large, reliable remote-capability toggle in Loads */
+.remote-capability-toggle{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:7px;
+  width:100%;
+  min-width:108px;
+  min-height:36px;
+  padding:7px 10px;
+  border:1px solid #cfd6df;
+  border-radius:9px;
+  background:#fff;
+  color:#465467;
+  font:inherit;
+  font-size:12px;
+  font-weight:700;
+  line-height:1.15;
+  cursor:pointer;
+  user-select:none;
+  transition:background .12s ease,border-color .12s ease,color .12s ease,box-shadow .12s ease,transform .06s ease;
+}
+.remote-capability-toggle:hover{background:#f5f8fc;border-color:#9db2cc;}
+.remote-capability-toggle:active{transform:translateY(1px);}
+.remote-capability-toggle:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(35,70,111,.14);border-color:#6f91b8;}
+.remote-capability-toggle.enabled{background:#eaf3ff;border-color:#8eb4df;color:#173f6b;}
+.remote-capability-toggle.enabled:hover{background:#deedff;border-color:#76a4d7;}
+.remote-capability-icon{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  width:18px;
+  height:18px;
+  flex:0 0 18px;
+  border-radius:50%;
+  background:#eef1f4;
+  color:#667085;
+  font-size:12px;
+  font-weight:800;
+}
+.remote-capability-toggle.enabled .remote-capability-icon{background:#23466f;color:#fff;}
+
+/* v48: exact mandatory common distance assemblies for practical loads */
+.mandatory-remote-assemblies {
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) 64px;
+  gap: 4px 6px;
+  align-items: center;
+  margin-top: 6px;
+  padding: 6px 7px;
+  border: 1px solid var(--border, #d9dee5);
+  border-radius: 7px;
+  background: rgba(255,255,255,.55);
+  font-size: 11px;
+  line-height: 1.2;
+}
+.mandatory-remote-assemblies > span { font-weight: 600; }
+.mandatory-remote-assemblies input {
+  width: 64px;
+  min-width: 64px;
+  text-align: center;
+  padding: 4px 5px;
+}
+.mandatory-remote-assemblies small {
+  grid-column: 1 / -1;
+  opacity: .72;
+  font-size: 10px;
+}
+
+/* v49: explicit subgroup work rules per load */
+.subgroup-work-links{display:flex;flex-direction:column;gap:6px;min-width:150px}
+.subgroup-link-row{display:flex;align-items:center;gap:5px;white-space:nowrap}
+.subgroup-link-label{display:inline-flex;align-items:center;justify-content:center;min-width:38px;font-size:11px;font-weight:700;color:var(--muted,#64748b)}
+.subgroup-link-row .btn{flex:1;justify-content:flex-start;min-height:30px}
+
+/* v72: weekly capacity diagnostics in Graphs */
+.week-capacity-panel{margin:12px 0 14px;padding:12px;border:1px solid var(--border,#d9dee5);border-radius:12px;background:#fff}
+.week-capacity-panel.has-overload{border-color:#e2a3a3;background:#fffafa}
+.week-capacity-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:10px}
+.capacity-status{display:inline-flex;align-items:center;border-radius:999px;padding:5px 9px;font-size:11px;font-weight:800;white-space:nowrap}
+.capacity-status.ok{background:#eaf7ee;color:#24633a}.capacity-status.overload{background:#fde8e8;color:#9b2c2c}
+.week-capacity-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:7px}
+.week-capacity-card{padding:8px 9px;border:1px solid #e4e7eb;border-radius:9px;background:#fafbfc;font-size:12px}
+.week-capacity-card.overload{border-color:#e5a0a0;background:#fff0f0}.week-capacity-title{font-weight:800;margin-bottom:3px}.week-capacity-card small{display:block;color:var(--ink-soft,#667085);margin-top:2px}.capacity-over{margin-top:4px;color:#a12929;font-weight:800;font-size:11px}
+.capacity-suggestions{margin-top:10px;padding-top:9px;border-top:1px dashed #e2c4c4}.capacity-suggestions-title{display:flex;align-items:center;gap:6px;font-weight:800;color:#8f2727;font-size:12px;margin-bottom:7px}
+.capacity-suggestion-list{display:flex;flex-wrap:wrap;gap:7px}.capacity-suggestion{display:grid;grid-template-columns:minmax(130px,1fr) auto;grid-template-areas:'subject move' 'hint hint';gap:2px 8px;text-align:left;border:1px solid #d7dce2;border-radius:8px;background:#fff;padding:7px 9px;cursor:pointer;max-width:360px}.capacity-suggestion:hover{border-color:#7f96ae;background:#f7fafc}.capacity-suggestion span{grid-area:subject;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.capacity-suggestion b{grid-area:move}.capacity-suggestion small{grid-area:hint;color:var(--ink-soft,#667085)}
+.graphs-week-summary-item.overload,.graphs-week-over-total{background:#fde8e8!important;color:#992d2d!important}.graphs-week-over-head{box-shadow:inset 0 -4px 0 #c94f4f}.graphs-week-over-head .graphs-week-hours-head{color:#ffd5d5}
+
+/* v72: drag & drop in main schedule */
+.schedule-grid td.drag-slot{outline:2px dashed #6f879f;outline-offset:-3px;background:#f5f9fc!important}.schedule-grid td.drag-slot.invalid{outline-color:#bf5151;background:#fff4f4!important}.lesson-chip.schedule-draggable{cursor:grab}.lesson-chip.schedule-draggable:active{cursor:grabbing}.lesson-chip.schedule-dragging{opacity:.4}.drag-mini-handle{font-size:10px;opacity:.55;margin-left:5px;vertical-align:1px}.drag-help{font-size:11px;color:var(--ink-soft,#667085);margin-left:4px}
+
+/* v78 — единый индикатор дефицита для автографика */
+.graph-scarcity{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:5px;font-size:11px;line-height:1.25;color:var(--muted,#64748b)}
+.graph-scarcity b{font-size:10px;text-transform:none;letter-spacing:.035em;border-radius:999px;padding:2px 6px;background:#eef2f7;color:#475569}
+.graph-scarcity-high b{background:#fee2e2;color:#991b1b}
+.graph-scarcity-medium b{background:#fef3c7;color:#92400e}
+.graph-scarcity-low b{background:#dcfce7;color:#166534}
+.graph-scarcity-vacancy b{background:#e0e7ff;color:#3730a3}
+.priority-details{margin-top:8px}
+
+/* v80 — режимы недельного лимита автографика */
+.graph-overload-mode{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.graph-overload-mode select{min-width:170px}
+.graph-overload-mode label{display:flex;align-items:center;gap:5px;font-size:12px;white-space:nowrap}
+.graph-overload-mode input[type=number]{width:58px;padding:6px 7px}
+.smart-result-mode{margin-top:7px;font-size:12px;opacity:.72}
+
+.graph-scarcity-sep{display:inline-block;margin:0 1px;color:var(--muted,#94a3b8)}
+
+/* v84: visual status of graph load rows */
+.graphs-table tbody tr.graph-load-row-done > td {
+  background: #edf8ef;
+}
+.graphs-table tbody tr.graph-load-row-partial > td {
+  background: #fff8df;
+}
+.graphs-table tbody tr.graph-load-row-over > td {
+  background: #fdecec;
+}
+.graphs-table tbody tr.graph-load-row-done:hover > td {
+  background: #e3f4e7;
+}
+.graphs-table tbody tr.graph-load-row-partial:hover > td {
+  background: #fff1c2;
+}
+.graphs-table tbody tr.graph-load-row-over:hover > td {
+  background: #f9dede;
+}
+
+/* v104 — явный трёхпозиционный выбор формата нагрузки */
+.delivery-mode-buttons{display:flex;gap:4px;flex-wrap:wrap;align-items:center}
+.delivery-mode-btn{border:1px solid #c9d2dc;background:#fff;color:#314154;border-radius:7px;padding:5px 8px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap}
+.delivery-mode-btn:hover{background:#f4f7fa;border-color:#9fb0c3}
+.delivery-mode-btn.active{background:#e5f0ff;border-color:#7aa4d2;color:#173f6b;box-shadow:inset 0 0 0 1px rgba(35,70,111,.08)}
+
+/* v105 */
+.delivery-mode-buttons{display:flex;gap:5px;flex-wrap:wrap}
+.delivery-mode-btn{opacity:.62;transition:.15s ease}
+.delivery-mode-btn.active{opacity:1!important;background:#1e4f82!important;border-color:#1e4f82!important;color:#fff!important;box-shadow:0 0 0 3px rgba(30,79,130,.15)!important;font-weight:800!important;transform:translateY(-1px)}
+.delivery-mode-btn.active::before{content:"✓ ";font-weight:900}
+.room-list-badge{max-width:180px;white-space:normal;line-height:1.25}
+
+/* v108: recurring slot moves */
+.cand-move-range{margin-top:4px;font-size:11px;color:#64748b;font-weight:600}
+.sync-info-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 18px 0;padding:10px 13px;border:1px solid #9fc4e8;border-radius:9px;background:#eef7ff;color:#244a70;font-size:13px}.sync-info-banner b{color:#173b61}
+.half-pair-badge{display:inline-flex;padding:1px 5px;border-radius:999px;background:#efe7ff;color:#6342a0;font-size:10px;font-weight:700;margin-left:4px}
+
+/* v110 — явное отображение половины пары */
+.graph-cell-units {
+  margin-top: 3px;
+  font-size: 9px;
+  line-height: 1.15;
+  color: #64748b;
+  white-space: nowrap;
+}
+.graph-cell-units.half {
+  color: #7c3aed;
+  font-weight: 700;
+}
+.schedule-grid td.cell.has-half-pair {
+  position: relative;
+  min-height: 86px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  background-image: linear-gradient(to bottom, transparent calc(50% - .5px), rgba(100,116,139,.25) calc(50% - .5px), rgba(100,116,139,.25) calc(50% + .5px), transparent calc(50% + .5px));
+}
+.schedule-grid td.cell.has-half-pair .half-pair-chip {
+  box-sizing: border-box;
+  min-height: 38px;
+  margin: 1px 2px;
+  border-left-width: 3px;
+}
+.schedule-grid td.cell.has-half-pair .half-pair-chip.half-0 {
+  align-self: flex-start;
+}
+.schedule-grid td.cell.has-half-pair .half-pair-chip.half-1 {
+  align-self: flex-end;
+}
+.schedule-grid td.cell.has-half-pair .half-pair-badge {
+  display: inline-flex;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 800;
+  background: #ede9fe;
+  color: #6d28d9;
+  vertical-align: middle;
+}
+.schedule-grid td.cell.has-half-pair .half-pair-chip {
+  display: block;
+  width: calc(100% - 4px);
+  height: calc(50% - 3px);
+  min-height: 36px;
+  overflow: hidden;
+}
+.schedule-grid td.cell.has-half-pair .half-pair-chip.half-0 { margin-bottom: 3px; }
+.schedule-grid td.cell.has-half-pair .half-pair-chip.half-1 { margin-top: 3px; }
+.schedule-grid td.cell.has-half-pair .half-pair-chip {
+  display: block;
+  width: calc(100% - 4px);
+  height: calc(50% - 3px);
+  min-height: 36px;
+  overflow: hidden;
+}
+.schedule-grid td.cell.has-half-pair .half-pair-chip.half-0 { margin-bottom: 3px; }
+.schedule-grid td.cell.has-half-pair .half-pair-chip.half-1 { margin-top: 3px; }
+.schedule-grid td.cell.half-pair-partial::after {
+  content: "½ пары свободно";
+  display: block;
+  margin: 3px 4px 1px;
+  padding: 2px 4px;
+  border: 1px dashed rgba(109,40,217,.35);
+  border-radius: 5px;
+  color: #7c3aed;
+  font-size: 8.5px;
+  font-weight: 700;
+  text-align: center;
+  background: rgba(237,233,254,.45);
+  pointer-events: none;
+}
+
+/* v114: persistent graph-row locks */
+.graphs-table tbody tr.graph-row-locked > td {
+  box-shadow: inset 0 0 0 1px rgba(146, 98, 20, .18);
+  background-image: linear-gradient(rgba(255, 248, 224, .62), rgba(255, 248, 224, .62));
+}
+.graphs-table tbody tr.graph-row-locked .graphs-input:disabled {
+  opacity: .78;
+  cursor: not-allowed;
+  font-weight: 700;
+}
+.graph-lock-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 7px;
+  border-radius: 7px;
+  background: #fff4cf;
+  border: 1px solid #e7c85d;
+  color: #745512;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* v1474 — два стабильных представления «Все недели» */
+.parity-schedule-pair{display:flex;flex-direction:column;gap:22px;margin-top:10px}
+.parity-schedule-section{border:1px solid var(--line,#d8d2c6);border-radius:12px;background:#fff;overflow:hidden}
+.parity-schedule-title{display:flex;align-items:center;gap:10px;padding:10px 14px;background:#eef3f8;color:#203b5d;border-bottom:1px solid var(--line,#d8d2c6)}
+.parity-schedule-title b{font-size:14px}.parity-schedule-title span{font-size:11px;opacity:.7}
+.parity-grid-wrap{overflow-x:auto;margin:0!important;border:0!important;border-radius:0!important}
+.parity-schedule-grid{table-layout:fixed!important;width:100%!important;min-width:1100px}
+.parity-schedule-grid .time-col,.parity-schedule-grid .time-cell{width:82px;min-width:82px;max-width:82px}
+.parity-schedule-grid th:not(.time-col),.parity-schedule-grid td:not(.time-cell){width:auto!important;min-width:0!important}
+.parity-schedule-grid .time-cell{vertical-align:middle;text-align:center;background:#f5f2ea}.parity-schedule-grid .time-cell span{display:block;font-size:10px;color:#667085;margin-top:4px}
+.parity-schedule-grid td.cell{vertical-align:top;height:88px;padding:5px;box-sizing:border-box}
+.parity-lesson-chip{cursor:pointer}
+.inspect-body-detailed{min-width:min(620px,82vw)}
+.inspect-title-block{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;padding-bottom:10px;border-bottom:1px solid var(--line,#ddd)}
+.inspect-badges{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.inspect-badge{font-size:11px;padding:4px 7px;border-radius:999px;background:#eef2f6;color:#344054}.inspect-badge.remote{background:#e7f2ff;color:#175cd3}.inspect-badge.locked{background:#fff4d6;color:#8a5a00}
+.inspect-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.inspect-grid>div{display:flex;flex-direction:column;gap:3px;padding:9px 10px;border:1px solid var(--line,#ddd);border-radius:9px;background:#fafafa}.inspect-grid span{font-size:10px;color:#667085;text-transform:uppercase;letter-spacing:.03em}.inspect-grid b{font-size:13px;color:#1f2937;font-weight:600}.inspect-note{padding:8px 10px;background:#f7f9fb;border-radius:8px;font-size:12px}.inspect-actions{flex-wrap:wrap}
+@media(max-width:760px){.inspect-grid{grid-template-columns:1fr}.inspect-title-block{flex-direction:column}.inspect-badges{justify-content:flex-start}}
+
+/* v1534: participants of a remote stream are editable directly in the current group's graph. */
+.graph-stream-peer-values{display:flex;flex-direction:column;gap:3px;margin-top:5px;min-width:76px}
+.graph-stream-peer-edit{display:flex;align-items:center;justify-content:space-between;gap:5px;padding:2px 4px;border-radius:6px;background:rgba(255,255,255,.72);font-size:9px;line-height:1.1;white-space:nowrap}
+.graph-stream-peer-edit>span{max-width:78px;overflow:hidden;text-overflow:ellipsis}
+.graph-stream-peer-edit input{width:42px;min-width:42px;padding:2px 3px;border:1px solid var(--border,#d9dee5);border-radius:5px;background:#fff;font-size:10px;text-align:center}
+.graph-stream-peer-edit.is-locked,.graph-stream-peer-edit.is-practice{opacity:.62}
+.graph-stream-peer-edit input:disabled{cursor:not-allowed;background:#f3f4f6}
+
+/* v1535: ДО-поток в графиках только сверяется. Соседние значения никогда не перезаписываются из текущей строки. */
+.graph-stream-peer-edit.is-readonly input{pointer-events:none;background:#f6f7f9;color:var(--ink,#1f2937)}
+.graph-stream-peer-edit.is-conflict{background:#fff1f0;border:1px solid #ef9a92;color:#9f1d17;font-weight:700}
+.graph-stream-peer-edit.is-conflict input{background:#fff7f6;border-color:#ef9a92;color:#9f1d17}
+
+/* v1536: компактная сверка ДО-потока. Чужие значения — бейджи, не вторые поля ввода. */
+.graph-stream-compare{display:inline-flex;align-items:center;gap:5px;margin-top:4px;padding:2px 6px;border:1px solid #bdd8cf;border-radius:999px;background:#eef8f4;color:#315f52;font-size:9px;line-height:1.2;max-width:100%;white-space:nowrap}
+.graph-stream-compare b{font-size:9px;font-weight:800;overflow:hidden;text-overflow:ellipsis}
+.graph-stream-compare.has-mismatch{border-color:#e6bd62;background:#fff8df;color:#8a5a00}
+.graph-stream-peer-values{display:flex;flex-wrap:wrap;justify-content:center;gap:2px;margin-top:3px;min-width:0;max-width:86px}
+.graph-stream-peer-chip{display:block;max-width:84px;padding:1px 3px;border-radius:4px;background:rgba(255,255,255,.62);color:#6b7280;font-size:8px;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.graph-stream-peer-chip.is-conflict{background:#fff0ed;color:#a42d24;font-weight:700;outline:1px solid rgba(213,90,76,.35)}
+.graph-stream-peer-chip.is-locked,.graph-stream-peer-chip.is-practice{opacity:.62}
+.graphs-cell.graph-stream-mismatch-cell{box-shadow:inset 0 0 0 1.5px rgba(213,90,76,.55)}
+
+/* v1537: компактный выбор приоритета сверки ДО-потока */
+.graph-stream-compare {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 2px 4px;
+  margin-top: 3px;
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 1.15;
+}
+.graph-stream-mode-select {
+  width: auto;
+  max-width: 94px;
+  height: 22px;
+  min-height: 22px;
+  padding: 0 18px 0 5px;
+  border: 1px solid rgba(30, 64, 175, .20);
+  border-radius: 5px;
+  background: rgba(255,255,255,.78);
+  font-size: 10px;
+  line-height: 20px;
+}
+.graph-stream-peer-values {
+  margin-top: 1px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+}
+.graph-stream-peer-chip {
+  padding: 0 3px;
+  border-radius: 4px;
+  font-size: 8px;
+  line-height: 13px;
+  white-space: nowrap;
+}
+
+/* v1539: only compact relationship labels inside weekly graph cells; no peer values, comparison or highlighting. */
+.graph-cell-links{display:flex;flex-direction:column;align-items:center;gap:0;margin-top:0;max-width:72px;font-size:6.5px;line-height:.95;color:#7a8791;pointer-events:none}
+.graph-cell-links span{display:block;max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.graph-cell-link-own{font-weight:600;color:#64748b}
+.graph-cell-link-remote{color:#5f7f91}
+
+/* v1540: ДО-поток показывает справочно значения связанных строк именно этой недели. Без автопереноса и подсветки. */
+.graph-cell-link-remote-list{display:flex;flex-direction:column;align-items:center;gap:0;max-width:72px}
+.graph-cell-link-remote{display:block;max-width:72px;padding:0;color:#5f7f91;font-size:6.5px;line-height:.95;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* v1543: weekly linked-hours info uses the exact same typography as .graphs-meta
+   (teacher/type/subgroup line under the subject). Only cell layout is constrained here. */
+.graphs-table .graph-cell-links.graphs-meta{
+  display:block!important;
+  margin-top:1px!important;
+  max-width:54px!important;
+  overflow:hidden!important;
+  white-space:nowrap!important;
+  text-overflow:ellipsis!important;
+  opacity:1!important;
+  pointer-events:none;
+}
+.graphs-table .graph-cell-links.graphs-meta span{
+  display:inline!important;
+  max-width:none!important;
+  overflow:visible!important;
+  white-space:nowrap!important;
+  text-overflow:clip!important;
+  color:inherit!important;
+  font:inherit!important;
+}
+.graphs-table .graph-cell-links.graphs-meta span + span::before{content:" · ";}
+/* v1554: mixed bells + clear substitution states */
+.bell-preset-card.mixed{background:#fff7e6;border-color:#e2b86e}.bell-preset-card.mixed:hover{border-color:#c89235}
+.bell-mixed-editor{margin-top:12px;padding:12px;border:1px solid #ded7c8;border-radius:10px;background:#fffdf8}.bell-mixed-table{display:grid;gap:0;border:1px solid #e2ddd1;border-radius:8px;overflow:hidden}.bell-mixed-head,.bell-mixed-row{display:grid;grid-template-columns:70px 48px minmax(120px,1fr) minmax(120px,1fr) 150px;align-items:center;gap:8px;padding:7px 9px}.bell-mixed-head{background:#f3efe7;font-size:11px;font-weight:700}.bell-mixed-row{border-top:1px solid #ece7dd;font-size:11.5px}.bell-mixed-row select{min-width:130px}
+.bell-preset-chip.mixed{background:#fff0cd;color:#775614;border-color:#e4c578}
+.sub-row.change-old-row td{background:#fff1f1!important;color:#933;text-decoration:line-through;text-decoration-thickness:1px}.sub-row.change-old-row td:last-child{text-decoration:none}.sub-row.change-new-row td{background:#fff8d9!important}.sub-row.change-new-row td:last-child{box-shadow:inset 4px 0 0 #e0ad20}
+.lesson-chip.cancelled-chip,.lesson-chip.moved-away-chip{background:#fbe8e8!important;color:#a52d2d!important;border-left:4px solid #c94a4a!important;text-decoration:line-through;text-decoration-thickness:1px}.lesson-chip.cancelled-chip .sub-badge,.lesson-chip.moved-away-chip .sub-badge{text-decoration:none}
+.lesson-chip.substituted{background:#fff4c7!important;border-left-color:#e0ad20!important}.lesson-chip.substituted .lesson-meta{color:#6e5717!important}.public-event.substituted,.public-event.moved{background:#fff4c7!important;border-left:4px solid #e0ad20!important}.public-event.cancelled{background:#fbe8e8!important;color:#9d3131!important;text-decoration:line-through;text-decoration-thickness:1px;border-left:4px solid #c94a4a!important}.public-event.cancelled .sub-badge{display:inline-block;text-decoration:none}.public-event.cancelled.cancelled-gap-highlight{background:#fbe8e8!important;color:#9d3131!important;border-left:4px solid #c94a4a!important}
+.sub-badge.replacement{background:#d49b13}.sub-badge.assignment{background:#8d5d24}.sub-badge.remote-change{background:#4e9d7c}.sub-badge.cancel{background:#c94a4a}.sub-badge.moved{background:#d49b13!important}
+@media(max-width:850px){.bell-mixed-head,.bell-mixed-row{grid-template-columns:52px 40px 1fr 1fr}.bell-mixed-head span:last-child,.bell-mixed-row select{grid-column:1/-1}.bell-mixed-row select{width:100%}}
+/* v1557 — отдельные звонки для нечётных/чётных недель */
+.bell-parity-tabs{display:flex;gap:6px;margin:10px 0 6px;padding:4px;background:#f4f1ea;border:1px solid #e2ddd2;border-radius:10px;width:max-content;max-width:100%}
+.bell-parity-tab{appearance:none;border:1px solid transparent;background:transparent;border-radius:7px;padding:7px 12px;font-size:12px;font-weight:650;color:#526071;cursor:pointer;white-space:nowrap}
+.bell-parity-tab:hover{background:#fff;border-color:#ddd7ca}
+.bell-parity-tab.active{background:#244e7e;border-color:#244e7e;color:#fff;box-shadow:0 1px 2px rgba(24,48,78,.15)}
+.bell-parity-hint{margin:0 0 10px;padding:8px 10px;border-left:3px solid #88a8c8;background:#f5f9fd;border-radius:0 7px 7px 0;font-size:11.5px;color:#526071}
+.bell-preset-chip small{font-size:10px;font-weight:700;color:#9a5c20}
+@media(max-width:700px){.bell-parity-tabs{width:100%;overflow:auto}.bell-parity-tab{flex:1}.bell-parity-hint{font-size:11px}}
+.bell-parity-hint{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.bell-parity-reset{border:0;background:transparent;color:#37658f;font-size:11px;font-weight:700;cursor:pointer;white-space:nowrap;padding:3px 0}
+.bell-parity-reset:hover{text-decoration:underline}.bell-parity-reset:disabled{opacity:.45;cursor:default;text-decoration:none}
+
+/* v1558 — редактор звонков прокручивается целиком даже на невысоком экране. */
+.bell-preset-modal{
+  max-height:calc(100dvh - 28px)!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+}
+@supports not (height: 100dvh){
+  .bell-preset-modal{max-height:calc(100vh - 28px)!important;}
+}
+
+/* v1559 — реальная прокрутка тела модалки звонков: заголовок фиксирован, содержимое листается. */
+.bell-preset-modal{
+  height:min(760px,calc(100dvh - 28px))!important;
+  max-height:calc(100dvh - 28px)!important;
+  overflow:hidden!important;
+  display:flex!important;
+  flex-direction:column!important;
+  min-height:0!important;
+}
+.bell-preset-modal>.modal-title-row{flex:0 0 auto!important;}
+.bell-preset-modal>.bell-multi-grid{
+  flex:1 1 auto!important;
+  min-height:0!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+  padding-right:4px;
+}
+@supports not (height: 100dvh){
+  .bell-preset-modal{height:min(760px,calc(100vh - 28px))!important;max-height:calc(100vh - 28px)!important;}
+}
+
+/* v1560: clearer current bells summary by base / odd / even */
+.bell-existing-summary{display:flex;flex-direction:column;gap:7px;margin:10px 0;padding:10px;background:#f7f8fa;border:1px solid #e2e6eb;border-radius:10px}
+.bell-existing-title{font-size:12px;font-weight:750;color:#344356}
+.bell-existing-row{display:grid;grid-template-columns:132px minmax(0,1fr);gap:8px;align-items:start;padding:6px;border:1px solid transparent;border-radius:8px}
+.bell-existing-row.active{background:#eef5fc;border-color:#b9d0e7}
+.bell-existing-scope{font-size:11.5px;font-weight:700;color:#526071;padding-top:5px}
+.bell-existing-chips{display:flex;flex-wrap:wrap;gap:5px}
+.bell-preset-chip.inherited{opacity:.72;border-style:dashed}
+.bell-preset-chip small{font-size:9.5px;font-weight:600}
+@media(max-width:760px){.bell-existing-row{grid-template-columns:1fr}.bell-existing-scope{padding-top:0}}
+
+/* v1560: clear base vs odd/even bell editor */
+.bell-mode-switch{display:flex;gap:6px;margin:10px 0 8px;padding:4px;background:#f4f1ea;border:1px solid #e2ddd2;border-radius:10px;width:max-content;max-width:100%}
+.bell-mode-btn{appearance:none;border:1px solid transparent;background:transparent;border-radius:7px;padding:8px 13px;font-size:12px;font-weight:700;color:#526071;cursor:pointer}
+.bell-mode-btn.active{background:#244e7e;border-color:#244e7e;color:#fff;box-shadow:0 1px 2px rgba(24,48,78,.15)}
+.bell-current-box{margin:0 0 10px;padding:10px;border:1px solid #dfe5ec;border-radius:9px;background:#f8fafc}
+.bell-current-box.compact{margin-bottom:9px;background:#fff}
+.bell-current-heading{font-size:11px;font-weight:800;color:#526071;margin-bottom:7px;text-transform:uppercase;letter-spacing:.02em}
+.bell-current-list{display:flex;flex-wrap:wrap;gap:6px}
+.bell-parity-columns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+.bell-parity-column{min-width:0;padding:10px;border:1px solid #d8dee8;border-radius:10px;background:#fafbfd}
+.bell-parity-column-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.bell-preset-actions.parity{grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}
+.bell-preset-actions.parity .bell-preset-card{min-height:58px;padding:9px}
+.bell-preset-actions.parity .bell-preset-card b{font-size:11.5px}
+@media(max-width:900px){.bell-parity-columns{grid-template-columns:1fr}.bell-mode-switch{width:100%}.bell-mode-btn{flex:1}.bell-preset-actions.parity{grid-template-columns:1fr 1fr 1fr}}
+.bell-effective-now{margin:10px 0;padding:10px;border:1px solid #cfd9e5;border-radius:10px;background:#f6f9fc}
+.bell-effective-row{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:6px}
+.bell-effective-row>b{min-width:105px;font-size:12px;color:#2f3d4c}
+
+/* v1616 — параллельные подгруппы занимают один слот слева/справа, а не складываются вертикально. */
+.schedule-grid td.cell.multi.subgroup-split {
+  flex-direction: row;
+  align-items: stretch;
+  gap: 5px;
+}
+.schedule-grid td.cell.multi.subgroup-split > .lesson-chip {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  margin: 0;
+}
+.schedule-grid td.cell.multi.subgroup-split > .group-custom-bell-time,
+.schedule-grid td.cell.multi.subgroup-split > .shortened-cell-time {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  z-index: 3;
+}
+.schedule-grid td.cell.multi.subgroup-split > .group-custom-bell-time ~ .lesson-chip,
+.schedule-grid td.cell.multi.subgroup-split > .shortened-cell-time ~ .lesson-chip {
+  margin-top: 24px;
+}
+
+/* v1657: presence по группам в админке расписания */
+.schedule-presence-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:8px 0 10px;padding:9px 12px;border:1px solid #d8dde6;border-radius:10px;background:#f7f9fc;font-size:13px}.schedule-presence-chip{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;background:#eef2f7;border:1px solid #d7dee8}.schedule-presence-chip.same-group{font-weight:700;background:#fff2cf;border-color:#e5bd58}
+
+/* v1679: public publication state */
+.public-publication-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.2;
+  border: 1px solid transparent;
+}
+.public-publication-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: 0 0 9px;
+  background: currentColor;
+}
+.public-publication-status.published {
+  color: #16723a;
+  background: #e9f8ef;
+  border-color: #b9e7c9;
+}
+.public-publication-status.changed {
+  color: #8a6500;
+  background: #fff7d6;
+  border-color: #eddc8b;
+}
+.public-publication-status.unpublished {
+  color: #a32a2a;
+  background: #fff0f0;
+  border-color: #efc1c1;
+}
