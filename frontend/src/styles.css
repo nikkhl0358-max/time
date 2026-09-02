@@ -546,3 +546,15 @@
   background: #fff0f0;
   border-color: #efc1c1;
 }
+
+/* v1716: explicit public refresh + cache-safe public contour */
+.public-status-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:7px; }
+.public-status-row .public-publication-status { margin-top:0; }
+.public-refresh-btn {
+  appearance:none; border:1px solid rgba(255,255,255,.45); background:rgba(255,255,255,.10); color:#fff;
+  border-radius:8px; padding:6px 10px; font:inherit; font-size:12px; font-weight:700; cursor:pointer;
+  transition:background .15s ease,border-color .15s ease;
+}
+.public-refresh-btn:hover { background:rgba(255,255,255,.20); border-color:rgba(255,255,255,.7); }
+.public-refresh-btn:active { transform:translateY(1px); }
+@media (max-width:640px) { .public-refresh-btn { width:100%; text-align:center; } }

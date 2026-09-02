@@ -10,6 +10,7 @@ import gzip
 import hashlib
 import tempfile
 import select
+import sqlite3
 from collections import OrderedDict
 from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, Response
@@ -17,11 +18,15 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 # В контейнере путь задаётся явно через DATA_DIR=/data. Локально без переменной
 # сохраняем данные рядом с приложением.
 DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if "AMVERA" in os.environ else os.path.join(os.path.dirname(__file__), "data"))
-DATA_FILE = os.path.join(DATA_DIR, "storage.json")
+LEGACY_DATA_FILE = os.path.join(DATA_DIR, "storage.json")
+SQLITE_PATH = os.environ.get("SQLITE_PATH") or os.path.join(DATA_DIR, "raspisanie.db")
+# Compatibility alias for old diagnostics/comments. SQLite is canonical from v1711.
+DATA_FILE = LEGACY_DATA_FILE
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
-MAX_BACKUPS = 50
+MAX_BACKUPS = int(os.environ.get("MAX_BACKUPS", "30"))
 
 _lock = threading.Lock()
+_sqlite_init_lock = threading.Lock()
 _presence_lock = threading.Lock()
 _presence = {}  # session_id -> user info + last_seen
 PRESENCE_TTL_SECONDS = 75
@@ -1023,33 +1028,206 @@ def _schedule_options_cache_put(key, value):
 
 
 
+def _sqlite_connect():
+    """Open the canonical SQLite store with safe settings for one-container deployment."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(SQLITE_PATH) or ".", exist_ok=True)
+    conn = sqlite3.connect(SQLITE_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at REAL NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS storage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    # v1712: heavy historical semester snapshots live outside the main project
+    # JSON. The editor still sees lightweight scheduleVersions metadata, while
+    # /api/storage-version loads the requested snapshot lazily from this table.
+    conn.execute("CREATE TABLE IF NOT EXISTS publication_snapshots (store_key TEXT NOT NULL, version_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, created_at REAL NOT NULL, PRIMARY KEY(store_key, version_id))")
+    conn.commit()
+    return conn
+
+
+def _project_without_embedded_snapshots(store_key, value, conn=None):
+    """Move scheduleVersions[*].snapshot to SQLite and return lightweight value.
+
+    This keeps the canonical schedule-data-v2 row small enough for frequent saves.
+    The operation is transaction-friendly: when conn is supplied, snapshot rows and
+    the project row are committed together by the caller.
+    """
+    parsed_from_string = isinstance(value, str)
+    if parsed_from_string:
+        try:
+            project = json.loads(value)
+        except Exception:
+            return value
+    else:
+        project = value
+    if not isinstance(project, dict):
+        return value
+    versions = project.get("scheduleVersions")
+    if not isinstance(versions, list):
+        return value
+    own_conn = conn is None
+    if own_conn:
+        conn = _sqlite_connect()
+        conn.execute("BEGIN IMMEDIATE")
+    changed = False
+    kept_ids = []
+    new_versions = []
+    try:
+        now = time.time()
+        for raw in versions[-40:]:
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            version_id = str(row.get("id") or "")
+            snapshot = row.pop("snapshot", None)
+            if version_id:
+                kept_ids.append(version_id)
+            if isinstance(snapshot, dict) and version_id:
+                payload = json.dumps(snapshot, ensure_ascii=False, separators=(",", ":"))
+                conn.execute(
+                    "INSERT INTO publication_snapshots(store_key,version_id,snapshot_json,created_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(store_key,version_id) DO UPDATE SET snapshot_json=excluded.snapshot_json, created_at=excluded.created_at",
+                    (str(store_key), version_id, payload, now),
+                )
+                row["hasSnapshot"] = True
+                if row.get("placed") is None:
+                    try:
+                        row["placed"] = ((snapshot.get("schedule") or {}).get("stats") or {}).get("placed")
+                    except Exception:
+                        pass
+                changed = True
+            new_versions.append(row)
+        if len(new_versions) != len(versions):
+            changed = True
+        if kept_ids:
+            placeholders = ",".join("?" for _ in kept_ids)
+            conn.execute(
+                f"DELETE FROM publication_snapshots WHERE store_key=? AND version_id NOT IN ({placeholders})",
+                (str(store_key), *kept_ids),
+            )
+        else:
+            conn.execute("DELETE FROM publication_snapshots WHERE store_key=?", (str(store_key),))
+        if changed:
+            project = dict(project)
+            project["scheduleVersions"] = new_versions
+        if own_conn:
+            conn.commit()
+    except Exception:
+        if own_conn:
+            conn.rollback()
+        raise
+    finally:
+        if own_conn:
+            conn.close()
+    if not changed:
+        return value
+    return json.dumps(project, ensure_ascii=False, separators=(",", ":")) if parsed_from_string else project
+
+
+def _load_publication_snapshot(store_key, version_id):
+    if not os.path.exists(SQLITE_PATH):
+        return None
+    conn = _sqlite_connect()
+    try:
+        row = conn.execute(
+            "SELECT snapshot_json FROM publication_snapshots WHERE store_key=? AND version_id=?",
+            (str(store_key), str(version_id)),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def _storage_exists():
+    return os.path.exists(SQLITE_PATH) or os.path.exists(LEGACY_DATA_FILE)
+
+
+def _migrate_legacy_json_to_sqlite_if_needed():
+    """One-time, non-destructive import of legacy storage.json into SQLite.
+
+    The JSON file is deliberately left in place as a rollback safety copy. Once
+    the database exists it is never re-imported, so a stale legacy file cannot
+    overwrite newer SQLite data after a restart.
+    """
+    with _sqlite_init_lock:
+        if os.path.exists(SQLITE_PATH):
+            return False
+        if not os.path.exists(LEGACY_DATA_FILE):
+            return False
+        with open(LEGACY_DATA_FILE, "r", encoding="utf-8") as f:
+            try:
+                legacy = json.load(f)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"storage.json is corrupted; SQLite migration aborted: {exc}")
+        if not isinstance(legacy, dict):
+            raise RuntimeError("storage.json has invalid root type; SQLite migration aborted")
+        conn = _sqlite_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            for key, value in legacy.items():
+                payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                conn.execute(
+                    "INSERT OR REPLACE INTO kv_store(key,value_json,updated_at) VALUES(?,?,?)",
+                    (str(key), payload, now),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO storage_meta(key,value) VALUES('migrated_from_storage_json', ?)",
+                (datetime.utcnow().isoformat(timespec="seconds") + "Z",),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            conn.close()
+            try:
+                os.remove(SQLITE_PATH)
+            except OSError:
+                pass
+            raise
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        _invalidate_store_cache()
+        return True
+
+
 def load_store():
-    if not os.path.exists(DATA_FILE):
+    _migrate_legacy_json_to_sqlite_if_needed()
+    if not os.path.exists(SQLITE_PATH):
         _invalidate_store_cache()
         return {}
-    try:
-        current_mtime = os.path.getmtime(DATA_FILE)
-    except OSError:
-        current_mtime = None
-    if current_mtime is not None and _store_cache["mtime"] == current_mtime and _store_cache["store"] is not None:
-        # Shallow copy: callers do things like `store[key] = ...` on the
-        # result and expect that not to silently corrupt what's cached until
-        # save_store() is actually called. The individual values are large
-        # JSON-encoded strings (immutable), so sharing those references
-        # across copies is safe and cheap — this avoids re-parsing megabytes
-        # of JSON for a copy that will very often just be read from.
+    # All application writes go through save_store(), which refreshes this cache.
+    # On process start the cache is empty and SQLite is read once.
+    if _store_cache.get("store") is not None:
         return dict(_store_cache["store"])
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
+    conn = _sqlite_connect()
+    try:
+        rows = conn.execute("SELECT key, value_json FROM kv_store").fetchall()
+    finally:
+        conn.close()
+    parsed = {}
+    for key, value_json in rows:
         try:
-            parsed = json.load(f)
+            parsed[key] = json.loads(value_json)
         except json.JSONDecodeError as exc:
-            # Повреждённое хранилище нельзя трактовать как пустое: иначе следующий POST
-            # мог бы затереть рабочие данные. Останавливаем запись и требуем восстановление.
-            raise RuntimeError(f"storage.json is corrupted: {exc}")
-    _store_cache["mtime"] = current_mtime
+            raise RuntimeError(f"SQLite value for {key!r} is corrupted: {exc}")
+    # v1712: migrate old embedded version snapshots lazily on the first read.
+    # This is non-destructive: snapshot bytes are inserted before the compact
+    # project value replaces the old row.
+    working = parsed.get("schedule-data-v2")
+    if isinstance(working, dict) and any(isinstance(x, dict) and isinstance(x.get("snapshot"), dict) for x in (working.get("scheduleVersions") or [])):
+        parsed = _replace_sqlite_store(parsed, durable=True)
+    _store_cache["mtime"] = None
     _store_cache["store"] = parsed
     return dict(parsed)
-
 
 def _is_valid_working_value(value):
     """Рабочее расписание не может быть null/пустой строкой/пустым объектом."""
@@ -1070,14 +1248,18 @@ def _latest_valid_backup_for_key(key):
     if not os.path.isdir(BACKUP_DIR):
         return None, None
     names = sorted(
-        (name for name in os.listdir(BACKUP_DIR) if name.startswith("storage_") and name.endswith(".json")),
+        (name for name in os.listdir(BACKUP_DIR) if name.startswith("storage_") and (name.endswith(".json") or name.endswith(".json.gz"))),
         reverse=True,
     )
     for name in names:
         path = os.path.join(BACKUP_DIR, name)
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                store = json.load(f)
+            if name.endswith(".gz"):
+                with gzip.open(path, "rt", encoding="utf-8") as f:
+                    store = json.load(f)
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    store = json.load(f)
             value = store.get(key)
             if _is_valid_working_value(value):
                 return name, store
@@ -1086,100 +1268,137 @@ def _latest_valid_backup_for_key(key):
     return None, None
 
 
-def _backup_current_store():
-    if not os.path.exists(DATA_FILE):
-        return
+def _store_with_snapshots_for_backup(store):
+    """Hydrate external publication snapshots into a portable JSON backup."""
+    out = copy.deepcopy(store)
+    value = out.get("schedule-data-v2")
+    if not isinstance(value, dict) or not isinstance(value.get("scheduleVersions"), list) or not os.path.exists(SQLITE_PATH):
+        return out
+    conn = _sqlite_connect()
+    try:
+        rows = conn.execute("SELECT version_id, snapshot_json FROM publication_snapshots WHERE store_key=?", ("schedule-data-v2",)).fetchall()
+    finally:
+        conn.close()
+    snapshots = {}
+    for version_id, payload in rows:
+        try:
+            snapshots[str(version_id)] = json.loads(payload)
+        except Exception:
+            continue
+    hydrated = []
+    for raw in value.get("scheduleVersions") or []:
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        vid = str(row.get("id") or "")
+        if not isinstance(row.get("snapshot"), dict) and vid in snapshots:
+            row["snapshot"] = snapshots[vid]
+            row["hasSnapshot"] = True
+        hydrated.append(row)
+    value = dict(value)
+    value["scheduleVersions"] = hydrated
+    out["schedule-data-v2"] = value
+    return out
+
+
+def _write_json_backup_snapshot(store=None):
+    store = load_store() if store is None else store
+    if not store:
+        return None
+    store = _store_with_snapshots_for_backup(store)
     os.makedirs(BACKUP_DIR, exist_ok=True)
     stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S_%fZ")
-    target = os.path.join(BACKUP_DIR, f"storage_{stamp}.json")
-    shutil.copy2(DATA_FILE, target)
+    target = os.path.join(BACKUP_DIR, f"storage_{stamp}.json.gz")
+    fd, tmp = tempfile.mkstemp(prefix="backup.", suffix=".tmp", dir=BACKUP_DIR)
+    try:
+        # Write gzip directly to the atomic temp file. Typical timetable JSON
+        # compresses several-fold, preventing the backup ring from filling /data.
+        with os.fdopen(fd, "wb") as raw_f:
+            with gzip.GzipFile(fileobj=raw_f, mode="wb", compresslevel=3) as gz_f:
+                gz_f.write(json.dumps(store, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            raw_f.flush()
+            os.fsync(raw_f.fileno())
+        os.replace(tmp, target)
+        tmp = None
+    finally:
+        if tmp:
+            try: os.remove(tmp)
+            except OSError: pass
     backups = sorted(
-        (os.path.join(BACKUP_DIR, name) for name in os.listdir(BACKUP_DIR) if name.startswith("storage_") and name.endswith(".json")),
-        key=os.path.getmtime,
-        reverse=True,
+        (os.path.join(BACKUP_DIR, name) for name in os.listdir(BACKUP_DIR) if name.startswith("storage_") and (name.endswith(".json") or name.endswith(".json.gz"))),
+        key=os.path.getmtime, reverse=True,
     )
     for old_path in backups[MAX_BACKUPS:]:
-        try:
-            os.remove(old_path)
-        except OSError:
-            pass
+        try: os.remove(old_path)
+        except OSError: pass
+    return target
+
+
+def _backup_current_store():
+    if not _storage_exists():
+        return
+    _write_json_backup_snapshot()
+
+
+def _replace_sqlite_store(store, durable=True):
+    """Atomically replace the logical key/value store in one SQLite transaction."""
+    conn = _sqlite_connect()
+    try:
+        conn.execute("PRAGMA synchronous=" + ("FULL" if durable else "NORMAL"))
+        conn.execute("BEGIN IMMEDIATE")
+        existing = {row[0] for row in conn.execute("SELECT key FROM kv_store")}
+        incoming = set(map(str, store.keys()))
+        for key in existing - incoming:
+            conn.execute("DELETE FROM kv_store WHERE key=?", (key,))
+        now = time.time()
+        compacted_store = {}
+        for key, value in store.items():
+            compacted_store[str(key)] = _project_without_embedded_snapshots(str(key), value, conn=conn) if str(key) == "schedule-data-v2" else value
+        for key, value in compacted_store.items():
+            payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            conn.execute(
+                "INSERT INTO kv_store(key,value_json,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
+                (str(key), payload, now),
+            )
+        conn.commit()
+        return compacted_store
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def save_store(store, backup=True, durable=True, refresh_public=True):
-    # v1634: never use one shared `/data/storage.json.tmp` filename. Even though
-    # most writers are protected by the in-process `_lock`, gunicorn restarts,
-    # overlapping processes during deploys, or a future multi-worker setup can
-    # still have two processes writing at the same time. With a shared tmp name,
-    # process A can rename the tmp file created by process B; B then reaches
-    # os.replace() and gets FileNotFoundError. Use a unique temp file in the same
-    # directory and atomically replace DATA_FILE from that unique path instead.
-    # v1609: `backup=False` is used by every frequent atomic per-edit endpoint
-    # (section/graph/schedule merge and patch) — same fix as v1576 applied to
-    # generation-progress saves, extended here. Backing up (a full file copy +
-    # backups-directory listing) on every single manual edit was holding the
-    # global storage lock far longer than the edit itself needs, which matters
-    # a lot once several people (e.g. 4 concurrent editors) are saving at
-    # once: every save queues behind the previous one's backup-copy time,
-    # widening the exact race window client-side reconciliation has to land
-    # in before being read as stale. A backup still happens for the plain
-    # whole-document save path (`set_key`) and via the explicit manual backup
-    # action — this only removes it from the hot, frequent, per-edit path.
+    # v1711: SQLite is the canonical working store. A save is a single database
+    # transaction, so readers never observe a half-written project and there is
+    # no storage.json temp-file/rename race. JSON backups remain available for
+    # human inspection and one-click restore.
     os.makedirs(DATA_DIR, exist_ok=True)
-    if backup:
+    if backup and _storage_exists():
         _backup_current_store()
-    tmp = None
-    try:
-        # Same filesystem/directory is required so os.replace stays atomic.
-        fd, tmp = tempfile.mkstemp(prefix="storage.json.", suffix=".tmp", dir=DATA_DIR)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(store, f, ensure_ascii=False, separators=(",", ":"))
-            f.flush()
-            if durable:
-                os.fsync(f.fileno())
-        os.replace(tmp, DATA_FILE)
-        tmp = None
-        # v1670: this dict is now exactly what's on disk — update the cache
-        # directly instead of leaving the next load_store() call to re-read
-        # and re-parse the file it just wrote.
-        try:
-            _store_cache["mtime"] = os.path.getmtime(DATA_FILE)
-            _store_cache["store"] = store
-        except OSError:
-            _invalidate_store_cache()
-        if durable:
-            # Persist the directory entry replacement as well when possible.
-            try:
-                dir_fd = os.open(DATA_DIR, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
-        # v1682: every editor save updates only a tiny status sidecar. Heavy
-        # public JSON/gzip is rebuilt only on publication (or first deploy).
-        try:
-            project_for_status = _public_project_from_store(store)
-            _write_public_status_sidecar(project_for_status)
-        except Exception as exc:
-            app.logger.warning("public status refresh failed: %s", exc)
-        if refresh_public:
-            try:
-                project_for_public = _public_project_from_store(store)
-                scope = str(((project_for_public or {}).get("_syncMeta") or {}).get("scope") or "")
-                heavy_missing = not (os.path.exists(PUBLIC_INDEX_FILE) and os.path.exists(PUBLIC_INDEX_META_FILE))
-                if heavy_missing or scope in {"publication", "publish-weeks"}:
-                    _refresh_public_index_from_store(store, force=True)
-                    _refresh_public_sidecar_from_store(store, force=True)
-            except Exception as exc:
-                app.logger.warning("public sidecar refresh failed: %s", exc)
-    finally:
-        if tmp:
-            try:
-                os.remove(tmp)
-            except FileNotFoundError:
-                pass
+    cached_store = _replace_sqlite_store(store, durable=durable)
+    # Cache the exact compact logical form committed to SQLite; historical
+    # snapshots stay in publication_snapshots and are fetched only on restore.
+    _store_cache["mtime"] = None
+    _store_cache["store"] = cached_store
 
+    try:
+        project_for_status = _public_project_from_store(store)
+        _write_public_status_sidecar(project_for_status)
+    except Exception as exc:
+        app.logger.warning("public status refresh failed: %s", exc)
+    if refresh_public:
+        try:
+            project_for_public = _public_project_from_store(store)
+            scope = str(((project_for_public or {}).get("_syncMeta") or {}).get("scope") or "")
+            heavy_missing = not (os.path.exists(PUBLIC_INDEX_FILE) and os.path.exists(PUBLIC_INDEX_META_FILE))
+            if heavy_missing or scope in {"publication", "publish-weeks"}:
+                _refresh_public_index_from_store(store, force=True)
+                _refresh_public_sidecar_from_store(store, force=True)
+        except Exception as exc:
+            app.logger.warning("public sidecar refresh failed: %s", exc)
 
 
 
@@ -1252,7 +1471,7 @@ def _editor_compact_project(data):
             "by": row.get("by"),
             "note": row.get("note"),
             "placed": stats.get("placed"),
-            "hasSnapshot": bool(snapshot),
+            "hasSnapshot": bool(snapshot) or row.get("hasSnapshot") is True,
         })
     out["scheduleVersions"] = compact_versions
     return out
@@ -1273,18 +1492,7 @@ def get_key(key):
             backup_name, backup_store = _latest_valid_backup_for_key(key)
             if backup_store is not None:
                 _backup_current_store()
-                save_tmp = DATA_FILE + ".restore.tmp"
-                with open(save_tmp, "w", encoding="utf-8") as f:
-                    json.dump(backup_store, f, ensure_ascii=False)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(save_tmp, DATA_FILE)
-                # v1670: written outside save_store(), keep the cache in sync.
-                try:
-                    _store_cache["mtime"] = os.path.getmtime(DATA_FILE)
-                    _store_cache["store"] = backup_store
-                except OSError:
-                    _invalidate_store_cache()
+                save_store(backup_store, backup=False, refresh_public=True)
                 return jsonify({
                     "key": key,
                     "value": backup_store[key],
@@ -1319,9 +1527,16 @@ def get_storage_version(key, version_id):
         return jsonify({"error": "invalid storage"}), 422
     for row in (data.get("scheduleVersions") or []) if isinstance(data, dict) else []:
         if isinstance(row, dict) and str(row.get("id") or "") == str(version_id):
-            if not isinstance(row.get("snapshot"), dict):
+            version = dict(row)
+            snapshot = version.get("snapshot") if isinstance(version.get("snapshot"), dict) else _load_publication_snapshot(key, version_id)
+            if not isinstance(snapshot, dict):
                 return jsonify({"error": "snapshot missing"}), 404
-            return jsonify({"ok": True, "version": row})
+            version["snapshot"] = snapshot
+            return jsonify({"ok": True, "version": version})
+    # Compatibility: snapshot row can survive briefly even if metadata was edited.
+    snapshot = _load_publication_snapshot(key, version_id)
+    if isinstance(snapshot, dict):
+        return jsonify({"ok": True, "version": {"id": version_id, "snapshot": snapshot, "hasSnapshot": True}})
     return jsonify({"error": "version not found"}), 404
 
 
@@ -1382,7 +1597,7 @@ def set_key(key):
         # storage.json. Если постоянный диск почему-то не примонтирован или файл пропал,
         # обычное автосохранение блокируется. Создание разрешается только явным действием
         # пользователя на действительно новом экземпляре.
-        if not os.path.exists(DATA_FILE) and not allow_create:
+        if not _storage_exists() and not allow_create:
             return jsonify({"error": "Хранилище отсутствует. Автосохранение заблокировано, чтобы не затереть данные после пересборки."}), 409
         store = load_store()
 
@@ -2431,7 +2646,7 @@ def storage_section_merge(key):
     if not isinstance(base, dict) or not isinstance(local, dict):
         return jsonify({"error": "Неверный формат данных страницы"}), 400
     with _lock:
-        if not os.path.exists(DATA_FILE):
+        if not _storage_exists():
             return jsonify({"error": "Хранилище отсутствует"}), 409
         store = load_store()
         raw = store.get(key)
@@ -2713,7 +2928,7 @@ def storage_graph_patch(key):
         return jsonify({"error": "Неверный формат синхронизации расписания с графиком"}), 400
     graph_fields = ("weeklyPairs", "weekPattern", "customWeeks", "graphMode", "graphLocked")
     with _lock:
-        if not os.path.exists(DATA_FILE):
+        if not _storage_exists():
             return jsonify({"error": "Хранилище отсутствует"}), 409
         store = load_store()
         raw = store.get(key)
@@ -2786,7 +3001,7 @@ def storage_graph_merge(key):
     if not isinstance(base, dict) or not isinstance(local, dict):
         return jsonify({"error": "Неверный формат данных графика"}), 400
     with _lock:
-        if not os.path.exists(DATA_FILE):
+        if not _storage_exists():
             return jsonify({"error": "Хранилище отсутствует"}), 409
         store = load_store()
         raw = store.get(key)
@@ -2901,7 +3116,7 @@ def _schedule_patch_batch_loop():
             successful = []
             try:
                 with _lock:
-                    if not os.path.exists(DATA_FILE):
+                    if not _storage_exists():
                         raise FileNotFoundError("Хранилище отсутствует")
                     store = load_store()
                     raw = store.get(storage_key)
@@ -3117,7 +3332,7 @@ def storage_publication_commit(key):
         return jsonify({"error": "Неверный формат публикации"}), 400
 
     with _lock:
-        if not os.path.exists(DATA_FILE):
+        if not _storage_exists():
             return jsonify({"error": "Хранилище отсутствует"}), 409
         store = load_store()
         raw = store.get(key)
@@ -3203,7 +3418,7 @@ def storage_publish_weeks(key):
         return jsonify({"error": "Неверный список недель"}), 400
 
     with _lock:
-        if not os.path.exists(DATA_FILE):
+        if not _storage_exists():
             return jsonify({"error": "Хранилище отсутствует"}), 409
         store = load_store()
         raw = store.get(key)
@@ -3289,7 +3504,7 @@ def storage_schedule_group_merge(key):
         return jsonify({"error": "Неверный формат данных расписания группы"}), 400
 
     with _lock:
-        if not os.path.exists(DATA_FILE):
+        if not _storage_exists():
             return jsonify({"error": "Хранилище отсутствует"}), 409
         store = load_store()
         raw = store.get(key)
@@ -3463,7 +3678,7 @@ def storage_schedule_merge(key):
         return jsonify({"error": "Неверный формат данных расписания"}), 400
     _protect_manual_schedule_ids(_manual_schedule_touched_ids(base.get("schedule"), local.get("schedule")))
     with _lock:
-        if not os.path.exists(DATA_FILE):
+        if not _storage_exists():
             return jsonify({"error": "Хранилище отсутствует"}), 409
         store = load_store()
         raw = store.get(key)
@@ -3532,16 +3747,20 @@ def storage_backups():
         return jsonify({"backups": []})
     items = []
     for name in sorted(os.listdir(BACKUP_DIR), reverse=True):
-        if not (name.startswith("storage_") and name.endswith(".json")):
+        if not (name.startswith("storage_") and (name.endswith(".json") or name.endswith(".json.gz"))):
             continue
         path = os.path.join(BACKUP_DIR, name)
         try:
             valid = False
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    backup_store = json.load(f)
+                if name.endswith(".gz"):
+                    with gzip.open(path, "rt", encoding="utf-8") as f:
+                        backup_store = json.load(f)
+                else:
+                    with open(path, "r", encoding="utf-8") as f:
+                        backup_store = json.load(f)
                 valid = _is_valid_working_value(backup_store.get("schedule-data-v2"))
-            except (OSError, json.JSONDecodeError, TypeError):
+            except (OSError, json.JSONDecodeError, TypeError, EOFError):
                 valid = False
             items.append({"name": name, "size": os.path.getsize(path), "modified": os.path.getmtime(path), "valid": valid})
         except OSError:
@@ -3555,41 +3774,49 @@ def storage_backup_download(name):
     # but is still restricted to a canonical admin user and storage_*.json files.
     if _request_admin_user() is None:
         return jsonify({"error": "admin authorization required"}), 403
-    if "/" in name or "\\" in name or not name.startswith("storage_") or not name.endswith(".json"):
+    if "/" in name or "\\" in name or not name.startswith("storage_") or not (name.endswith(".json") or name.endswith(".json.gz")):
         return jsonify({"error": "invalid backup name"}), 400
     path = os.path.join(BACKUP_DIR, name)
     if not os.path.isfile(path):
         return jsonify({"error": "not found"}), 404
     try:
         # Refuse to download a truncated/corrupt JSON backup by mistake.
-        with open(path, "r", encoding="utf-8") as f:
-            candidate = json.load(f)
+        if name.endswith(".gz"):
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                candidate = json.load(f)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                candidate = json.load(f)
         if not _is_valid_working_value(candidate.get("schedule-data-v2")):
             return jsonify({"error": "backup does not contain valid working data"}), 422
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, EOFError) as exc:
         return jsonify({"error": f"backup is invalid: {exc}"}), 422
-    return send_from_directory(BACKUP_DIR, name, as_attachment=True, download_name=name, mimetype="application/json")
+    mimetype = "application/gzip" if name.endswith(".gz") else "application/json"
+    return send_from_directory(BACKUP_DIR, name, as_attachment=True, download_name=name, mimetype=mimetype)
 
 
 @app.post("/api/storage-backups/<name>/restore")
 def storage_backup_restore(name):
-    if "/" in name or "\\" in name or not name.startswith("storage_") or not name.endswith(".json"):
+    if "/" in name or "\\" in name or not name.startswith("storage_") or not (name.endswith(".json") or name.endswith(".json.gz")):
         return jsonify({"error": "invalid backup name"}), 400
     path = os.path.join(BACKUP_DIR, name)
     if not os.path.exists(path):
         return jsonify({"error": "not found"}), 404
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            candidate = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
+        if name.endswith(".gz"):
+            with gzip.open(path, "rt", encoding="utf-8") as f:
+                candidate = json.load(f)
+        else:
+            with open(path, "r", encoding="utf-8") as f:
+                candidate = json.load(f)
+    except (OSError, json.JSONDecodeError, EOFError) as exc:
         return jsonify({"error": f"backup is invalid: {exc}"}), 422
     if not _is_valid_working_value(candidate.get("schedule-data-v2")):
         return jsonify({"error": "backup does not contain valid working data"}), 422
     with _lock:
         _backup_current_store()
-        shutil.copy2(path, DATA_FILE)
-        _invalidate_store_cache()  # v1670: written outside save_store(), cache would otherwise go stale.
-    return jsonify({"ok": True, "restored": name})
+        save_store(candidate, backup=False, refresh_public=True)
+    return jsonify({"ok": True, "restored": name, "storage": "sqlite"})
 
 
 # v1681: hashed Vite assets are immutable. With many public/admin users, let
@@ -3606,7 +3833,46 @@ def _performance_cache_headers(response):
 
 @app.get("/healthz")
 def healthz():
-    return jsonify({"ok": True})
+    ready = _storage_exists()
+    sqlite_ok = False
+    sqlite_bytes = 0
+    snapshot_count = 0
+    error = ""
+    try:
+        if os.path.exists(SQLITE_PATH):
+            conn = _sqlite_connect()
+            try:
+                conn.execute("SELECT 1").fetchone()
+                snapshot_count = int(conn.execute("SELECT COUNT(*) FROM publication_snapshots").fetchone()[0])
+                sqlite_ok = True
+            finally:
+                conn.close()
+            sqlite_bytes = os.path.getsize(SQLITE_PATH)
+    except Exception as exc:
+        error = str(exc)
+    backup_count = 0
+    backup_bytes = 0
+    try:
+        if os.path.isdir(BACKUP_DIR):
+            backup_files = [os.path.join(BACKUP_DIR, n) for n in os.listdir(BACKUP_DIR) if n.startswith("storage_") and (n.endswith(".json") or n.endswith(".json.gz"))]
+            backup_count = len(backup_files)
+            backup_bytes = sum(os.path.getsize(x) for x in backup_files if os.path.isfile(x))
+    except Exception:
+        pass
+    try:
+        disk = shutil.disk_usage(DATA_DIR)
+        disk_free = disk.free
+    except Exception:
+        disk_free = None
+    return jsonify({
+        "ok": bool(ready and (sqlite_ok or os.path.exists(LEGACY_DATA_FILE))),
+        "storage": "sqlite", "sqlitePath": SQLITE_PATH, "storageReady": ready,
+        "sqliteOk": sqlite_ok, "sqliteBytes": sqlite_bytes,
+        "publicationSnapshots": snapshot_count,
+        "backupCount": backup_count, "backupBytes": backup_bytes,
+        "dataDir": DATA_DIR, "dataDirWritable": os.access(DATA_DIR, os.W_OK),
+        "diskFreeBytes": disk_free, "error": error,
+    })
 
 
 # v1663: SPA navigation must survive a hard refresh / browser Back/Forward.

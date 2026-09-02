@@ -5189,6 +5189,168 @@ function TeachersTable({ teachers, setTeachers, depOptions, employmentTypes, set
     ])
   );
 
+  const exportTeacherAvailability = () => {
+    const activeDayIndices = (config.activeDays || []).map((on, i) => (on ? i : null)).filter((v) => v !== null);
+    const periods = Math.max(1, Number(config.periodsPerDay || 0));
+    const sortedTeachers = teachers
+      .filter((t) => (t.name || "").trim())
+      .slice()
+      .sort((a, b) => (a.name || "").localeCompare(b.name || "", "ru", { sensitivity: "base" }));
+    if (!sortedTeachers.length) {
+      alert("Нет преподавателей для выгрузки.");
+      return;
+    }
+
+    const wb = XLSX.utils.book_new();
+    const defaultPeriodTimes = ["8:30–10:00", "10:10–11:40", "11:50–13:20", "14:00–15:30", "15:40–17:10", "17:20–18:50", "19:00–20:30"];
+    const periodTime = (p) => String(config.periodTimes?.[p] || defaultPeriodTimes[p] || "").trim();
+
+    const thinBorder = {
+      top: { style: "thin", color: { rgb: "C9C9C9" } },
+      bottom: { style: "thin", color: { rgb: "C9C9C9" } },
+      left: { style: "thin", color: { rgb: "C9C9C9" } },
+      right: { style: "thin", color: { rgb: "C9C9C9" } },
+    };
+    const styles = {
+      teacher: {
+        font: { name: "Calibri", sz: 14, bold: false, color: { rgb: "222222" } },
+        alignment: { vertical: "center", horizontal: "left" },
+      },
+      corner: {
+        font: { name: "Times New Roman", sz: 14, bold: true, color: { rgb: "2F75B5" } },
+        alignment: { vertical: "center", horizontal: "left", wrapText: true },
+      },
+      period: {
+        font: { name: "Calibri", sz: 11, bold: false, color: { rgb: "111111" } },
+        alignment: { vertical: "center", horizontal: "center", wrapText: true },
+      },
+      day: {
+        font: { name: "Times New Roman", sz: 11, bold: true, color: { rgb: "111111" } },
+        fill: { fgColor: { rgb: "F2F2F2" } },
+        alignment: { vertical: "center", horizontal: "left" },
+        border: thinBorder,
+      },
+      free: {
+        font: { name: "Calibri", sz: 11, color: { rgb: "222222" } },
+        alignment: { horizontal: "center", vertical: "center" },
+        border: thinBorder,
+      },
+      blocked: {
+        font: { name: "Arial", sz: 18, bold: false, color: { rgb: "D44734" } },
+        fill: { fgColor: { rgb: "FCE1E1" } },
+        alignment: { horizontal: "center", vertical: "center" },
+        border: thinBorder,
+      },
+      legend: {
+        font: { name: "Calibri", sz: 11, color: { rgb: "222222" } },
+        alignment: { vertical: "center", horizontal: "left" },
+      },
+    };
+
+    const buildParitySheet = (parity) => {
+      const aoa = [];
+      const rowKinds = [];
+      const merges = [];
+      const blocks = [];
+      let r = 0;
+
+      sortedTeachers.forEach((t) => {
+        const unavailable = t.availabilityByParity
+          ? (parity === "even" ? (t.unavailableEven || []) : (t.unavailableOdd || []))
+          : (t.unavailable || []);
+        const blockStart = r;
+
+        aoa.push([]); rowKinds.push("spacerTop"); r += 1;
+        aoa.push([t.name || "Преподаватель"]); rowKinds.push("teacher");
+        merges.push({ s: { r, c: 0 }, e: { r, c: periods } });
+        r += 1;
+
+        const header = ["День \\ Пара"];
+        for (let p = 0; p < periods; p++) {
+          const tm = periodTime(p);
+          header.push(tm ? `${p + 1}\n${tm}` : `${p + 1}`);
+        }
+        aoa.push(header); rowKinds.push("header"); r += 1;
+
+        activeDayIndices.forEach((day) => {
+          const row = [DAY_LABELS_FULL[day] || DAY_LABELS[day] || `День ${day + 1}`];
+          for (let p = 0; p < periods; p++) row.push(unavailable.includes(slotOf(day, p)) ? "×" : "");
+          aoa.push(row); rowKinds.push("day"); r += 1;
+        });
+
+        aoa.push([]); rowKinds.push("gap"); r += 1;
+        aoa.push([]); rowKinds.push("gap"); r += 1;
+        const legendFreeRow = r;
+        aoa.push(["", "", "преподаватель свободен"]); rowKinds.push("legendFree"); r += 1;
+        const legendBusyRow = r;
+        aoa.push(["", "×", "преподаватель занят"]); rowKinds.push("legendBusy"); r += 1;
+        aoa.push([]); rowKinds.push("separator"); r += 1;
+
+        blocks.push({ start: blockStart, legendFreeRow, legendBusyRow, unavailable });
+      });
+
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!merges"] = merges;
+      ws["!cols"] = [{ wch: 29 }, ...Array.from({ length: periods }, () => ({ wch: 13.5 }))];
+      ws["!rows"] = rowKinds.map((kind) => ({
+        hpt: kind === "teacher" ? 24
+          : kind === "header" ? 38
+          : kind === "day" ? 28
+          : kind === "gap" ? 12
+          : kind === "legendFree" || kind === "legendBusy" ? 24
+          : kind === "separator" ? 16
+          : 8,
+      }));
+      ws["!freeze"] = { xSplit: 1, ySplit: 3, topLeftCell: "B4", activePane: "bottomRight", state: "frozen" };
+
+      const setStyle = (r0, c0, style) => {
+        const ref = XLSX.utils.encode_cell({ r: r0, c: c0 });
+        if (!ws[ref]) ws[ref] = { t: "s", v: "" };
+        ws[ref].s = style;
+      };
+
+      let cursor = 0;
+      sortedTeachers.forEach((t) => {
+        cursor += 1; // blank top spacer
+        setStyle(cursor, 0, styles.teacher);
+        cursor += 1;
+        setStyle(cursor, 0, styles.corner);
+        for (let p = 0; p < periods; p++) setStyle(cursor, p + 1, styles.period);
+        cursor += 1;
+
+        const unavailable = t.availabilityByParity
+          ? (parity === "even" ? (t.unavailableEven || []) : (t.unavailableOdd || []))
+          : (t.unavailable || []);
+        activeDayIndices.forEach((day) => {
+          setStyle(cursor, 0, styles.day);
+          for (let p = 0; p < periods; p++) {
+            setStyle(cursor, p + 1, unavailable.includes(slotOf(day, p)) ? styles.blocked : styles.free);
+          }
+          cursor += 1;
+        });
+
+        cursor += 2; // two blank rows
+        setStyle(cursor, 2, styles.legend);
+        cursor += 1;
+        setStyle(cursor, 1, styles.blocked);
+        setStyle(cursor, 2, styles.legend);
+        cursor += 2; // busy legend + separator
+      });
+
+      return ws;
+    };
+
+    const hasParity = sortedTeachers.some((t) => !!t.availabilityByParity);
+    if (hasParity) {
+      XLSX.utils.book_append_sheet(wb, buildParitySheet("odd"), "Нечётные недели");
+      XLSX.utils.book_append_sheet(wb, buildParitySheet("even"), "Чётные недели");
+    } else {
+      XLSX.utils.book_append_sheet(wb, buildParitySheet("all"), "Занятость");
+    }
+
+    XLSX.writeFile(wb, `zanyatost_prepodavateley_${new Date().toISOString().slice(0, 10)}.xlsx`, { cellStyles: true });
+  };
+
   const editingTeacher = teachers.find((t) => t.id === editing);
   const filtered = teachers
     .filter((t) => !search || (t.name || "").toLocaleLowerCase("ru").includes(search.toLocaleLowerCase("ru")))
@@ -5222,6 +5384,7 @@ function TeachersTable({ teachers, setTeachers, depOptions, employmentTypes, set
           Импорт из CSV/Excel
         </button>
         <button className="btn ghost sm" onClick={exportTeachers}><Download size={14}/> Выгрузить Excel</button>
+        <button className="btn primary sm" onClick={exportTeacherAvailability} title="Скачать наглядную матрицу недоступности преподавателей по дням и парам"><Download size={14}/> Выгрузить занятость</button>
       </div>
       {importMsg && <div className="import-msg">{importMsg}</div>}
       <table>
@@ -13863,7 +14026,7 @@ function VersionsPanel({data,onRestore,currentUser}){
   return <div className="section"><header className="section-head"><h1>Версии расписания</h1><p>Каждая публикация создаёт точку восстановления. Восстановление возвращает рабочий черновик к выбранной версии; публичная версия не меняется, пока вы снова не нажмёте «Опубликовать».</p></header>
     <div className="card" style={{padding:16,marginBottom:18}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><div><b>Серверные резервные копии</b><div className="muted" style={{marginTop:4}}>Скачивание идёт напрямую из <code>/data/backups</code> рабочего контейнера и не использует загрузчик файлов Amvera.</div></div><button className="btn ghost sm" onClick={refreshBackups}>Обновить список</button></div>
       {backupLoadError&&<div className="notice danger" style={{marginTop:10}}>{backupLoadError}</div>}
-      <div style={{display:"grid",gap:6,marginTop:12,maxHeight:360,overflow:"auto"}}>{serverBackups.map((b)=><div key={b.name} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"8px 10px",border:"1px solid #e5e7eb",borderRadius:8}}><span><b>{b.name}</b>{b.size?` · ${Math.round(b.size/1024)} КБ`:""}{b.valid===false?<span style={{marginLeft:8,color:"#b91c1c"}}>повреждён</span>:""}</span><button className="btn ghost sm" disabled={backupDownloadBusy===b.name||b.valid===false} onClick={()=>downloadBackup(b.name)}>{backupDownloadBusy===b.name?"Скачивание…":"Скачать JSON"}</button></div>)}{!serverBackups.length&&!backupLoadError&&<div className="muted">Резервных копий не найдено.</div>}</div>
+      <div style={{display:"grid",gap:6,marginTop:12,maxHeight:360,overflow:"auto"}}>{serverBackups.map((b)=><div key={b.name} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"8px 10px",border:"1px solid #e5e7eb",borderRadius:8}}><span><b>{b.name}</b>{b.size?` · ${Math.round(b.size/1024)} КБ`:""}{b.valid===false?<span style={{marginLeft:8,color:"#b91c1c"}}>повреждён</span>:""}</span><button className="btn ghost sm" disabled={backupDownloadBusy===b.name||b.valid===false} onClick={()=>downloadBackup(b.name)}>{backupDownloadBusy===b.name?"Скачивание…":"Скачать backup"}</button></div>)}{!serverBackups.length&&!backupLoadError&&<div className="muted">Резервных копий не найдено.</div>}</div>
     </div>
     <div className="table-wrap"><table><thead><tr><th>Дата</th><th>Автор</th><th>Размещено</th><th>Комментарий</th><th></th></tr></thead><tbody>{rows.map((v)=><tr key={v.id}><td>{new Date(v.at).toLocaleString("ru-RU")}</td><td>{v.by||"—"}</td><td>{v.placed??v.snapshot?.schedule?.stats?.placed??"—"}</td><td>{v.note||"Публикация"}</td><td><button className="btn ghost sm" onClick={()=>onRestore(v)}>Восстановить эту версию</button></td></tr>)}{!rows.length&&<tr><td colSpan={5} className="empty-row">Версии появятся после первой публикации</td></tr>}</tbody></table></div></div>;
 }
@@ -14385,6 +14548,12 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
   const publicationStatusLabel = publicationStatus === "published"
     ? "Расписание опубликовано"
     : (publicationStatus === "changed" ? "В расписание внесены изменения" : "Расписание не опубликовано");
+  const forcePublicRefresh = () => {
+    if (typeof window === "undefined") return;
+    const url = new URL(window.location.href);
+    url.searchParams.set("refresh", String(Date.now()));
+    window.location.replace(url.toString());
+  };
 
   useEffect(() => {
     if (list.length === 0) return;
@@ -14748,9 +14917,12 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
           ) : COLLEGE_NAME}
         </div>
         <h1>{kind === "group" ? "Расписание занятий" : "Расписание преподавателя"}</h1>
-        <div className={`public-publication-status ${publicationStatus}`} title={data.publishedAt ? `Последняя публикация: ${new Date(data.publishedAt).toLocaleString("ru-RU")}` : "Публикаций ещё не было"}>
-          <span className="public-publication-dot" aria-hidden="true"></span>
-          <span>{publicationStatusLabel}</span>
+        <div className="public-status-row">
+          <div className={`public-publication-status ${publicationStatus}`} title={data.publishedAt ? `Последняя публикация: ${new Date(data.publishedAt).toLocaleString("ru-RU")}` : "Публикаций ещё не было"}>
+            <span className="public-publication-dot" aria-hidden="true"></span>
+            <span>{publicationStatusLabel}</span>
+          </div>
+          <button type="button" className="public-refresh-btn" onClick={forcePublicRefresh} title="Загрузить последнюю опубликованную версию без кэша">↻ Обновить расписание</button>
         </div>
       </div>
 
@@ -18414,23 +18586,22 @@ input[type="text"], select { width: 100%; }
 /* v1503: denser semester public view */
 .semester-public-view{margin-top:8px;min-width:0}
 .semester-public-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 8px;color:#667085;font-size:11px}
-.semester-public-days{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:start}
+.semester-public-days{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:12px;align-items:start}
 .semester-public-day-card{border:1px solid var(--line);border-radius:8px;background:#fff;overflow:hidden;min-width:0}
-.semester-public-day-head{background:#ebe8df;padding:7px 10px;font-size:14px;font-weight:700;color:#26313d;position:sticky;top:0;z-index:1}
+.semester-public-day-head{background:#ebe8df;padding:7px 10px;font-size:14px;font-weight:700;color:#26313d;position:sticky;top:0;z-index:3}
 .semester-public-day-body{display:flex;flex-direction:column}
-.semester-public-item{display:grid;grid-template-columns:88px minmax(0,1fr) minmax(118px,156px);gap:8px;padding:7px 9px;border-top:1px solid #ece8de;align-items:start;min-width:0}
+.semester-public-item{display:grid;grid-template-columns:88px minmax(180px,1fr) minmax(128px,168px);gap:10px;padding:8px 10px;border-top:1px solid #ece8de;align-items:start;min-width:0}
 .semester-public-item.remote-event{background:#E8F7F0;box-shadow:inset 4px 0 0 #4E9D7C}.semester-public-item.remote-event .semester-public-item-title{color:#245C49}.semester-public-item.remote-event .semester-public-item-dates{background:#F4FBF8;border-color:#CFE8DD}
 .semester-public-item:first-child{border-top:0}
 .semester-public-item-time{display:flex;flex-direction:column;gap:1px;color:#354052;font-size:10.5px;line-height:1.2;white-space:nowrap}
 .semester-public-period{font-size:8px;text-transform:uppercase;letter-spacing:.02em;color:#8a94a3}
-.semester-public-item-title{font-size:13px;font-weight:700;line-height:1.18;color:#202938;overflow-wrap:anywhere}
+.semester-public-item-title{font-size:13px;font-weight:700;line-height:1.24;color:#202938;overflow-wrap:break-word;word-break:normal;hyphens:auto}
 .semester-public-item-meta{display:flex;flex-direction:column;gap:1px;margin-top:3px;color:#667085;font-size:10px;line-height:1.2}
-.semester-public-item-meta span{overflow-wrap:anywhere}
+.semester-public-item-meta span{overflow-wrap:break-word;word-break:normal}
 .semester-public-item-dates{background:#f7f8fa;border:1px solid #eceef2;border-radius:6px;padding:5px 6px;display:flex;flex-direction:column;gap:1px;font-size:9px;line-height:1.18;min-width:0}
 .semester-public-dates-label{font-size:7.5px;text-transform:uppercase;letter-spacing:.04em;color:#98a2b3}
-.semester-public-item-dates b{font-size:9px;line-height:1.18;color:#354052;overflow-wrap:anywhere}
+.semester-public-item-dates b{font-size:9px;line-height:1.2;color:#354052;overflow-wrap:break-word;word-break:normal}
 .semester-public-item-dates small{font-size:8px;color:#98a2b3}
-@media(min-width:1500px){.semester-public-days{grid-template-columns:repeat(3,minmax(0,1fr))}.semester-public-item{grid-template-columns:82px minmax(0,1fr) minmax(110px,140px)}}
 @media(max-width:980px){.semester-public-days{grid-template-columns:1fr}.semester-public-item{grid-template-columns:88px minmax(0,1fr) minmax(120px,160px)}}
 @media(max-width:620px){.semester-public-item{grid-template-columns:1fr;gap:5px;padding:7px 8px}.semester-public-item-time{flex-direction:row;align-items:baseline;gap:6px}.semester-public-item-dates{width:auto}.semester-public-day-head{position:static}}
 .public-days { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; align-items:start; }
@@ -18530,6 +18701,9 @@ input[type="text"], select { width: 100%; }
 .practice-filters{padding:10px 12px;border:1px solid #E5E7EB;border-radius:12px;background:#FAFBFC}.practice-filter-grid{display:grid;grid-template-columns:minmax(180px,1fr) minmax(170px,.8fr) minmax(210px,1fr) minmax(260px,1.4fr) auto;gap:8px;align-items:center}@media(max-width:1050px){.practice-filter-grid{grid-template-columns:1fr 1fr}}@media(max-width:650px){.practice-filter-grid{grid-template-columns:1fr}}
 .practice-week-cell{position:relative;background:#FDECEC!important;box-shadow:inset 0 0 0 1px #F0B7B7}.practice-week-cell .graphs-input{opacity:.45;cursor:not-allowed}.practice-week-partial-cell{position:relative;background:#FFF7D6!important;box-shadow:inset 0 0 0 1px #E8D28B}.practice-week-partial-cell .graphs-input{background:#FFFDF3}.practice-week-mark{font-size:9px;font-weight:800;color:#8A5A00;line-height:1;margin-bottom:2px}.practice-week-cell .practice-week-mark{color:#A33}.graphs-week-partial-practice-head{background:#FFF3BF!important}.graphs-week-full-practice-head{background:#FDECEC!important}.graphs-partial-practice-label{display:block;margin-top:2px;color:#8A5A00;font-weight:800;font-size:9px}.graphs-week-partial-practice-total{background:#FFF8DB!important}.graph-row-actions{min-width:255px;white-space:nowrap}.graph-row-actions .btn{margin:2px}.btn.xs{padding:5px 7px;font-size:11px}
 .schedule-grid{width:100%;table-layout:fixed}.schedule-grid .time-col{width:105px}.schedule-grid th:not(.time-col),.schedule-grid td.cell{min-width:120px}
+/* v1709: keep weekday/date row visible while the timetable itself scrolls. */
+.schedule-grid:not(.graphs-table) thead th{position:sticky;top:0;z-index:30;box-shadow:0 2px 0 rgba(0,0,0,.10),0 5px 10px rgba(0,0,0,.06);background-clip:padding-box}
+.schedule-grid:not(.graphs-table) thead .time-col,.schedule-grid:not(.graphs-table) thead .group-col{z-index:31}
 .semester-public-table{width:100%;table-layout:auto}.semester-table-wrap,.grid-wrap{max-width:100%;overflow-x:auto}
 @media(max-width:1100px){.schedule-grid{min-width:860px}.schedule-grid .lesson-chip{padding:6px}.lesson-meta{font-size:10.5px}.graphs-table{min-width:max-content}.all-groups-grid{min-width:1050px}}
 @media(max-width:720px){.section{padding-left:12px!important;padding-right:12px!important}.schedule-grid{min-width:760px}.schedule-grid th:not(.time-col),.schedule-grid td.cell{min-width:105px}.period-time{font-size:9px}.lesson-subject{font-size:11px}.schedule-toolbar,.lists-toolbar{flex-wrap:wrap}.semester-public-table{min-width:820px}}
