@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useDeferredValue, Fragment } from "react";
 import Papa from "papaparse";
-import * as XLSX from "xlsx";
+import * as XLSX from "xlsx-js-style";
 import { storageGet, storageGetStrict, publicBootstrapGet, publicIndexGet, publicScheduleGet, publicStatusGet, storageSet, storageGraphMerge, storageGraphPatch, storageScheduleMerge, storageScheduleGroupMerge, storageSchedulePatch, storagePublishWeeks, storagePublicationCommit, storageSectionMerge, storageMeta, storageBackups, storageDownloadBackup, storageRestoreBackup, storageVersionGet, presenceHeartbeat, presenceLeave, serverGenerateStart, serverGenerateStatus, serverGenerateCancel, serverAutoGraphStart, serverAutoGraphStatus } from "./storage.js";
 import {
   Plus, Trash2, Wand2, Download, Settings, Users, MapPin, BookOpen,
@@ -1353,14 +1353,40 @@ function generateSchedule(data, prior, perfScope = null) {
   // v1587: единая каноническая схема форматов для комбинированной нагрузки.
   // Она применяется ДО создания schedule.instances, поэтому «Не размещено»
   // сразу получает правильные очные/ДО recurring-блоки.
+  // v1689: в потоковой строке графика число 2 означает 2 ак.ч., то есть ОДНУ пару.
+  // Раньше потоковый план трактовал weeklyPairs=2 как две полноценные пары и
+  // создавал два одинаковых stream-instance на одну неделю. Обычные/подгрупповые
+  // строки не меняем: исправление локально только для потоков.
+  // v1692: делить часы на 2 можно только для РЕАЛЬНОГО потока, а не просто
+  // потому, что у строки остался старый streamId/streamGroupIds. Иначе обычная
+  // нагрузка с weeklyPairs=1 превращалась в 0.5 пары и получала подпись
+  // «1-я половина», хотя в графике пользователь задал одну обычную пару.
+  const isGraphHourStreamLoad = (l) => {
+    if (!l) return false;
+    const linkedIds = new Set([l.groupId, ...(l.streamGroupIds || [])].filter(Boolean));
+    return loads.some((other) => {
+      if (!other || other.id === l.id) return false;
+      const sameExplicitStream = !!l.streamId && !!other.streamId && l.streamId === other.streamId;
+      const linkedGroup = linkedIds.has(other.groupId) || (other.streamGroupIds || []).includes(l.groupId);
+      if (!sameExplicitStream && !linkedGroup) return false;
+      return other.subjectId === l.subjectId && other.teacherId === l.teacherId && other.typeId === l.typeId;
+    });
+  };
+  // v1695: weeklyPairs хранит КОЛИЧЕСТВО ПАР, а не академические часы.
+  // Это видно и в самом графике: сумма weeklyPairs показывается как «пар»,
+  // а справа часы = пары × 2. Поэтому значение 2 у потока означает ДВЕ пары
+  // на этой неделе, а не одну пару из двух академических часов.
+  // Половинная механика относится только к конкретной подгрупповой строке.
+  const loadMayUseHalfPair = (l) => Number(l?.subgroup || 0) > 0;
+  const occurrencePairUnitsForLoad = (_l, raw) => Math.max(0, Number(raw) || 0);
   const occurrenceKeysForLoad = (l) => {
     const keys = [];
     if ((l.weekPattern || "perWeek") !== "perWeek") return keys;
     for (const [weekRaw, countRaw] of Object.entries(l.weeklyPairs || {}).sort((a,b)=>Number(a[0])-Number(b[0]))) {
-      const week = Number(weekRaw), count = Math.max(0, Number(countRaw) || 0);
+      const week = Number(weekRaw), count = occurrencePairUnitsForLoad(l, countRaw);
       const whole = Math.floor(count + 1e-9);
       for (let layer = 1; layer <= whole; layer++) keys.push(`${week}:${layer}`);
-      if (count - whole >= 0.49) keys.push(`${week}:H`);
+      if (loadMayUseHalfPair(l) && count - whole >= 0.49) keys.push(`${week}:H`);
     }
     return keys;
   };
@@ -1822,8 +1848,9 @@ function generateSchedule(data, prior, perfScope = null) {
       // «Графики»: разное число пар на разных неделях — раскладываем на слои,
       // каждый слой — обычный шаблонный инстанс с custom-набором недель.
       const wp = load.weeklyPairs || {};
-      const weekNums = Object.keys(wp).map(Number).filter((w) => (Number(wp[w]) || 0) > 0);
-      const maxCount = weekNums.length ? Math.max(...weekNums.map((w) => Number(wp[w]) || 0)) : 0;
+      const graphPairUnitsAt = (w) => occurrencePairUnitsForLoad(load, wp[w]);
+      const weekNums = Object.keys(wp).map(Number).filter((w) => graphPairUnitsAt(w) > 0);
+      const maxCount = weekNums.length ? Math.max(...weekNums.map((w) => graphPairUnitsAt(w))) : 0;
       const maxWhole = Math.floor(maxCount + 1e-9);
       const mandatoryPlan = practicalAssemblyPlanByLoadId.get(load.id) || null;
       const lecturePlan = isLectureLessonTypeName(lessonTypeById[load.typeId]?.name) ? lectureStreamPlanByLoadId.get(load.id) : null;
@@ -1831,7 +1858,7 @@ function generateSchedule(data, prior, perfScope = null) {
       const graphPairing = load.pairing || "none";
       const graphBlockSize = { block2: 2, block3: 3, block4: 4 }[graphPairing] || 0;
       for (let layer = 1; layer <= maxWhole; layer++) {
-        const weeksForLayer = weekNums.filter((w) => (Number(wp[w]) || 0) >= layer && !(mandatoryPlan?.selectedKeys?.has(`${w}:${layer}`)) && !(lecturePlan?.selectedKeys?.has(`${w}:${layer}`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:${layer}`)));
+        const weeksForLayer = weekNums.filter((w) => graphPairUnitsAt(w) >= layer && !(mandatoryPlan?.selectedKeys?.has(`${w}:${layer}`)) && !(lecturePlan?.selectedKeys?.has(`${w}:${layer}`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:${layer}`)));
         if (weeksForLayer.length === 0) continue;
         const blockIndex = graphBlockSize ? (layer - 1) % graphBlockSize : 0;
         const blockStart = graphBlockSize ? (layer - blockIndex) : 0;
@@ -1843,7 +1870,9 @@ function generateSchedule(data, prior, perfScope = null) {
         });
       }
       // v109: 1 ак.ч. = половина пары. Две разные половины могут делить один номер пары.
-      const halfWeeks = weekNums.filter((w) => ((Number(wp[w]) || 0) - Math.floor(Number(wp[w]) || 0)) >= 0.49 && !(mandatoryPlan?.selectedKeys?.has(`${w}:H`)) && !(lecturePlan?.selectedKeys?.has(`${w}:H`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:H`)));
+      const halfWeeks = loadMayUseHalfPair(load)
+        ? weekNums.filter((w) => (graphPairUnitsAt(w) - Math.floor(graphPairUnitsAt(w))) >= 0.49 && !(mandatoryPlan?.selectedKeys?.has(`${w}:H`)) && !(lecturePlan?.selectedKeys?.has(`${w}:H`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:H`)))
+        : [];
       if (halfWeeks.length) instances.push({ instId: `${load.id}__H`, ...common, halfPair: true, weekPattern: "custom", customWeeks: halfWeeks, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
       return;
     }
@@ -1879,7 +1908,7 @@ function generateSchedule(data, prior, perfScope = null) {
 
     // "none" и "single" — обычные независимые инстансы.
     for (let i = 0; i < n; i++) instances.push({ instId: `${load.id}__${i}`, ...common, ...weekFields, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
-    if (hasHalf) instances.push({ instId: `${load.id}__H`, ...common, ...weekFields, halfPair: true, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
+    if (loadMayUseHalfPair(load) && hasHalf) instances.push({ instId: `${load.id}__H`, ...common, ...weekFields, halfPair: true, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
   });
 
   // v1656: страховка графика от потери отдельной week:layer потребности внутри потока.
@@ -1894,6 +1923,13 @@ function generateSchedule(data, prior, perfScope = null) {
     const id = String(inst?.instId || "");
     let m = id.match(/__L(\d+)$/);
     if (m) return m[1];
+    // v1687: для обычной нагрузки с pairsPerWeek > 1 генератор создаёт
+    // instId вида load__0, load__1, ... . Раньше они все падали в fallback
+    // layer="1", поэтому после размещения первой пары вторая считалась
+    // тем же самым требованием и исчезала из picker/«Не размещено».
+    // Индекс 0 соответствует первому слою, поэтому переводим его в 1-based layer.
+    m = id.match(/__(\d+)$/);
+    if (m) return String((Number(m[1]) || 0) + 1);
     m = id.match(/__(?:LECTURE_STREAM|PRACTICAL_STREAM)_\d+_([^_]+)_/);
     if (m) return m[1];
     m = id.match(/__MANDO_([^_]+)$/);
@@ -1934,11 +1970,11 @@ function generateSchedule(data, prior, perfScope = null) {
     const wp = load.weeklyPairs || {};
     const template = instances.find((inst) => String(inst?.loadId || "") === String(load.id)) || null;
     for (const [weekRaw, countRaw] of Object.entries(wp)) {
-      const week = Number(weekRaw), count = Math.max(0, Number(countRaw) || 0);
+      const week = Number(weekRaw), count = occurrencePairUnitsForLoad(load, countRaw);
       if (!Number.isFinite(week) || week <= 0 || count <= 0) continue;
       const whole = Math.floor(count + 1e-9);
       const requiredLayers = Array.from({length: whole}, (_,i)=>String(i+1));
-      if (count - whole >= 0.49) requiredLayers.push("H");
+      if (loadMayUseHalfPair(load) && count - whole >= 0.49) requiredLayers.push("H");
       for (const layer of requiredLayers) {
         const covKey = `${load.id}|${week}|${layer}`;
         if (graphCoverage.has(covKey)) continue;
@@ -4755,6 +4791,24 @@ function syncScheduleInstancesToGraph(data, nextLoads, options = {}) {
     ...((inst?.streamParticipants || []).map((p)=>String(p?.loadId || '')).filter(Boolean)),
   ].filter(Boolean));
   const weekKey = (inst) => weekNumbersForInstance(source.config, inst).map(Number).sort((a,b)=>a-b).join(',');
+  // v1688: repeated pairs of one load are different graph requirements. During
+  // semantic remap never allow layer 1 to inherit layer 2 (or vice versa) merely
+  // because subject/group/weeks are identical.
+  const graphSemanticLayer = (inst) => {
+    if (inst?.halfPair) return "H";
+    const id = String(inst?.instId || "");
+    let m = id.match(/__L(\d+)$/); if (m) return String(Number(m[1]));
+    m = id.match(/__(\d+)$/); if (m) return String((Number(m[1]) || 0) + 1);
+    m = id.match(/__(?:LECTURE_STREAM|PRACTICAL_STREAM)_\d+_([^_]+)_/); if (m) return String(m[1]).replace(/^L/, "");
+    m = id.match(/__MANDO_(?:\d+_)?([^_]+)$/); if (m) return String(m[1]).replace(/^L/, "");
+    m = id.match(/__GRAPH_REPAIR_\d+_([^_]+)$/); if (m) return String(m[1]).replace(/^L/, "");
+    if (id.includes("__GRAPH_DELTA_") && inst?.graphDeltaFromInstId) {
+      const src = String(inst.graphDeltaFromInstId || "");
+      const lm = src.match(/__L(\d+)$/); if (lm) return String(Number(lm[1]));
+      const nm = src.match(/__(\d+)$/); if (nm) return String((Number(nm[1]) || 0) + 1);
+    }
+    return "1";
+  };
   const sameCore = (a,b) => !!a && !!b &&
     a.subjectId === b.subjectId && a.typeId === b.typeId &&
     Number(a.subgroup || 0) === Number(b.subgroup || 0) &&
@@ -4775,6 +4829,7 @@ function syncScheduleInstancesToGraph(data, nextLoads, options = {}) {
     for (const candidate of instances) {
       if (!candidate || usedNewIds.has(candidate.instId) || !sameCore(oldInst,candidate)) continue;
       if (weekKey(candidate) !== weekKey(oldInst)) continue;
+      if (graphSemanticLayer(candidate) !== graphSemanticLayer(oldInst)) continue;
       const nextLineage = instLineageLoadIds(candidate);
       const overlap = [...oldLineage].filter((id)=>nextLineage.has(id)).length;
       if (!overlap) continue;
@@ -4816,6 +4871,31 @@ function syncScheduleInstancesToGraph(data, nextLoads, options = {}) {
   };
   for (const remappedId of [...graphRemappedIds]) {
     if (graphRemapParticipantConflict(remappedId)) delete assignment[remappedId];
+  }
+
+  // v1695: два слоя одной и той же строки графика — две разные пары.
+  // Они НИКОГДА не должны лежать в одной физической ячейке на пересекающихся
+  // неделях. Старые сборки могли сохранить L1 и L2 в одном day/period после
+  // потокового remap. Оставляем младший слой, второй возвращаем в «Не размещено».
+  const sameLoadSlotIds = Object.keys(assignment).filter((id)=>assignment[id]);
+  const instByIdForSameLoad = new Map(instances.map((x)=>[String(x?.instId||""), x]));
+  const layerRank1695 = (inst) => {
+    const v = graphSemanticLayer(inst);
+    return v === "H" ? 100000 : (Number(v) || 1);
+  };
+  for (let i=0; i<sameLoadSlotIds.length; i++) {
+    const aId=sameLoadSlotIds[i], a=assignment[aId], ai=instByIdForSameLoad.get(String(aId));
+    if (!a || !ai) continue;
+    for (let j=i+1; j<sameLoadSlotIds.length; j++) {
+      const bId=sameLoadSlotIds[j], b=assignment[bId], bi=instByIdForSameLoad.get(String(bId));
+      if (!b || !bi) continue;
+      if (String(ai.loadId||"") !== String(bi.loadId||"") || !ai.loadId) continue;
+      if (Number(a.day)!==Number(b.day) || Number(a.period)!==Number(b.period)) continue;
+      if (!weeksOverlap(ai, bi, source.config)) continue;
+      const ar=layerRank1695(ai), br=layerRank1695(bi);
+      const victim = br > ar ? bId : (ar > br ? aId : String(aId)>String(bId) ? aId : bId);
+      delete assignment[victim];
+    }
   }
 
   // v1666: график является источником истины по объёму. Если требование
@@ -6433,6 +6513,110 @@ function LoadsPanel({ data, set }) {
     }
     return dup;
   })();
+  const exportAllLoads = () => {
+    // v1700: выгрузка из «Нагрузок» всегда содержит ВСЕ строки, независимо от
+    // текущего поиска/фильтров. Помимо читаемых колонок сохраняем внутренние ID,
+    // все настройки связей и сырой JSON строки — так Excel остаётся полноценным
+    // снимком нагрузки даже если в модели появятся новые поля.
+    const nameById = (arr, id) => arr.find((x) => x.id === id)?.name || "";
+    const roomName = (id) => nameById(data.rooms || [], id) || id || "";
+    const loadName = (id) => {
+      const row = loads.find((x) => x.id === id);
+      if (!row) return id || "";
+      const group = nameById(groups, row.groupId) || row.groupId || "—";
+      const subject = nameById(subjects, row.subjectId) || row.subjectId || "—";
+      const subgroup = Number(row.subgroup || 0) > 0 ? ` · п/г ${row.subgroup}` : "";
+      return `${group} · ${subject}${subgroup}`;
+    };
+    const boolText = (v) => v ? "да" : "нет";
+    const formatText = (v) => v === "remote" ? "Только ДО" : v === "auto" ? "Комбинированно / авто" : "Только очно";
+    const positionText = (v) => v === "first" ? "первая пара" : v === "last" ? "последняя пара" : "любая";
+    const weekPatternText = (v) => v === "odd" ? "числитель" : v === "even" ? "знаменатель" : v === "custom" ? "выбранные недели" : v === "perWeek" ? "по графику" : (v || "все недели");
+    const maxGraphWeek = loads.reduce((mx, row) => Math.max(
+      mx,
+      ...Object.keys(row.weeklyPairs || {}).map((x) => Number(x) || 0),
+      ...(row.customWeeks || []).map((x) => Number(x) || 0),
+    ), 0);
+    const exportWeeks = Math.max(totalSemesterWeeks(config) || 0, maxGraphWeek);
+
+    const headers = [
+      "ID нагрузки", "Группа", "ID группы", "Специальность", "Курс", "База поступления",
+      "Дисциплина", "ID дисциплины", "ЦК дисциплины", "Преподаватель", "ID преподавателя", "ЦК преподавателя",
+      "Вид занятия", "ID вида занятия", "Подгруппа", "Пар/нед. (базовое)", "Ожидаемо студентов",
+      "Формат", "Может ДО", "% ДО", "Обязательных ДО-сборок",
+      "Тип аудитории", "Допустимые аудитории", "Две аудитории", "Профильная дисциплина", "Позиция в дне", "Спаривание",
+      "Схема недель", "Выбранные недели", "ID потока", "Группы потока", "ID групп потока",
+      "ДО-связанные нагрузки", "ID ДО-связанных нагрузок", "ID одновременной связки", "Все поля JSON",
+    ];
+
+    const rows = loads.map((l) => {
+      const group = groups.find((g) => g.id === l.groupId);
+      const subject = subjects.find((x) => x.id === l.subjectId);
+      const teacher = teachers.find((t) => t.id === l.teacherId);
+      const specialty = specialties.find((x) => x.id === group?.specialtyId);
+      const subjectDept = departments.find((x) => x.id === subject?.departmentId);
+      const teacherDept = departments.find((x) => x.id === teacher?.departmentId);
+      const streamGroups = (l.streamGroupIds || []).map((id) => nameById(groups, id) || id);
+      const remoteRows = (l.remoteSubgroupLoadIds || []).map(loadName);
+      return [
+        l.id || "", group?.name || "", l.groupId || "", specialty?.name || specialty?.code || "",
+        courseOfGroup(group) || "", group?.entryBase || group?.base || group?.admissionBase || "",
+        subject?.name || "", l.subjectId || "", subjectDept?.name || "", teacher?.name || "", l.teacherId || "", teacherDept?.name || "",
+        nameById(lessonTypes, l.typeId), l.typeId || "", Number(l.subgroup || 0), Number(l.pairsPerWeek || 0), l.expectedStudents ?? "",
+        formatText(l.format), boolText(!!l.canBeRemote), Number(l.remotePercent || 0), Number(l.mandatoryRemoteAssemblies || 0),
+        l.roomType === "любая" ? "любая" : nameById(data.roomTypes || [], l.roomType) || l.roomType || "",
+        (l.allowedRoomIds || []).map(roomName).join("; "), boolText(!!l.twoRooms), boolText(!!l.profileSubject), positionText(l.position), l.pairing || "none",
+        weekPatternText(l.weekPattern), (l.customWeeks || []).join(", "), l.streamId || "", streamGroups.join("; "), (l.streamGroupIds || []).join("; "),
+        remoteRows.join("; "), (l.remoteSubgroupLoadIds || []).join("; "), l.coScheduleId || "", JSON.stringify(l),
+      ];
+    });
+
+    const graphHeaders = [
+      "ID нагрузки", "Группа", "Дисциплина", "Преподаватель", "Вид занятия", "Подгруппа",
+      ...Array.from({ length: exportWeeks }, (_, i) => `Неделя ${i + 1}`), "Всего пар", "Всего ак.ч.",
+    ];
+    const graphRows = loads.map((l) => {
+      const values = Array.from({ length: exportWeeks }, (_, i) => Number(l.weeklyPairs?.[i + 1]) || "");
+      const totalPairs = values.reduce((sum, v) => sum + (Number(v) || 0), 0);
+      return [
+        l.id || "", nameById(groups, l.groupId), nameById(subjects, l.subjectId), nameById(teachers, l.teacherId), nameById(lessonTypes, l.typeId), Number(l.subgroup || 0),
+        ...values, totalPairs, totalPairs * 2,
+      ];
+    });
+
+    const relationsHeaders = ["ID нагрузки", "Нагрузка", "Тип связи", "ID связи/участника", "Участник"];
+    const relationsRows = [];
+    for (const l of loads) {
+      const self = loadName(l.id);
+      if (l.streamId) relationsRows.push([l.id, self, "Поток", l.streamId, ""]);
+      for (const gid of (l.streamGroupIds || [])) relationsRows.push([l.id, self, "Группа потока", gid, nameById(groups, gid)]);
+      for (const rid of (l.remoteSubgroupLoadIds || [])) relationsRows.push([l.id, self, "ДО-связка", rid, loadName(rid)]);
+      if (l.coScheduleId) relationsRows.push([l.id, self, "Одновременная очная связка", l.coScheduleId, ""]);
+      for (const roomId of (l.allowedRoomIds || [])) relationsRows.push([l.id, self, "Допустимая аудитория", roomId, roomName(roomId)]);
+    }
+
+    const wb = XLSX.utils.book_new();
+    const appendSheet = (sheetName, sheetHeaders, sheetRows, widths = []) => {
+      const ws = XLSX.utils.aoa_to_sheet([sheetHeaders, ...sheetRows]);
+      ws["!autofilter"] = { ref: `A1:${XLSX.utils.encode_col(Math.max(0, sheetHeaders.length - 1))}${Math.max(1, sheetRows.length + 1)}` };
+      ws["!freeze"] = { xSplit: 0, ySplit: 1, topLeftCell: "A2", activePane: "bottomLeft", state: "frozen" };
+      ws["!cols"] = sheetHeaders.map((h, i) => ({ wch: widths[i] || Math.min(42, Math.max(10, String(h).length + 2)) }));
+      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+    };
+    appendSheet("Нагрузка", headers, rows, [18,16,18,26,8,16,32,18,22,26,18,22,16,16,10,16,18,22,10,10,18,20,32,14,18,16,16,18,20,18,28,30,34,30,22,45]);
+    appendSheet("Графики", graphHeaders, graphRows, [18,16,32,26,16,10, ...Array(exportWeeks).fill(11), 12, 12]);
+    appendSheet("Связи", relationsHeaders, relationsRows, [18,42,26,24,42]);
+
+    const metaRows = [
+      ["Дата выгрузки", new Date().toLocaleString("ru-RU")],
+      ["Строк нагрузки", loads.length],
+      ["Учебных недель в выгрузке", exportWeeks],
+      ["Примечание", "Выгружены все строки нагрузки без учёта текущих фильтров. Колонка «Все поля JSON» сохраняет исходный объект строки целиком."],
+    ];
+    appendSheet("Информация", ["Параметр", "Значение"], metaRows, [28,90]);
+    XLSX.writeFile(wb, `nagruzka_polnaya_${new Date().toISOString().slice(0, 10)}.xlsx`);
+  };
+
   const deleteDuplicateLoads = () => {
     if (!duplicateLoadIds.length) return;
     if (!window.confirm(`Найдено повторных строк нагрузки: ${duplicateLoadIds.length}.\n\nОставить первую запись каждого совпадения и удалить только повторы?`)) return;
@@ -6640,6 +6824,7 @@ function LoadsPanel({ data, set }) {
           <input ref={fileRef} type="file" accept=".csv,.xlsx,.xls" style={{ display: "none" }} onChange={(e) => { handleImportFile(e.target.files[0]); e.target.value = ""; }} />
           <button className="btn ghost sm" onClick={() => downloadTemplate("shablon_nagruzka.xlsx", ["Группа", "Дисциплина", "Преподаватель", "Вид занятия", "Подгруппа", "Аудитория"], [["2-РД-1", "Реклама и PR", "Иванова А.П.", "лекция", "0", "любая"]])}>Скачать шаблон</button>
           <button className="btn ghost sm" onClick={() => fileRef.current?.click()} title="Группа/Дисциплина/Преподаватель/Вид занятия должны совпадать с уже заведёнными в Списках">Импорт Excel</button>
+          <button className="btn ghost sm" onClick={exportAllLoads} title="Выгрузить всю нагрузку целиком, включая графики, связи и служебные поля"><Download size={14}/> Выгрузить Excel</button>
         </div>
       </div>
       {importReport && (
@@ -8095,7 +8280,7 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
   if (groups.length === 0) return <div className="section"><header className="section-head"><h1>Графики</h1></header><div className="notice">Сначала добавьте хотя бы одну группу в Списках.</div></div>;
 
   return <div className="section">
-    <header className="section-head"><h1>Графики</h1><p>Строку, которая уже устраивает, можно зафиксировать кнопкой «Зафиксировать»: автографик и любые автоматические перераспределения не изменят её недели и часы. В недельных ячейках показывается число пар; шаг ввода — 0,5 пары. Очные потоки отображаются одной строкой с перечнем групп. Для подгрупп и ДО-потоков данные только справочные: значения автоматически не копируются, не сравниваются и не подсвечиваются. У подгруппы показывается связь с другой подгруппой той же группы по той же дисциплине и виду занятия, даже если преподаватель другой; у ДО-потока прямо в неделе дополнительно видно значение связанных подгрупп/групп этой недели. Автографик строит учебную последовательность: лекции запускают дисциплину, практики и лабораторные идут после начала лекций, обычные занятия распределяются по семестру без бессмысленного сгущения, а контрольные работы, зачёты и ЗчО ставятся после основной части своей дисциплины. Среди логичных вариантов первыми резервируются самые дефицитные преподаватели; при выборе недели учитывается их уже назначенный график по другим группам, чтобы не перегружать одну и ту же неделю.</p></header>
+    <header className="section-head"><h1>Графики</h1><p>Строку, которая уже устраивает, можно зафиксировать кнопкой «Зафиксировать»: автографик и любые автоматические перераспределения не изменят её недели и часы. В недельных ячейках показывается число пар; шаг ввода — 0,5 пары. Для потоковой строки значение 2 трактуется как 2 ак.ч. = 1 общая потоковая пара, чтобы поток не задваивался. Очные потоки отображаются одной строкой с перечнем групп. Для подгрупп и ДО-потоков данные только справочные: значения автоматически не копируются, не сравниваются и не подсвечиваются. У подгруппы показывается связь с другой подгруппой той же группы по той же дисциплине и виду занятия, даже если преподаватель другой; у ДО-потока прямо в неделе дополнительно видно значение связанных подгрупп/групп этой недели. Автографик строит учебную последовательность: лекции запускают дисциплину, практики и лабораторные идут после начала лекций, обычные занятия распределяются по семестру без бессмысленного сгущения, а контрольные работы, зачёты и ЗчО ставятся после основной части своей дисциплины. Среди логичных вариантов первыми резервируются самые дефицитные преподаватели; при выборе недели учитывается их уже назначенный график по другим группам, чтобы не перегружать одну и ту же неделю.</p></header>
     <div className="lists-toolbar graphs-toolbar-v2">
       <label className="graph-filter-label">Просмотр / назначение</label>
       <select value={viewMode} onChange={(e)=>setViewMode(e.target.value)} style={{width:"auto"}}><option value="specialty">по направлению</option><option value="teacher">по преподавателю</option><option value="subject">по дисциплине</option><option value="group">по группе</option></select>
@@ -8295,6 +8480,9 @@ function Modal({ title, onClose, children, backdropClass = "", modalClass = "" }
 function SchedulePanel({ data, set, generating, generationStatus, onGenerate, onCancelGenerate, onPublish, onCellPatch, activeUsers = [], currentUser = null, onPresenceEditing = null, routeGroupId = "", onRouteGroupChange = null }) {
   const [viewKind, setViewKind] = useState("group");
   const [viewId, setViewId] = useState(routeGroupId || "");
+  // v1707: автогенерация временно скрыта из интерфейса, но обработчики и серверный
+  // функционал намеренно оставлены — достаточно вернуть флаг в true.
+  const SHOW_AUTO_CALC_CONTROLS = false;
   const [manualMode, setManualMode] = useState(true);
   const selectScheduleViewId = (id) => {
     const next = String(id || "");
@@ -8464,6 +8652,13 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const id = String(inst?.instId || "");
     let m = id.match(/__L(\d+)$/);
     if (m) return m[1];
+    // v1687: для обычной нагрузки с pairsPerWeek > 1 генератор создаёт
+    // instId вида load__0, load__1, ... . Раньше они все падали в fallback
+    // layer="1", поэтому после размещения первой пары вторая считалась
+    // тем же самым требованием и исчезала из picker/«Не размещено».
+    // Индекс 0 соответствует первому слою, поэтому переводим его в 1-based layer.
+    m = id.match(/__(\d+)$/);
+    if (m) return String((Number(m[1]) || 0) + 1);
     m = id.match(/__(?:LECTURE_STREAM|PRACTICAL_STREAM)_\d+_([^_]+)_/);
     if (m) return m[1];
     m = id.match(/__MANDO_([^_]+)$/);
@@ -8535,7 +8730,15 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       if (!a) continue;
       effectivelyPlacedIds.add(String(assignedId));
       const assignedInst = scheduleInstById.get(String(assignedId));
-      for (const sourceId of (assignedInst?.mergedFromInstIds || [])) effectivelyPlacedIds.add(String(sourceId));
+      // v1688: legacy manualRecurringMerge may still reference source IDs from an
+      // older save. If those source instances exist in the CURRENT graph, they are
+      // independent canonical requirements and must NOT be hidden merely because a
+      // stale merged card lists them in mergedFromInstIds. Only suppress a source
+      // that no longer exists as its own current instance.
+      for (const sourceIdRaw of (assignedInst?.mergedFromInstIds || [])) {
+        const sourceId = String(sourceIdRaw);
+        if (!scheduleInstById.has(sourceId)) effectivelyPlacedIds.add(sourceId);
+      }
     }
 
     // v1654: `sched.unplaced` is only a cache/report. After graph edits, stream
@@ -8558,7 +8761,14 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       // требование графика (типично после расщепления ДО-потока), не предлагаем
       // поставить ту же пару второй раз.
       const requirementKeys = scheduleRequirementKeys(inst);
-      if (requirementKeys.length && requirementKeys.every((key) => placedRequirementKeys.has(key))) return false;
+      // v1688: graph instances are authoritative. A real current __L1/__L2 (or
+      // ordinary __0/__1) instance must remain visible until THAT instId is assigned.
+      // Semantic coverage suppression is only a safety net for technical repair/
+      // delta tails; applying it to ordinary canonical instances could make the
+      // second required pair disappear after the first one was placed.
+      const technicalCoverageDuplicate = !!inst.graphCoverageRepair ||
+        /__GRAPH_REPAIR_|__GRAPH_DELTA_/.test(String(inst.instId || ""));
+      if (technicalCoverageDuplicate && requirementKeys.length && requirementKeys.every((key) => placedRequirementKeys.has(key))) return false;
       if (viewKind === "group" && viewId && !belongsToGroup(inst, viewId)) return false;
       if (viewKind === "teacher" && viewId && inst.teacherId !== viewId) return false;
       if (viewKind === "room" && viewId) {
@@ -8582,6 +8792,24 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     });
   }, [baseVisibleUnplacedIds, weeklyPlanningMode, scheduleWeek, scheduleInstById, data.config]);
 
+  // v1697: номер графического слоя должен быть единым для всех ручных UI-путей.
+  // В частности, один клик по L1 никогда не должен прихватывать L2 той же строки.
+  const unplacedGraphLayer = (inst) => {
+    if (inst?.halfPair) return "H";
+    const id = String(inst?.instId || "");
+    let m = id.match(/__L(\d+)$/);
+    if (m) return String(Number(m[1]) || 1);
+    m = id.match(/__(\d+)$/);
+    if (m) return String((Number(m[1]) || 0) + 1);
+    m = id.match(/__(?:LECTURE_STREAM|PRACTICAL_STREAM)_\d+_([^_]+)_/);
+    if (m) return String(m[1]);
+    m = id.match(/__MANDO_([^_]+)$/);
+    if (m) return String(m[1]);
+    m = id.match(/__GRAPH_REPAIR_\d+_([^_]+)$/);
+    if (m) return String(m[1]);
+    return "1";
+  };
+
   // v1545/v1552/v1562: повторяющиеся недельные instances визуально остаются
   // одним блоком. Группировку тоже не пересчитываем при каждом hover/click.
   const unplacedDisplayGroups = useMemo(() => {
@@ -8595,14 +8823,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         inst.lectureInPersonStream || inst.mandatoryRemoteAssembly || inst.practicalInPersonStream || inst.graphCoverageRepair ||
         /__(?:LECTURE_STREAM|MANDO|PRACTICAL_STREAM|GRAPH_REPAIR)_/.test(inst.instId || "")
       );
-      const generatedLayer = (() => {
-        const id = String(inst.instId || "");
-        let m = id.match(/__LECTURE_STREAM_\d+_([^_]+)_/);
-        if (!m) m = id.match(/__PRACTICAL_STREAM_\d+_([^_]+)_/);
-        if (!m) m = id.match(/__MANDO_\d+_([^_]+)$/);
-        if (!m) m = id.match(/__GRAPH_REPAIR_\d+_([^_]+)$/);
-        return m?.[1] || (inst.halfPair ? "H" : "L1");
-      })();
+      const generatedLayer = unplacedGraphLayer(inst);
       let recurringKind = inst.mandatoryRemoteAssembly ? "remote" : inst.practicalInPersonStream ? "practical" : "lecture";
       // v1657: repair-instance должен визуально входить в тот же повторяющийся
       // потоковый блок, что и остальные недели этой строки нагрузки. Иначе неделя,
@@ -8612,10 +8833,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         const sibling = (sched.instances || []).find((x) => {
           if (!x || x.graphCoverageRepair || String(x.loadId || "") !== String(inst.loadId || "")) return false;
           const xid = String(x.instId || "");
-          let xm = xid.match(/__LECTURE_STREAM_\d+_([^_]+)_/);
-          if (!xm) xm = xid.match(/__PRACTICAL_STREAM_\d+_([^_]+)_/);
-          if (!xm) xm = xid.match(/__MANDO_([^_]+)$/);
-          const xlayer = xm?.[1] || (x.halfPair ? "H" : "L1");
+          const xlayer = unplacedGraphLayer(x);
           return xlayer === generatedLayer && (x.lectureInPersonStream || x.mandatoryRemoteAssembly || x.practicalInPersonStream || /__(?:LECTURE_STREAM|MANDO|PRACTICAL_STREAM)_/.test(xid));
         });
         if (sibling) recurringKind = sibling.mandatoryRemoteAssembly || String(sibling.instId || "").includes("__MANDO_") ? "remote" : sibling.practicalInPersonStream || String(sibling.instId || "").includes("__PRACTICAL_STREAM_") ? "practical" : "lecture";
@@ -8834,7 +9052,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     };
   }, [sched, data.groups, data.teachers, data.config]);
 
-  const rawList = viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll" ? data.groups : viewKind === "teacher" ? data.teachers : data.rooms;
+  const rawList = viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll" ? data.groups : (viewKind === "teacher" || viewKind === "allTeachers") ? data.teachers : data.rooms;
   const list = (viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll") && filterSpec ? rawList.filter((g) => g.specialtyId === filterSpec) : rawList;
   const scheduleGroupPresence = useMemo(() => {
     const map = new Map();
@@ -9015,7 +9233,142 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     return [...m.values()].map((c) => ({ ...c, weeks: [...new Set(c.weeks)].sort((a,b)=>a-b) }));
   }, [visibleSemesterGroupSlotConflicts]);
 
-  const currentViewName = viewKind === "allGroups" ? "Все группы" : (byId(list, viewId)?.name || "");
+
+  // v1701: группа может выглядеть полностью корректно сама по себе, но её преподаватель
+  // в этот же момент вести другую группу. Раньше верхний красный баннер считал ТОЛЬКО
+  // пересечения участников одной группы, поэтому такая реальная двойная занятость была
+  // видна лишь в «Центре конфликтов». Показываем её прямо в расписании.
+  const semesterTeacherSlotConflicts = useMemo(() => {
+    if (!sched) return [];
+    const out = [];
+    const seen = new Set();
+    for (const [slotKey, rows] of semesterCellIndex.bySlot.entries()) {
+      const [week, day, period] = slotKey.split(':').map(Number);
+      const byTeacher = new Map();
+      for (const row of rows) {
+        const tid = row?.inst?.teacherId;
+        if (!tid || row?.inst?.isVacancyTeacher) continue;
+        const arr = byTeacher.get(tid) || [];
+        arr.push(row); byTeacher.set(tid, arr);
+      }
+      for (const [teacherId, arr] of byTeacher.entries()) {
+        for (let i=0;i<arr.length;i++) for (let j=i+1;j<arr.length;j++) {
+          const A=arr[i], B=arr[j];
+          if (!A?.inst || !B?.inst || A.inst.instId === B.inst.instId) continue;
+          const ah=A.a?.half ?? null, bh=B.a?.half ?? null;
+          if (ah != null && bh != null && Number(ah)!==Number(bh)) continue;
+          if (sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst)) continue;
+          const intentional = !!(
+            A.a?.manualTeacherMultiRoom || B.a?.manualTeacherMultiRoom ||
+            A.a?.manualSameSubjectTeacherSameRoom || B.a?.manualSameSubjectTeacherSameRoom ||
+            A.a?.manualMultiGroupRoom || B.a?.manualMultiGroupRoom
+          );
+          if (intentional) continue;
+          const ids=[String(A.inst.instId||''),String(B.inst.instId||'')].sort();
+          const k=`${teacherId}|${week}|${day}|${period}|${ids[0]}|${ids[1]}`;
+          if (seen.has(k)) continue;
+          seen.add(k);
+          out.push({ teacherId, week, day, period, a:A.inst, b:B.inst });
+        }
+      }
+    }
+    return out;
+  }, [sched, semesterCellIndex]);
+
+  // v1702: визуальная страховка от «разрешённых» двойных занятий преподавателя.
+  // Даже если пользователь сознательно подтвердил ручное совмещение, две разные
+  // пары одного преподавателя в один момент остаются заметны в сетке жёлтым.
+  // Это НЕ превращает разрешённое совмещение в ошибку и не мешает сохранению.
+  const semesterTeacherConcurrentByInst = useMemo(() => {
+    const byInst = new Map();
+    if (!sched) return byInst;
+    const seen = new Set();
+    const add = (instId, info) => {
+      const key = String(instId || "");
+      if (!key) return;
+      const arr = byInst.get(key) || [];
+      arr.push(info);
+      byInst.set(key, arr);
+    };
+    for (const [slotKey, rows] of semesterCellIndex.bySlot.entries()) {
+      const [week, day, period] = slotKey.split(':').map(Number);
+      const byTeacher = new Map();
+      for (const row of rows) {
+        const tid = row?.inst?.teacherId;
+        if (!tid || row?.inst?.isVacancyTeacher) continue;
+        const arr = byTeacher.get(tid) || [];
+        arr.push(row); byTeacher.set(tid, arr);
+      }
+      for (const [teacherId, arr] of byTeacher.entries()) {
+        for (let i=0;i<arr.length;i++) for (let j=i+1;j<arr.length;j++) {
+          const A=arr[i], B=arr[j];
+          if (!A?.inst || !B?.inst || A.inst.instId === B.inst.instId) continue;
+          const ah=A.a?.half ?? null, bh=B.a?.half ?? null;
+          if (ah != null && bh != null && Number(ah)!==Number(bh)) continue;
+          if (sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst)) continue;
+          const ids=[String(A.inst.instId||''),String(B.inst.instId||'')].sort();
+          const pairKey=`${teacherId}|${week}|${day}|${period}|${ids[0]}|${ids[1]}`;
+          if (seen.has(pairKey)) continue;
+          seen.add(pairKey);
+          const intentional = !!(
+            A.a?.manualTeacherMultiRoom || B.a?.manualTeacherMultiRoom ||
+            A.a?.manualSameSubjectTeacherSameRoom || B.a?.manualSameSubjectTeacherSameRoom ||
+            A.a?.manualMultiGroupRoom || B.a?.manualMultiGroupRoom
+          );
+          add(A.inst.instId, { teacherId, week, day, period, other:B.inst, intentional });
+          add(B.inst.instId, { teacherId, week, day, period, other:A.inst, intentional });
+        }
+      }
+    }
+    return byInst;
+  }, [sched, semesterCellIndex]);
+
+  const teacherConcurrentInfoForCell = (cell, day, period) => {
+    if (!cell?.inst) return [];
+    const visibleWeeks = weekScope === "week" ? new Set([Number(scheduleWeek)]) : new Set(actualWeeksForAssignedDay(cell.inst, day, period).map(Number));
+    return (semesterTeacherConcurrentByInst.get(String(cell.inst.instId)) || []).filter((x) =>
+      Number(x.day) === Number(day) && Number(x.period) === Number(period) && visibleWeeks.has(Number(x.week))
+    );
+  };
+
+  const teacherConcurrentLabel = (items) => {
+    const uniq = new Map();
+    for (const x of items || []) {
+      const other = x?.other;
+      if (!other) continue;
+      const groups = instanceGroupNames(data, other);
+      const groupText = groups.join(", ") || byId(data.groups, other.groupId)?.name || "другая группа";
+      const subjectText = lessonLabel(other, data).subj || "занятие";
+      uniq.set(`${groupText}|${subjectText}`, `${groupText} · ${subjectText}`);
+    }
+    return [...uniq.values()].join("; ");
+  };
+
+  const visibleSemesterTeacherConflictBlocks = useMemo(() => {
+    let src = semesterTeacherSlotConflicts;
+    if (viewKind === "teacher") src = viewId ? src.filter((c) => c.teacherId === viewId) : [];
+    // v1703: в режиме «По группам» сводка двойной занятости намеренно ГЛОБАЛЬНАЯ.
+    // Преподаватель может быть занят одновременно в двух совершенно других группах,
+    // поэтому привязка баннера к текущей выбранной группе скрывала часть проблем.
+    // Сетка выбранной группы остаётся локальной, а верхняя сводка сразу показывает
+    // все неразрешённые двойные назначения преподавателей во всём расписании.
+    else if (viewKind === "group") src = src;
+    else if (viewKind === "allGroups" && filterSpec) {
+      const allowed = new Set(data.groups.filter((g) => g.specialtyId === filterSpec).map((g) => g.id));
+      src = src.filter((c) => streamGroups(c.a).some((gid)=>allowed.has(gid)) || streamGroups(c.b).some((gid)=>allowed.has(gid)));
+    } else if (viewKind !== "allGroups") src = [];
+    const m = new Map();
+    for (const c of src) {
+      const ids=[String(c.a?.instId||''),String(c.b?.instId||'')].sort();
+      const key=`${c.teacherId}|${c.day}|${c.period}|${ids[0]}|${ids[1]}`;
+      let row=m.get(key);
+      if(!row){ row={...c,weeks:[]}; m.set(key,row); }
+      row.weeks.push(Number(c.week));
+    }
+    return [...m.values()].map((c)=>({...c,weeks:[...new Set(c.weeks)].sort((a,b)=>a-b)}));
+  }, [semesterTeacherSlotConflicts, viewKind, viewId, filterSpec, data.groups]);
+
+  const currentViewName = viewKind === "allGroups" ? "Все группы" : viewKind === "allTeachers" ? "Все преподаватели" : viewKind === "allRooms" ? "Все аудитории" : (byId(list, viewId)?.name || "");
   const isGroupDayTemporarilyBlocked = (day) => {
     if (viewKind !== "group" || weekScope !== "week" || !viewId) return false;
     const date = dateForScheduleDay(day);
@@ -9141,6 +9494,8 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       const match =
         (viewKind === "group" && belongsToScheduleGroup(inst, viewId)) ||
         (viewKind === "allGroups") ||
+        (viewKind === "allTeachers") ||
+        (viewKind === "allRooms") ||
         (viewKind === "teacher" && inst.teacherId === viewId) ||
         (viewKind === "room" && assignmentRoomIds(a).includes(viewId));
       if (match) out.push({ inst, a });
@@ -9158,7 +9513,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === subDate && Number(x.targetPeriod) === Number(period))) {
         const cell = movedCellForSubstitution(data, sub);
         if (!cell) continue;
-        const match = (viewKind === "group" && belongsToScheduleGroup(cell.inst, viewId)) || viewKind === "allGroups" || (viewKind === "teacher" && (cell.subOverride?.teacherId || cell.inst.teacherId) === viewId) || (viewKind === "room" && assignmentRoomIds(cell.a).includes(viewId));
+        const match = (viewKind === "group" && belongsToScheduleGroup(cell.inst, viewId)) || viewKind === "allGroups" || viewKind === "allTeachers" || viewKind === "allRooms" || (viewKind === "teacher" && (cell.subOverride?.teacherId || cell.inst.teacherId) === viewId) || (viewKind === "room" && assignmentRoomIds(cell.a).includes(viewId));
         if (match) out.push(cell);
       }
     }
@@ -9197,6 +9552,36 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === subDate && Number(x.targetPeriod) === Number(period))) {
         const cell = movedCellForSubstitution(data, sub);
         if (cell && belongsToScheduleGroup(cell.inst, groupId)) out.push(cell);
+      }
+    }
+    return out;
+  };
+
+  // v1707: агрегированные представления «Все преподаватели» / «Все аудитории».
+  // Они используют тот же недельный индекс, что и «Все группы», поэтому не требуют
+  // отдельного расчёта расписания и отражают замены на выбранную дату.
+  const aggregateEntityCellFor = (kind, entityId, day, period) => {
+    if (!sched) return [];
+    const out = [];
+    const sourceRows = weekScope === "all"
+      ? (semesterCellIndex.byDayPeriod.get(`${Number(day)}:${Number(period)}`) || [])
+      : (semesterCellIndex.bySlot.get(`${Number(scheduleWeek)}:${Number(day)}:${Number(period)}`) || []);
+    const matches = (cell) => {
+      if (kind === "teacher") return String(cell.subOverride?.teacherId || cell.inst.teacherId || "") === String(entityId);
+      return assignmentRoomIds(cell.a).map(String).includes(String(entityId));
+    };
+    for (const row of sourceRows) {
+      const inst = row.inst, a = row.a;
+      if (!a || a.day !== day || a.period !== period) continue;
+      if (weekScope === "week" && totalWeeksInSchedule > 0 && !instanceVisibleInScheduleWeek(inst, day, period, scheduleWeek)) continue;
+      if (weekScope === "all" && totalWeeksInSchedule > 0 && actualWeeksForAssignedDay(inst, day).length === 0) continue;
+      const cell = (subDate && weekdayOf(subDate) === day) ? overlayForCell(inst, a, subDate, data.substitutions) : { inst, a, subOverride: null };
+      if (matches(cell)) out.push(cell);
+    }
+    if (subDate && weekdayOf(subDate) === day) {
+      for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === subDate && Number(x.targetPeriod) === Number(period))) {
+        const cell = movedCellForSubstitution(data, sub);
+        if (cell && matches(cell)) out.push(cell);
       }
     }
     return out;
@@ -9783,7 +10168,10 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     if (!target.groupId || target.groupId !== other.groupId) return false;
     const a = Number(target.subgroup || 0), b = Number(other.subgroup || 0);
     if (!(a > 0 && b > 0 && a !== b)) return false;
-    if (!target.teacherId || !other.teacherId || target.teacherId === other.teacherId) return false;
+    if (!target.teacherId || !other.teacherId) return false;
+    // v1690: в спортивном зале один преподаватель может одновременно вести
+    // две разные группы. Ограничение здесь относится к числу групп в зале,
+    // а не к числу преподавателей. Третья группа всё равно запрещена ниже.
     return true;
   };
 
@@ -9856,17 +10244,19 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const other = enrichScheduleInstance(otherRaw);
     if (!target || !other || target.instId === other.instId) return false;
     if (target.format === "remote" || other.format === "remote") return false;
-    if (!target.teacherId || !other.teacherId || target.teacherId === other.teacherId) return false;
+    // v1694: спортзал — специальное ручное исключение. Две разные группы
+    // могут заниматься одновременно и с РАЗНЫМИ преподавателями, и с ОДНИМ
+    // преподавателем. Ограничение здесь задаётся числом групп в спортзале,
+    // а не конфликтом teacherId. Автогенератор это исключение не использует.
+    if (!target.teacherId || !other.teacherId) return false;
     const targetGroups = streamGroups(target);
     const otherGroups = streamGroups(other);
     if (targetGroups.length !== 1 || otherGroups.length !== 1) return false;
     if (targetGroups[0] === otherGroups[0]) return false;
     const room = byId(data.rooms, roomId);
     if (!isGymRoomType(room)) return false;
-    const roomCapacity = Number(room?.capacity) || 0;
-    if (!roomCapacity) return false;
-    const combined = (Number(target.requiredCapacity) || 0) + (Number(other.requiredCapacity) || 0);
-    if (combined > roomCapacity) return false;
+    // Вместимость спортзала не является жёстким запретом для ручной постановки:
+    // реальное жёсткое правило — не более двух разных групп одновременно.
     return true;
   };
 
@@ -9889,6 +10279,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     let softened = { ...(assignmentMap || {}) };
     let teacherMultiRoom = false;
     let sameSubjectTeacherSameRoom = false;
+    let multiGroupRoom = false;
     const targetRoomIds = [roomId, extraRoomId].filter(Boolean);
     const sameTeacherAtSlot = (instancesList || []).filter((otherRaw) => {
       if (otherRaw?.instId === instId) return false;
@@ -9903,7 +10294,15 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     if (sameTeacherAtSlot.length === 1) {
       const otherRaw = sameTeacherAtSlot[0];
       const a = assignmentMap?.[otherRaw.instId];
-      if (manualSameSubjectTeacherSameRoomCompatible(target, otherRaw, targetRoomIds, a)) {
+      if (roomId && manualSameRoomMultiGroupCompatible(target, otherRaw, roomId)) {
+        // v1690: специальное ручное исключение для спортзала. Один и тот же
+        // преподаватель может вести одновременно две разные группы в одном
+        // спортивном зале. Удаляем уже стоящую пару только из временной карты
+        // проверки canPlace — из реального расписания она НЕ удаляется.
+        // Ровно одна уже стоящая пара => после добавления будет максимум 2 группы.
+        delete softened[otherRaw.instId];
+        multiGroupRoom = true;
+      } else if (manualSameSubjectTeacherSameRoomCompatible(target, otherRaw, targetRoomIds, a)) {
         delete softened[otherRaw.instId];
         sameSubjectTeacherSameRoom = true;
       } else if (manualSameTeacherMultiRoomCompatible(target, otherRaw, targetRoomIds, a)) {
@@ -9911,9 +10310,9 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         teacherMultiRoom = true;
       }
     }
-    if (sameSubjectTeacherSameRoom || teacherMultiRoom) {
+    if (sameSubjectTeacherSameRoom || teacherMultiRoom || multiGroupRoom) {
       const retryTeacher = canPlace(softened, instancesList, data.rooms, instId, day, period, roomId, extraRoomId, proposedHalf, data.config);
-      if (retryTeacher.ok) return { ...retryTeacher, ...(sameSubjectTeacherSameRoom ? {manualSameSubjectTeacherSameRoom:true} : {}), ...(teacherMultiRoom ? {manualTeacherMultiRoom:true} : {}) };
+      if (retryTeacher.ok) return { ...retryTeacher, ...(sameSubjectTeacherSameRoom ? {manualSameSubjectTeacherSameRoom:true} : {}), ...(teacherMultiRoom ? {manualTeacherMultiRoom:true} : {}), ...(multiGroupRoom ? {manualMultiGroupRoom:true} : {}) };
       // Continue below: the only remaining blocker may be an explicitly shared room.
     } else {
       softened = { ...(assignmentMap || {}) };
@@ -9923,7 +10322,6 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const enrichedTarget = enrichScheduleInstance(target);
     if (!enrichedTarget || enrichedTarget.format === "remote") return base;
     let shared = false;
-    let multiGroupRoom = false;
     // v1620: общий спортзал — максимум две группы одновременно. Если в зале
     // уже есть две пересекающиеся по неделям пары, третью ручной редактор не
     // пропускает и не пытается «размягчить» конфликт аудитории.
@@ -10737,7 +11135,25 @@ ${(option.warnings || []).join('; ') || 'мягкое ограничение'}
   };
 
   const placeUnplacedDisplayGroup = (instIds, day, period, roomId, extraRoomId = null, options = {}) => {
-    const ids = [...new Set(instIds || [])];
+    let ids = [...new Set(instIds || [])];
+    // v1697: ручная постановка одного визуального блока размещает ТОЛЬКО один
+    // графический слой. Раньше из-за старых stream/repair-группировок в ids могли
+    // одновременно оказаться L1 и L2 одной строки; тогда один клик ставил обе
+    // пары в одну физическую ячейку. Оставляем слой первой выбранной карточки,
+    // а остальные слои остаются в «Не размещено».
+    if (ids.length > 1) {
+      const firstRaw = (sched.instances || []).find((x)=>String(x?.instId)===String(ids[0]));
+      const firstLoad = String(firstRaw?.loadId || "");
+      const firstLayer = unplacedGraphLayer(firstRaw);
+      if (firstRaw && firstLoad) {
+        const sameLayer = ids.filter((id) => {
+          const row = (sched.instances || []).find((x)=>String(x?.instId)===String(id));
+          if (!row) return false;
+          return String(row.loadId || "") !== firstLoad || unplacedGraphLayer(row) === firstLayer;
+        });
+        if (sameLayer.length) ids = sameLayer;
+      }
+    }
     if (ids.length <= 1) return placeInstance(ids[0], day, period, roomId, extraRoomId, options);
     const merged = mergedUnplacedDisplayInstance(ids);
     if (!merged) return { ok:false, reason:"Блок не найден" };
@@ -11193,6 +11609,8 @@ ${check.reason || "Конфликт расписания"}
         if (viewKind === "group" && !belongsToScheduleGroup(inst, viewId)) return false;
         if (viewKind === "allGroups" && (!groupId || !belongsToScheduleGroup(inst, groupId))) return false;
         if (viewKind === "teacher" && inst.teacherId !== viewId) return false;
+        if (viewKind === "allTeachers" && !inst.teacherId) return false;
+        if (viewKind === "allRooms" && inst.format === "remote") return false;
         if (viewKind === "room") {
           if (inst.format === "remote") return false; // дистанту аудитория не нужна
           const room = byId(data.rooms, viewId);
@@ -11269,7 +11687,8 @@ ${check.reason || "Конфликт расписания"}
       if (viewKind === "group" && !belongsToScheduleGroup(inst, viewId)) continue;
       if (viewKind === "allGroups" && (!groupId || !belongsToScheduleGroup(inst, groupId))) continue;
       if (viewKind === "teacher" && inst.teacherId !== viewId) continue;
-      if (viewKind === "room" && inst.format === "remote") continue;
+      if (viewKind === "allTeachers" && !inst.teacherId) continue;
+      if ((viewKind === "room" || viewKind === "allRooms") && inst.format === "remote") continue;
       // v107: в недельном просмотре предложение должно относиться к реально
       // видимой паре этой недели. Раньше сюда попадали шаблоны из других недель,
       // из-за чего в списке появлялись переносы, которых пользователь не видел.
@@ -11478,39 +11897,280 @@ ${check.reason || "Конфликт расписания"}
     URL.revokeObjectURL(url);
   };
 
-  const exportCSV = () => {
-    if (!sched) return;
-    const rows = [["№", "Время", ...activeDayIndices.map((d) => DAY_LABELS_FULL[d])]];
-    for (let p = 0; p < data.config.periodsPerDay; p++) {
-      const row = [String(p + 1), data.config.periodTimes[p] || ""];
-      for (const day of activeDayIndices) {
-        const cells = cellFor(day, p);
-        if (cells.length === 0) { row.push(""); continue; }
-        const texts = cells.map((cell) => {
-          if (cell.subOverride?.cancelled) return "отменено";
-          const { subj } = lessonLabel(cell.inst, data);
-          const teacher = byId(data.teachers, cell.subOverride?.teacherId || cell.inst.teacherId)?.name || "";
-          const group = instanceGroupNames(data, cell.inst).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
-          const room = assignmentRoomLabel(data, cell.a) || "";
-          const parts = [subj];
-          if (viewKind !== "teacher") parts.push(teacher);
-          if (viewKind !== "group") parts.push(group);
-          if (viewKind !== "room") parts.push(cell.inst.format === "remote" ? "дистанционно" : room);
-          if (cell.inst.weekPattern && cell.inst.weekPattern !== "all") parts.push(weekNumbersLabel(data.config, cell.inst));
-          return parts.join(" / ");
-        });
-        row.push(texts.join("  |  "));
+  // v1707: Excel-выгрузка расписания в формате шаблона СПбГУ,
+  // присланного пользователем: вертикальный день слева, время, название,
+  // место и преподаватель/группа; для семестра отдельная колонка «Даты».
+  const excelSafeSheetName = (value, fallback = "Расписание") => {
+    const cleaned = String(value || fallback).replace(/[\\/?*\[\]:]/g, " ").trim().slice(0, 31) || fallback;
+    return cleaned;
+  };
+
+  const excelLongDate = (dateStr) => {
+    if (!dateStr) return "";
+    const d = new Date(dateStr + "T00:00:00");
+    return `${d.getDate()} ${RU_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+  };
+
+  const excelPeriodCaption = (startDate, endDate) => {
+    if (!startDate || !endDate) return "";
+    return `${excelLongDate(startDate)} - ${excelLongDate(endDate)} г. на дату ${formatDateDM(todayISO())}`;
+  };
+
+  const excelEntityTitle = (kind, entity) => {
+    if (kind === "room") return `Аудитория ${entity?.name || ""}`.trim();
+    return entity?.name || "Расписание";
+  };
+
+  const excelHeadersForKind = (kind, semester = false) => {
+    if (kind === "teacher") return semester
+      ? ["", "Время", "Даты", "Название", "Места проведения", "Учебные группы"]
+      : ["", "Время", "Название", "Места проведения", "Учебные группы"];
+    if (kind === "room") return semester
+      ? ["", "Время", "Даты", "Название", "Учебные группы", "Преподаватели"]
+      : ["", "Время", "Название", "Учебные группы", "Преподаватели"];
+    return semester
+      ? ["", "Время", "Даты", "Название", "Места проведения", "Преподаватели"]
+      : ["", "Время", "Название", "Места проведения", "Преподаватели"];
+  };
+
+  const excelLessonRecord = (kind, entityId, cell, day, period, date = "") => {
+    if (!cell?.inst || !cell?.a || cell.subOverride?.cancelled) return null;
+    const { subj, type } = lessonLabel(cell.inst, data);
+    const subgroup = Number(cell.inst.subgroup || 0) > 0 ? `\nПодгруппа ${cell.inst.subgroup}` : "";
+    const title = `${subj}, ${type}${subgroup}`;
+    const teacher = byId(data.teachers, cell.subOverride?.teacherId || cell.inst.teacherId)?.name || "";
+    const groups = instanceGroupNames(data, cell.inst).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
+    const room = cell.inst.format === "remote"
+      ? "С использованием информационно-коммуникационных технологий"
+      : (assignmentRoomLabel(data, cell.a) || "");
+    // v1708: время берём по фактической группе и дате пары. Это важно для
+    // групп, у которых сетка звонков различается на числителе/знаменателе.
+    // Работает одинаково и в листах групп, и в листах преподавателей/аудиторий.
+    const groupIdForTime = cell.inst.groupId || (kind === "group" ? entityId : "");
+    const time = groupIdForTime
+      ? (periodTimeForGroupDay(data, groupIdForTime, day, period, date || "") || data.config.periodTimes?.[period] || "")
+      : (data.config.periodTimes?.[period] || "");
+    return { day, period, date, time, title, teacher, groups, room };
+  };
+
+  const excelWeekRowsForEntity = (kind, entityId) => {
+    const rows = [];
+    const weekMonday = data.config.semesterStart
+      ? addDays(mondayOf(data.config.semesterStart), (scheduleWeek - 1) * 7)
+      : "";
+    for (const day of activeDayIndices) {
+      const actualDate = weekMonday ? addDays(weekMonday, day) : "";
+      for (let period = 0; period < data.config.periodsPerDay; period++) {
+        const cells = kind === "group"
+          ? groupCellFor(entityId, day, period)
+          : aggregateEntityCellFor(kind, entityId, day, period);
+        for (const cell of cells) {
+          // groupCellFor/aggregateEntityCellFor уже фильтруют выбранную неделю по
+          // weekPattern/customWeeks. Передаём дату ещё и для чётностной сетки звонков.
+          const rec = excelLessonRecord(kind, entityId, cell, day, period, actualDate);
+          if (rec) rows.push(rec);
+        }
       }
-      rows.push(row);
     }
-    const csv = rows.map((r) => r.map(csvEscape).join(";")).join("\n");
-    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `raspisanie_${currentViewName || "grid"}.csv`.replace(/\s+/g, "_");
-    a.click();
-    URL.revokeObjectURL(url);
+    return rows.sort((a,b)=>a.day-b.day || a.period-b.period || a.title.localeCompare(b.title,"ru"));
+  };
+
+  const excelSemesterRowsForEntity = (kind, entityId) => {
+    if (!sched || !data.config.semesterStart) return [];
+    const records = [];
+    const total = totalSemesterWeeks(data.config);
+    for (let week = 1; week <= total; week++) {
+      const wm = addDays(mondayOf(data.config.semesterStart), (week - 1) * 7);
+      for (const day of activeDayIndices) {
+        const date = addDays(wm, day);
+        if (date < data.config.semesterStart || date > data.config.semesterEnd || isNoClassDate(data, date)) continue;
+        for (const inst of sched.instances || []) {
+          const base = sched.assignment?.[inst.instId];
+          if (!base || base.day !== day || !instanceAppliesToDate(data.config, inst, date)) continue;
+          const overlay = overlayForCell(inst, base, date, data.substitutions || []);
+          if (overlay?.subOverride?.cancelled) continue;
+          const teacherId = String(overlay?.subOverride?.teacherId || inst.teacherId || "");
+          const roomIds = assignmentRoomIds(overlay?.a || base).map(String);
+          const match = kind === "group"
+            ? belongsToScheduleGroup(inst, entityId)
+            : kind === "teacher"
+              ? teacherId === String(entityId)
+              : roomIds.includes(String(entityId));
+          if (!match) continue;
+          const rec = excelLessonRecord(kind, entityId, overlay, day, overlay.a.period, date);
+          if (rec) records.push(rec);
+        }
+        // Перенесённые пары живут в дате назначения и не обязательно присутствуют
+        // в обычном индексе дня/пары, поэтому добавляем их отдельно.
+        for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === date)) {
+          const cell = movedCellForSubstitution(data, sub);
+          if (!cell) continue;
+          const teacherId = String(cell.subOverride?.teacherId || cell.inst.teacherId || "");
+          const roomIds = assignmentRoomIds(cell.a).map(String);
+          const match = kind === "group"
+            ? belongsToScheduleGroup(cell.inst, entityId)
+            : kind === "teacher"
+              ? teacherId === String(entityId)
+              : roomIds.includes(String(entityId));
+          if (!match) continue;
+          const rec = excelLessonRecord(kind, entityId, cell, day, Number(cell.a.period), date);
+          if (rec) records.push(rec);
+        }
+      }
+    }
+    const grouped = new Map();
+    for (const r of records) {
+      const key = [r.day,r.period,r.time,r.title,r.room,r.teacher,r.groups].join("|");
+      if (!grouped.has(key)) grouped.set(key,{...r,dates:[]});
+      grouped.get(key).dates.push(r.date);
+    }
+    return [...grouped.values()].sort((a,b)=>a.day-b.day || a.period-b.period || a.title.localeCompare(b.title,"ru"));
+  };
+
+  const applySpbuExcelTemplate = (ws, rows, semester, kind) => {
+    const colCount = semester ? 6 : 5;
+    ws["!cols"] = semester
+      ? [{wch:7.14},{wch:21.43},{wch:28.57},{wch:57.14},{wch:42.86},{wch:57.14}]
+      : [{wch:7.14},{wch:21.43},{wch:57.14},{wch:42.86},{wch:57.14}];
+    ws["!rows"] = ws["!rows"] || [];
+    ws["!rows"][0] = { hpt: 22.5 };
+    const merges = ws["!merges"] || [];
+    merges.push({s:{r:0,c:0},e:{r:0,c:colCount-1}});
+    merges.push({s:{r:1,c:0},e:{r:1,c:colCount-1}});
+
+    const titleStyle = { font:{name:"Times New Roman",sz:18,bold:true,color:{rgb:"000000"}}, alignment:{horizontal:"center",vertical:"center"} };
+    const headerStyle = { font:{name:"Times New Roman",sz:11,bold:true}, alignment:{horizontal:"center",vertical:"center",wrapText:true} };
+    const bodyStyle = { font:{name:"Times New Roman",sz:11}, alignment:{horizontal:"center",vertical:"center",wrapText:true} };
+    const dayStyle = { font:{name:"Times New Roman",sz:11}, alignment:{horizontal:"center",vertical:"center",textRotation:90,wrapText:true} };
+    if (ws.A1) ws.A1.s = titleStyle;
+    if (ws.A2) ws.A2.s = headerStyle;
+    for (let c=1;c<colCount;c++) {
+      const addr=XLSX.utils.encode_cell({r:3,c});
+      if (ws[addr]) ws[addr].s=headerStyle;
+    }
+
+    let excelRow = 4; // 0-based; data begins on Excel row 5
+    const dayRanges = [];
+    let activeDay = null, dayStart = null;
+    rows.forEach((row, idx) => {
+      if (activeDay !== row.day) {
+        if (activeDay != null && dayStart != null && excelRow-1 > dayStart) dayRanges.push([dayStart,excelRow-1]);
+        activeDay = row.day;
+        dayStart = excelRow;
+      }
+      for (let c=0;c<colCount;c++) {
+        const addr=XLSX.utils.encode_cell({r:excelRow,c});
+        if (ws[addr]) ws[addr].s = c===0 ? dayStyle : bodyStyle;
+      }
+      const longText = Math.max(String(row.title||"").length, String(row.room||"").length, String(row.groups||"").length);
+      if (longText > 85 || String(row.title||"").includes("\n")) ws["!rows"][excelRow] = {hpt:45};
+      else if (longText > 55) ws["!rows"][excelRow] = {hpt:30};
+      excelRow++;
+    });
+    if (activeDay != null && dayStart != null && excelRow-1 > dayStart) dayRanges.push([dayStart,excelRow-1]);
+    for (const [r1,r2] of dayRanges) merges.push({s:{r:r1,c:0},e:{r:r2,c:0}});
+    ws["!merges"] = merges;
+  };
+
+  // v1708: формат дат с учётом числителя/знаменателя. Если одно и то же
+  // занятие повторяется через неделю, не маскируем это диапазоном "каждую неделю".
+  const excelSemesterDatesCaption = (dates = []) => {
+    const sorted = [...new Set((dates || []).filter(Boolean))].sort();
+    if (!sorted.length) return "";
+    const paritySet = new Set(sorted.map((d) => weekParityForDate(data.config, d)).filter(Boolean));
+    const oneParity = paritySet.size === 1 ? [...paritySet][0] : null;
+    const parityLabel = oneParity === "odd" ? "числитель" : oneParity === "even" ? "знаменатель" : "";
+
+    const chunks = [];
+    let start = sorted[0], prev = sorted[0], step = null, count = 1;
+    const flush = () => {
+      if (count === 1) chunks.push(formatDateDM(start));
+      else if (step === 7) chunks.push(`${formatDateDM(start)}–${formatDateDM(prev)} (${count})`);
+      else if (step === 14) chunks.push(`${formatDateDM(start)}–${formatDateDM(prev)} (через неделю, ${count})`);
+      else chunks.push(`${formatDateDM(start)}–${formatDateDM(prev)} (${count})`);
+    };
+    for (let i=1;i<sorted.length;i++) {
+      const diff = Math.round((new Date(sorted[i]+"T00:00:00") - new Date(prev+"T00:00:00"))/86400000);
+      if ((step == null && (diff === 7 || diff === 14)) || diff === step) {
+        step = step == null ? diff : step;
+        prev = sorted[i]; count++; continue;
+      }
+      flush(); start = prev = sorted[i]; step = null; count = 1;
+    }
+    flush();
+    const base = chunks.join("; ");
+    return parityLabel ? `${base} — ${parityLabel}` : base;
+  };
+
+  const makeSpbuExcelSheet = (kind, entity, semester = false) => {
+    const rows = semester ? excelSemesterRowsForEntity(kind, entity.id) : excelWeekRowsForEntity(kind, entity.id);
+    const headers = excelHeadersForKind(kind, semester);
+    const startDate = semester
+      ? data.config.semesterStart
+      : addDays(mondayOf(data.config.semesterStart), (scheduleWeek - 1) * 7);
+    // В присланном недельном шаблоне период подписан от понедельника до
+    // следующего понедельника, поэтому повторяем формат буквально (+7 дней).
+    const endDate = semester ? data.config.semesterEnd : addDays(startDate, 7);
+    const aoa = [
+      [excelEntityTitle(kind, entity)],
+      [excelPeriodCaption(startDate, endDate)],
+      [],
+      headers,
+    ];
+    for (const row of rows) {
+      const dayDate = semester ? "" : addDays(startDate, row.day);
+      const dayLabel = semester
+        ? DAY_LABELS_FULL[row.day]
+        : `${DAY_LABELS_FULL[row.day].toLowerCase()}\n ${formatRuDate(dayDate)}`;
+      if (kind === "teacher") {
+        aoa.push(semester
+          ? [dayLabel,row.time,excelSemesterDatesCaption(row.dates || []),row.title,row.room,row.groups]
+          : [dayLabel,row.time,row.title,row.room,row.groups]);
+      } else if (kind === "room") {
+        aoa.push(semester
+          ? [dayLabel,row.time,excelSemesterDatesCaption(row.dates || []),row.title,row.groups,row.teacher]
+          : [dayLabel,row.time,row.title,row.groups,row.teacher]);
+      } else {
+        aoa.push(semester
+          ? [dayLabel,row.time,excelSemesterDatesCaption(row.dates || []),row.title,row.room,row.teacher]
+          : [dayLabel,row.time,row.title,row.room,row.teacher]);
+      }
+    }
+    const ws = XLSX.utils.aoa_to_sheet(aoa);
+    applySpbuExcelTemplate(ws, rows, semester, kind);
+    return ws;
+  };
+
+  const exportScheduleExcel = () => {
+    if (!sched) return;
+    const wb = XLSX.utils.book_new();
+    const semester = weekScope === "all" || viewKind === "semesterAll";
+    const used = new Set();
+    const appendEntity = (kind, entity) => {
+      if (!entity?.id) return;
+      let name = excelSafeSheetName(entity.name || (kind === "room" ? `Аудитория ${entity.id}` : "Расписание"));
+      let base=name, n=2;
+      while (used.has(name)) name=`${base.slice(0,27)} ${n++}`;
+      used.add(name);
+      XLSX.utils.book_append_sheet(wb, makeSpbuExcelSheet(kind, entity, semester), name);
+    };
+
+    if (viewKind === "allTeachers") {
+      [...data.teachers].sort((a,b)=>String(a.name||"").localeCompare(String(b.name||""),"ru")).forEach((x)=>appendEntity("teacher",x));
+    } else if (viewKind === "allRooms") {
+      [...data.rooms].sort((a,b)=>String(a.name||"").localeCompare(String(b.name||""),"ru",{numeric:true})).forEach((x)=>appendEntity("room",x));
+    } else if (viewKind === "allGroups" || viewKind === "semesterAll") {
+      [...data.groups].sort((a,b)=>String(a.name||"").localeCompare(String(b.name||""),"ru",{numeric:true})).forEach((x)=>appendEntity("group",x));
+    } else if (viewKind === "teacher") {
+      appendEntity("teacher",byId(data.teachers,viewId));
+    } else if (viewKind === "room") {
+      appendEntity("room",byId(data.rooms,viewId));
+    } else {
+      appendEntity("group",byId(data.groups,viewId));
+    }
+    if (!wb.SheetNames.length) return;
+    const scope = semester ? "ves_semester" : `nedelya_${scheduleWeek}`;
+    XLSX.writeFile(wb, `raspisanie_${currentViewName || "raspisanie"}_${scope}.xlsx`.replace(/[\\/:*?"<>|\s]+/g,"_"), { cellStyles: true });
   };
 
   const exportWord = () => {
@@ -11589,35 +12249,33 @@ th{background:#1E3A5F;color:#ffffff;}
     <div className="section">
       <header className="section-head">
         <h1>Расписание</h1>
-        <p>Автоматический, ручной и комбинированный режим — закреплённые вручную пары алгоритм не трогает при повторной генерации.</p>
+        <p>Ручное редактирование расписания. Функции автоматического расчёта временно скрыты из интерфейса.</p>
       </header>
 
       <div className="schedule-toolbar">
-        <button className="btn primary" onClick={() => onGenerate()} disabled={generating}>
-          {generating ? <Loader2 className="spin" size={16} /> : <Wand2 size={16} />}
-          {generating ? (generationStatus || "Считаю на сервере…") : sched ? "Пересчитать (сохранив закреплённые)" : "Сгенерировать расписание"}
-        </button>
-        {!generating && <button className="btn ghost" onClick={() => onGenerate("", { fastMode: true })} title="Быстрый расчёт: короткие пакеты и минимальная доводка; данные и закреплённые пары сохраняются">
-          ⚡ Быстрый расчёт
-        </button>}
-        {generating && <button className="btn ghost" onClick={onCancelGenerate} title="Остановить серверный расчёт; уже готовые пакеты останутся сохранены">
-          <X size={16}/> Остановить расчёт
-        </button>}
+        {SHOW_AUTO_CALC_CONTROLS && <>
+          <button className="btn primary" onClick={() => onGenerate()} disabled={generating}>
+            {generating ? <Loader2 className="spin" size={16} /> : <Wand2 size={16} />}
+            {generating ? (generationStatus || "Считаю на сервере…") : sched ? "Пересчитать (сохранив закреплённые)" : "Сгенерировать расписание"}
+          </button>
+          {!generating && <button className="btn ghost" onClick={() => onGenerate("", { fastMode: true })} title="Быстрый расчёт: короткие пакеты и минимальная доводка; данные и закреплённые пары сохраняются">⚡ Быстрый расчёт</button>}
+          {generating && <button className="btn ghost" onClick={onCancelGenerate} title="Остановить серверный расчёт; уже готовые пакеты останутся сохранены"><X size={16}/> Остановить расчёт</button>}
+        </>}
 
         {sched && (
           <>
-            {viewKind === "group" && viewId && <button className="btn ghost" onClick={() => onGenerate(viewId)} disabled={generating} title="Пересчитать только выбранную группу, сохранив расписание остальных групп">
+            {SHOW_AUTO_CALC_CONTROLS && viewKind === "group" && viewId && <button className="btn ghost" onClick={() => onGenerate(viewId)} disabled={generating} title="Пересчитать только выбранную группу, сохранив расписание остальных групп">
               <Wand2 size={15}/> Пересчитать группу
             </button>}
-            {viewKind === "group" && viewId && !generating && <button className="btn ghost" onClick={() => onGenerate(viewId, { fastMode: true })} title="Быстро пересчитать только выбранную группу; остальные группы и закреплённые пары не меняются">
+            {SHOW_AUTO_CALC_CONTROLS && viewKind === "group" && viewId && !generating && <button className="btn ghost" onClick={() => onGenerate(viewId, { fastMode: true })} title="Быстро пересчитать только выбранную группу; остальные группы и закреплённые пары не меняются">
               ⚡ Быстро группу
             </button>}
             {viewKind === "group" && viewId && !generating && <button className={"btn ghost" + (isCurrentGroupScheduleFrozen() ? " on" : "")} onClick={toggleCurrentGroupScheduleFreeze} title={isCurrentGroupScheduleFrozen() ? "Разрешить автогенератору снова менять эту группу" : "Зафиксировать все текущие пары группы: общая генерация других групп больше не сможет их передвигать или удалять"}>
               {isCurrentGroupScheduleFrozen() ? "🔒 Группа зафиксирована" : "🔓 Зафиксировать группу"}
             </button>}
             <div className="view-switch">
-              {[{ k: "group", label: "По группам" }, { k: "allGroups", label: "Все группы" }, { k: "semesterAll", label: "Весь семестр" }, { k: "teacher", label: "По преподавателям" }, { k: "room", label: "По аудиториям" }].map((o) => (
-                <button key={o.k} className={"pill" + (viewKind === o.k ? " on" : "")} onClick={() => { setViewKind(o.k); if (o.k !== "group" && typeof onRouteGroupChange === "function") onRouteGroupChange(""); if (o.k === "allGroups") setWeekScope("week"); }}>{o.label}</button>
+              {[{ k: "group", label: "По группам" }, { k: "allGroups", label: "Все группы" }, { k: "semesterAll", label: "Весь семестр" }, { k: "teacher", label: "По преподавателям" }, { k: "allTeachers", label: "Все преподаватели" }, { k: "room", label: "По аудиториям" }, { k: "allRooms", label: "Все аудитории" }].map((o) => (
+                <button key={o.k} className={"pill" + (viewKind === o.k ? " on" : "")} onClick={() => { setViewKind(o.k); if (o.k !== "group" && typeof onRouteGroupChange === "function") onRouteGroupChange(""); if (["allGroups","allTeachers","allRooms"].includes(o.k)) setWeekScope("week"); }}>{o.label}</button>
               ))}
             </div>
             {(viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll") && (
@@ -11626,18 +12284,18 @@ th{background:#1E3A5F;color:#ffffff;}
                 {data.specialties.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             )}
-            {viewKind !== "allGroups" && viewKind !== "semesterAll" && <SearchableSelect value={viewId} onChange={selectScheduleViewId} options={listOptions} placeholder={viewKind === "group" ? "Выберите группу…" : viewKind === "teacher" ? "Выберите преподавателя…" : "Выберите аудиторию…"} />}
+            {!["allGroups","allTeachers","allRooms","semesterAll"].includes(viewKind) && <SearchableSelect value={viewId} onChange={selectScheduleViewId} options={listOptions} placeholder={viewKind === "group" ? "Выберите группу…" : viewKind === "teacher" ? "Выберите преподавателя…" : "Выберите аудиторию…"} />}
             {viewKind !== "semesterAll" && totalWeeksInSchedule > 0 && <div className="admin-week-nav">
               <button className="icon-btn" disabled={weekScope !== "week" || scheduleWeek <= 1} onClick={()=>setScheduleWeek((w)=>Math.max(1,w-1))}>«</button>
               <button className={"week-chip " + (weekScope === "week" ? (parityForWeekNumber(data.config,scheduleWeek)==="odd" ? "odd" : "even") : "")} onClick={()=>setWeekScope("week")} title="Показывать одну неделю"><span className="week-chip-num">{scheduleWeek}</span><span className="week-chip-label">{parityForWeekNumber(data.config,scheduleWeek)==="odd" ? "числ." : "знам."}</span></button>
               <button className="icon-btn" disabled={weekScope !== "week" || scheduleWeek >= totalWeeksInSchedule} onClick={()=>setScheduleWeek((w)=>Math.min(totalWeeksInSchedule,w+1))}>»</button>
-              {viewKind !== "allGroups" && <button className={"btn ghost sm" + (weekScope === "all" ? " on" : "")} onClick={()=>setWeekScope("all")}>Все недели</button>}
+              {!["allGroups","allTeachers","allRooms"].includes(viewKind) && <button className={"btn ghost sm" + (weekScope === "all" ? " on" : "")} onClick={()=>setWeekScope("all")}>Все недели</button>}
             </div>}
             {viewKind !== "semesterAll" && <div className="weekly-mode-controls">
               {!weeklyPlanningMode ? <button className="btn ghost" onClick={enterWeeklyPlanningMode}>📅 Перейти в недельный режим</button> : <>
                 <span className="week-mode-badge">Неделя {scheduleWeek}</span>
-                <button className="btn primary" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate("", { fastMode:true, weekNumber:scheduleWeek })}>⚡ Собрать неделю автоматически</button>
-                {viewKind === "group" && viewId && <button className="btn ghost" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate(viewId, { fastMode:true, weekNumber:scheduleWeek })}>⚡ Только эту группу</button>}
+                {SHOW_AUTO_CALC_CONTROLS && <button className="btn primary" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate("", { fastMode:true, weekNumber:scheduleWeek })}>⚡ Собрать неделю автоматически</button>}
+                {SHOW_AUTO_CALC_CONTROLS && viewKind === "group" && viewId && <button className="btn ghost" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate(viewId, { fastMode:true, weekNumber:scheduleWeek })}>⚡ Только эту группу</button>}
                 <button className="btn ghost" onClick={()=>setWeeklyPlanningMode(false)}>Выйти из недельного режима</button>
               </>}
             </div>}
@@ -11646,9 +12304,9 @@ th{background:#1E3A5F;color:#ffffff;}
               Ручное редактирование
             </label>
             <input type="date" className="date-input" value={subDate} onChange={(e) => setSubDate(e.target.value)} title="Показать замены на дату" />
-            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportCSV}><Download size={15} /> CSV / Excel</button>}
+            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
             {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportWord}><Download size={15} /> Word (.doc)</button>}
-            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportSemesterAllExcel}><Download size={15} /> Excel (.xlsx)</button>}
+            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
             {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportSemesterAllWord}><Download size={15} /> Word (.doc)</button>}
             <button className="btn ghost" onClick={() => window.print()}>Печать / HTML</button>
             <div className="publish-controls">
@@ -11708,6 +12366,21 @@ th{background:#1E3A5F;color:#ffffff;}
           <span>{viewKind === "group" ? "Предупреждение относится только к выбранной группе и меняется при переключении группы. " : ""}Учитываются реальные совпадения по неделе, дню и номеру пары; параллельные п/г 1 и п/г 2 не считаются конфликтом.</span>
           {visibleSemesterGroupConflictBlocks.slice(0,6).map((c,idx)=><span key={`${c.gid}_${c.day}_${c.period}_${c.a?.instId}_${c.b?.instId}_${idx}`} className="schedule-hard-conflict-line">{viewKind === "allGroups" ? `${byId(data.groups,c.gid)?.name||"Группа"} · ` : ""}{DAY_LABELS[c.day]} · {c.period+1}-я пара · недели {c.weeks.join(", ")}: {lessonLabel(c.a,data).subj} ↔ {lessonLabel(c.b,data).subj}</span>)}
           {visibleSemesterGroupConflictBlocks.length > 6 && <span className="schedule-hard-conflict-line">…ещё {visibleSemesterGroupConflictBlocks.length - 6}</span>}
+        </div>
+      )}
+
+
+      {sched && visibleSemesterTeacherConflictBlocks.length > 0 && (viewKind === "group" || viewKind === "teacher" || viewKind === "allGroups") && (
+        <div className="schedule-hard-conflict-banner">
+          <strong>⚠ Двойная занятость преподавателя: {visibleSemesterTeacherConflictBlocks.length}{viewKind === "group" ? " · по всем группам" : ""}</strong>
+          <span>{viewKind === "group" ? "Сводка общая для всего расписания и не зависит от выбранной группы. " : ""}Один преподаватель назначен на два разных занятия в одну и ту же неделю, день и пару. Осознанные ручные исключения и параллельные п/г 1 + п/г 2 сюда не попадают.</span>
+          {visibleSemesterTeacherConflictBlocks.slice(0,6).map((c,idx)=>{
+            const teacherName=byId(data.teachers,c.teacherId)?.name||"Преподаватель";
+            const ga=instanceGroupNames(data,c.a).join(", ")||byId(data.groups,c.a?.groupId)?.name||"группа";
+            const gb=instanceGroupNames(data,c.b).join(", ")||byId(data.groups,c.b?.groupId)?.name||"группа";
+            return <span key={`${c.teacherId}_${c.day}_${c.period}_${c.a?.instId}_${c.b?.instId}_${idx}`} className="schedule-hard-conflict-line">{teacherName} · {DAY_LABELS[c.day]} · {c.period+1}-я пара · недели {c.weeks.join(", ")}: {ga} — {lessonLabel(c.a,data).subj} ↔ {gb} — {lessonLabel(c.b,data).subj}</span>;
+          })}
+          {visibleSemesterTeacherConflictBlocks.length > 6 && <span className="schedule-hard-conflict-line">…ещё {visibleSemesterTeacherConflictBlocks.length - 6}</span>}
         </div>
       )}
 
@@ -11809,12 +12482,14 @@ th{background:#1E3A5F;color:#ffffff;}
                           const locked = sched.locked.includes(cell.inst.instId);
                           const visibleWeeks = weekScope === "week" ? [scheduleWeek] : actualWeeksForAssignedDay(cell.inst, day, p);
                           const violatesAvailability = isTeacherUnavailableForWeeks(cellTeacher, day, p, visibleWeeks);
+                          const concurrentTeacher = teacherConcurrentInfoForCell(cell, day, p);
+                          const concurrentTeacherText = teacherConcurrentLabel(concurrentTeacher);
                           const cellGroupId = viewKind === "group" ? viewId : cell.inst.groupId;
                           const cellPeer = schedulePeerForCell(day, p, cellGroupId);
                           return (
                             <div key={scheduleRenderKey(cell.inst)}
                               draggable={manualMode && !cell.subOverride?.substituted}
-                              className={"lesson-chip" + (cell.inst.format === "remote" ? " remote-chip" : "") + scheduleSpecialClass(data, cell.a, viewKind === "group" ? viewId : cell.inst.groupId, day, practiceDate || "") + (cell.subOverride?.substituted ? " substituted" : "") + (violatesAvailability ? " availability-warn" : "") + (cell.inst.halfPair ? ` half-pair-chip half-${cell.a?.half ?? 0}` : "") + (manualMode ? " schedule-draggable" : "") + (draggingLesson===cell.inst.instId ? " schedule-dragging" : "")}
+                              className={"lesson-chip" + (cell.inst.format === "remote" ? " remote-chip" : "") + scheduleSpecialClass(data, cell.a, viewKind === "group" ? viewId : cell.inst.groupId, day, practiceDate || "") + (cell.subOverride?.substituted ? " substituted" : "") + (violatesAvailability ? " availability-warn" : "") + (concurrentTeacher.length ? " teacher-concurrent-warn" : "") + (cell.inst.halfPair ? ` half-pair-chip half-${cell.a?.half ?? 0}` : "") + (manualMode ? " schedule-draggable" : "") + (draggingLesson===cell.inst.instId ? " schedule-dragging" : "")}
                               onDragStart={(e)=>{if(!manualMode||cell.subOverride?.substituted){e.preventDefault();return;}e.stopPropagation();setManualError("");setDraggingLesson(cell.inst.instId);announceScheduleEditing(day,p,cellGroupId,true);e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",cell.inst.instId);}}
                               onDragEnd={()=>{setDraggingLesson(null);setDragOverSlot(null);announceScheduleEditing(day,p,cellGroupId,false);}}
                               onClick={(e) => { if (manualMode && cells.length > 1) { e.stopPropagation(); setInspecting(cell.inst.instId); } }}>
@@ -11836,6 +12511,7 @@ th{background:#1E3A5F;color:#ffffff;}
                                 {assignmentUsesExternalRoom(data,cell.a)&&<span className="special-place-badge">↗ Вознесенский пр., 44</span>}
                                 {viewKind === "group" && viewId && groupHasCustomBellDay(data,viewId,day,practiceDate||"")&&<span className="special-time-badge">🕐 смещённые звонки</span>}
                               </div>
+                              {concurrentTeacher.length > 0 && <div className="teacher-concurrent-note" title={`Преподаватель одновременно ведёт: ${concurrentTeacherText}`}><AlertTriangle size={12}/> <b>Одновременно:</b> {concurrentTeacherText}</div>}
                               {manualMode && (locked ? <Lock size={11} className="lock-icon" /> : null)}
                               {cell.subOverride?.substituted && <><span className={`sub-badge${cell.subOverride?.moved ? " moved" : ""}`}>{cell.subOverride?.moved ? "перенос" : "замена"}</span>{cell.subOverride?.format==="remote"&&<span className="sub-badge remote-change">ДО</span>}</>}
                               {violatesAvailability && <AlertTriangle size={12} className="avail-warn-icon" title="Недоступное время преподавателя" />}
@@ -11907,10 +12583,12 @@ th{background:#1E3A5F;color:#ffffff;}
                         const room = assignmentRoomLabel(data, cell.a) || "";
                         const visibleWeeks = weekScope === "week" ? [scheduleWeek] : actualWeeksForAssignedDay(cell.inst, day, p);
                         const violatesAvailability = isTeacherUnavailableForWeeks(cellTeacher, day, p, visibleWeeks);
+                        const concurrentTeacher = teacherConcurrentInfoForCell(cell, day, p);
+                        const concurrentTeacherText = teacherConcurrentLabel(concurrentTeacher);
                         const cellPeer = schedulePeerForCell(day, p, group.id);
                         return <div key={cell.inst.instId}
                           draggable={manualMode && !cell.subOverride?.substituted}
-                          className={"lesson-chip" + (cell.inst.format === "remote" ? " remote-chip" : "") + scheduleSpecialClass(data, cell.a, group.id, day, practiceDate || "") + (cell.subOverride?.substituted ? " substituted" : "") + (violatesAvailability ? " availability-warn" : "") + (cell.inst.halfPair ? ` half-pair-chip half-${cell.a?.half ?? 0}` : "") + (manualMode ? " schedule-draggable" : "") + (draggingLesson===cell.inst.instId ? " schedule-dragging" : "")}
+                          className={"lesson-chip" + (cell.inst.format === "remote" ? " remote-chip" : "") + scheduleSpecialClass(data, cell.a, group.id, day, practiceDate || "") + (cell.subOverride?.substituted ? " substituted" : "") + (violatesAvailability ? " availability-warn" : "") + (concurrentTeacher.length ? " teacher-concurrent-warn" : "") + (cell.inst.halfPair ? ` half-pair-chip half-${cell.a?.half ?? 0}` : "") + (manualMode ? " schedule-draggable" : "") + (draggingLesson===cell.inst.instId ? " schedule-dragging" : "")}
                           onDragStart={(e)=>{if(!manualMode||cell.subOverride?.substituted){e.preventDefault();return;}e.stopPropagation();setManualError("");setDraggingLesson(cell.inst.instId);announceScheduleEditing(day,p,group.id,true);e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",cell.inst.instId);}}
                           onDragEnd={()=>{setDraggingLesson(null);setDragOverSlot(null);announceScheduleEditing(day,p,group.id,false);}}
                           onClick={(e)=>{ if(manualMode && cells.length>1){ e.stopPropagation(); setInspecting(cell.inst.instId); } }}>
@@ -11922,6 +12600,7 @@ th{background:#1E3A5F;color:#ffffff;}
                             {assignmentUsesExternalRoom(data,cell.a)&&<span className="special-place-badge">↗ Вознесенский пр., 44</span>}
                             {rowHasCustomBell&&<span className="special-time-badge">🕐 смещённые звонки</span>}
                           </div>
+                          {concurrentTeacher.length > 0 && <div className="teacher-concurrent-note" title={`Преподаватель одновременно ведёт: ${concurrentTeacherText}`}><AlertTriangle size={12}/> <b>Одновременно:</b> {concurrentTeacherText}</div>}
                           {cell.subOverride?.substituted && <><span className={`sub-badge${cell.subOverride?.moved ? " moved" : ""}`}>{cell.subOverride?.moved ? "перенос" : "замена"}</span>{cell.subOverride?.format==="remote"&&<span className="sub-badge remote-change">ДО</span>}</>}
                           {violatesAvailability && <AlertTriangle size={12} className="avail-warn-icon" title="Преподаватель недоступен в это время" />}
                         </div>;
@@ -11930,6 +12609,45 @@ th{background:#1E3A5F;color:#ffffff;}
                   })}
                 </tr>
               )))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {sched && (viewKind === "allTeachers" || viewKind === "allRooms") && list.length > 0 && (
+        <div className="grid-wrap all-groups-wrap">
+          <table className="schedule-grid all-groups-grid">
+            <thead><tr>
+              <th className="group-col">{viewKind === "allTeachers" ? "Преподаватель" : "Аудитория"}</th>
+              <th className="time-col">Пара</th>
+              {activeDayIndices.map((d)=><th key={d}><div>{DAY_LABELS_FULL[d]}</div>{weekScope === "week" && dateForScheduleDay(d) && <div className="schedule-day-date">{formatDateDM(dateForScheduleDay(d))}</div>}</th>)}
+            </tr></thead>
+            <tbody>
+              {list.flatMap((entity) => Array.from({length:data.config.periodsPerDay}).map((_,p)=><tr key={`${entity.id}_${p}`}>
+                {p===0 && <td className="group-col" rowSpan={data.config.periodsPerDay}><div className="all-groups-name">{entity.name}</div>{viewKind === "allRooms" && <div className="all-groups-spec">{entity.capacity ? `${entity.capacity} мест` : ""}</div>}</td>}
+                <td className="time-col"><div className="period-badge">{p+1}</div><div className="period-time">{data.config.periodTimes[p]||""}</div></td>
+                {activeDayIndices.map((day)=>{
+                  const cells=aggregateEntityCellFor(viewKind === "allTeachers" ? "teacher" : "room", entity.id, day, p);
+                  return <td key={day} className={`cell ${cells.length?"filled":"empty"}${cells.length>1?" multi":""}`}>
+                    {cells.map((cell)=>{
+                      const {subj,type}=lessonLabel(cell.inst,data);
+                      const groups=instanceGroupNames(data,cell.inst).join(", ") || byId(data.groups,cell.inst.groupId)?.name || "";
+                      const teacher=byId(data.teachers,cell.subOverride?.teacherId||cell.inst.teacherId)?.name||"";
+                      const room=cell.inst.format==="remote"?"дистанционно":(assignmentRoomLabel(data,cell.a)?`ауд. ${assignmentRoomLabel(data,cell.a)}`:"");
+                      if(cell.subOverride?.cancelled) return <div key={scheduleRenderKey(cell.inst)} className="lesson-chip cancelled-chip"><span>Занятие отменено</span><span className="sub-badge cancel">отмена</span></div>;
+                      return <div key={scheduleRenderKey(cell.inst)} className={`lesson-chip${cell.inst.format==="remote"?" remote-chip":""}${cell.subOverride?.substituted?" substituted":""}`} onClick={()=>manualMode&&setInspecting(cell.inst.instId)}>
+                        <div className="lesson-subject">{subj}{scheduleSubgroupLabel(cell.inst)}</div>
+                        <div className="lesson-meta">
+                          <span>{groups}</span>
+                          {viewKind === "allTeachers" ? <span>{room}</span> : <span>{teacher}</span>}
+                          <span className="lesson-type">{type}</span>
+                        </div>
+                        {cell.subOverride?.substituted&&<span className="sub-badge">замена</span>}
+                      </div>;
+                    })}
+                  </td>;
+                })}
+              </tr>))}
             </tbody>
           </table>
         </div>
@@ -11955,7 +12673,7 @@ th{background:#1E3A5F;color:#ffffff;}
         </div>;
       })()}
 
-      {sched && viewKind !== "allGroups" && viewKind !== "semesterAll" && !viewId && (
+      {sched && !["allGroups","allTeachers","allRooms","semesterAll"].includes(viewKind) && !viewId && (
         <div className="empty-row">Выберите {viewKind === "group" ? "группу" : viewKind === "teacher" ? "преподавателя" : "аудиторию"}, чтобы открыть расписание и сводку.</div>
       )}
 
@@ -12729,7 +13447,13 @@ function SubstitutionsPanel({ data, set }) {
   const byId = (arr, id) => arr.find((x) => x.id === id);
   const subs = (data.substitutions || []).filter((s) => s.date === date);
   const subFor = (instId) => subs.find((s) => s.instId === instId);
-  const baseRows = sched.instances
+  // v1685: календарное исключение noClasses имеет абсолютный приоритет над
+  // обычной недельной сеткой. Раньше страница «Замены» брала все занятия по
+  // weekday + week applicability и лишь рисовала предупреждение сверху, поэтому
+  // на закрытую дату визуально попадало всё обычное расписание этого вторника.
+  // Это были не реальные переносы, а ошибка выборки интерфейса.
+  const noOrdinaryClassesToday = isNoClassDate(data, date);
+  const baseRows = noOrdinaryClassesToday ? [] : sched.instances
     .map((inst) => ({ inst, a: sched.assignment[inst.instId] }))
     .filter((r) => r.a && r.a.day === day && instanceAppliesToDate(data.config, r.inst, date));
   const rows = baseRows.slice().sort((x, y) => ((subFor(x.inst.instId)?.newPeriod ?? x.a.period) - (subFor(y.inst.instId)?.newPeriod ?? y.a.period)) || ((byId(data.groups,x.inst.groupId)?.name||"").localeCompare(byId(data.groups,y.inst.groupId)?.name||"")));
@@ -12799,7 +13523,8 @@ ${warnings.join("\n")}
   return (
     <div className="section">
       <header className="section-head"><h1>Замены / отмены / переносы</h1><p>Все операции относятся только к <b>конкретному занятию на выбранную дату</b>: можно заменить ресурс, отменить, перенести сразу или отменить и назначить перенос позже.</p></header>
-      <div className="schedule-toolbar"><input type="date" className="date-input" value={date} onChange={(e)=>{setDate(e.target.value);setError("");}}/><span className="weekday-label">{DAY_LABELS_FULL[day]}</span>{isNoClassDate(data,date)&&<span className="holiday-warn">⛔ день без обычных занятий</span>}</div>
+      <div className="schedule-toolbar"><input type="date" className="date-input" value={date} onChange={(e)=>{setDate(e.target.value);setError("");}}/><span className="weekday-label">{DAY_LABELS_FULL[day]}</span>{noOrdinaryClassesToday&&<span className="holiday-warn">⛔ день без обычных занятий</span>}</div>
+      {noOrdinaryClassesToday && subs.length>0 && <div className="notice">На этой дате отключено обычное расписание. Сохранённые ранее операции замены для регулярных пар не применяются к закрытому дню и не выводятся в список.</div>}
       {error&&<div className="notice conflict-notice"><AlertTriangle size={15}/>{error}</div>}
       <div className="table-wrap"><table><thead><tr><th></th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Преподаватель</th><th>Ауд.</th><th>Замена</th></tr></thead><tbody>
         {rows.map((row)=>{
@@ -12993,7 +13718,7 @@ function ConflictCenterPanel({data,set,onAutoGenerate}){
           conflicts.push({kind:"double",severity:"critical",date:A.date,text:`${groupName}: реальное наложение на ${A.a.period+1}-й паре — ${subLabel(subsA)} пересекается с ${subLabel(subsB)}. ${occurrenceLabel(A)} ↔ ${occurrenceLabel(B)}`});
         }
       }
-      if (A.teacherId && B.teacherId && A.teacherId===B.teacherId && !A.inst.isVacancyTeacher && !B.inst.isVacancyTeacher && !sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst) && !A.a?.manualTeacherMultiRoom && !B.a?.manualTeacherMultiRoom) {
+      if (A.teacherId && B.teacherId && A.teacherId===B.teacherId && !A.inst.isVacancyTeacher && !B.inst.isVacancyTeacher && !sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst) && !A.a?.manualTeacherMultiRoom && !B.a?.manualTeacherMultiRoom && !A.a?.manualMultiGroupRoom && !B.a?.manualMultiGroupRoom) {
         const key=`${slotKey}|teacher|${A.teacherId}|${pairIds}`;
         if (!doubleSeen.has(key)) {
           doubleSeen.add(key);
@@ -14609,6 +15334,10 @@ export default function App() {
   const graphSavedEditSerialRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
   const scheduleCellPatchChainRef = useRef(Promise.resolve());
+  // v1699: графики имеют собственный debounce от фактического graphSet.
+  // Не полагаемся на общий useEffect(data): его skipAutosave нужен для серверных
+  // rebase/нормализаций и мог случайно проглотить именно пользовательскую правку.
+  const graphSaveTimerRef = useRef(null);
   // v1595: ids edited manually while auto-calculation is running. Progress
   // packets are never allowed to overwrite these ids in the browser; the
   // server enforces the same rule against canonical storage.
@@ -14842,11 +15571,44 @@ export default function App() {
             graphSchedulePatch.lockedAdd.length || graphSchedulePatch.lockedRemove.length ||
             graphSchedulePatch.unplacedAdd.length || graphSchedulePatch.unplacedRemove.length
           );
+          // v1698: the GRAPH itself is the primary source of truth and must not
+          // be held hostage by a potentially much heavier derived schedule sync.
+          // Persist the tiny graph delta first. The derived instances/unplaced
+          // patch is then saved through the already overload-safe schedule queue.
+          // This removes the failure mode where one graph-cell edit tried to
+          // validate/serialize a large schedule inside /storage-graph-patch and
+          // therefore never reached durable storage under peak load.
+          const graphRequestId = `graph-${Date.now()}-${Math.random().toString(36).slice(2)}`;
           const mergedRes = await storageGraphPatch("schedule-data-v2", changes, historyAppend, {
             userId: currentUser?.id || "",
             by: currentUser?.name || currentUser?.login || "Пользователь",
             sessionId: presenceSessionRef.current,
-          }, hasGraphScheduleDelta ? graphSchedulePatch : null);
+            requestId: graphRequestId,
+          }, null);
+          if (hasGraphScheduleDelta) {
+            try {
+              const scheduleSyncRes = await storageSchedulePatch("schedule-data-v2", graphSchedulePatch, {
+                userId: currentUser?.id || "",
+                by: currentUser?.name || currentUser?.login || "Пользователь",
+                sessionId: presenceSessionRef.current,
+                requestId: `${graphRequestId}-schedule`,
+                source: "graph-sync",
+              });
+              if (scheduleSyncRes?.token) lastSavedTokenRef.current = String(scheduleSyncRes.token);
+              if (scheduleSyncRes?._syncMeta?.at) setLastConfirmedSaveAt(scheduleSyncRes._syncMeta.at);
+            } catch (syncErr) {
+              // The graph is already durably saved. Keep the local derived state;
+              // the next graph synchronization can retry the schedule projection.
+              console.error("Graph schedule projection save failed", syncErr);
+              setSyncNotice({
+                by: "Синхронизация графика",
+                at: new Date().toISOString(),
+                pending: true,
+                conflict: false,
+                message: "График сохранён. Производная синхронизация расписания будет повторена при следующем изменении.",
+              });
+            }
+          }
           const mergedRows = Array.isArray(mergedRes?.rows) ? mergedRes.rows : [];
           const mergedById = new Map(mergedRows.map((row) => [String(row?.id || ""), row]));
           const syncMeta = mergedRes?._syncMeta || null;
@@ -14886,7 +15648,7 @@ export default function App() {
             const hist = [...(savedBase.changeHistory || []), ...historyAppend];
             const histById = new Map();
             hist.forEach((x) => histById.set(String(x?.id || `${x?.at}|${x?.user}|${x?.section}|${x?.action}`), x));
-            lastSavedJson.current = JSON.stringify({ ...savedBase, loads: savedLoads, ...(mergedRes?.schedule ? {schedule:mergedRes.schedule} : {}), changeHistory: [...histById.values()].slice(-1000), graphState: graphStateFromLoads(savedLoads), ...(syncMeta ? {_syncMeta:syncMeta} : {}) });
+            lastSavedJson.current = JSON.stringify({ ...savedBase, loads: savedLoads, ...(hasGraphScheduleDelta ? {schedule:localSchedule} : {}), changeHistory: [...histById.values()].slice(-1000), graphState: graphStateFromLoads(savedLoads), ...(syncMeta ? {_syncMeta:syncMeta} : {}) });
           } catch {}
           const confirmedAt = syncMeta?.at || new Date().toISOString();
           setLastConfirmedSaveAt(confirmedAt);
@@ -15287,9 +16049,11 @@ export default function App() {
     // Только graphSet увеличивает serial. Поэтому server merge, normalizeStoredData и
     // syncScheduleInstancesToGraph не возвращают ложный статус «не сохранено».
     if (tab === "graphs") {
-      const serial = graphUserEditSerialRef.current;
-      if (serial === graphObservedEditSerialRef.current) return;
-      graphObservedEditSerialRef.current = serial;
+      // v1699: пользовательские graphSet сохраняются отдельным таймером прямо
+      // из graphSet. Общий data-effect здесь только наблюдает серверные/служебные
+      // изменения и НЕ должен создавать второй конкурирующий autosave.
+      graphObservedEditSerialRef.current = graphUserEditSerialRef.current;
+      return;
     }
     // v1677: schedule persistence is cell-only. Manual moves/placements/locks
     // already go through persistScheduleCellPatchNow; scheduling a second broad
@@ -15321,6 +16085,7 @@ export default function App() {
   useEffect(() => () => {
     for (const timer of pageSaveTimersRef.current.values()) clearTimeout(timer);
     pageSaveTimersRef.current.clear();
+    if (graphSaveTimerRef.current) clearTimeout(graphSaveTimerRef.current);
   }, []);
 
   // v1680: schedule-cell commits intentionally do not rebuild lastSavedJson on
@@ -15811,7 +16576,8 @@ export default function App() {
     if (key !== "loads") return set(key);
     return (val) => {
       graphUserEditSerialRef.current += 1;
-      return setData((d) => {
+      const editSerial = graphUserEditSerialRef.current;
+      setData((d) => {
       const rawNextLoads = typeof val === "function" ? val(d.loads) : val;
       // v1551: добавление/изменение строки графика не размещает новые недели на сетку.
       // Полностью неизменившиеся ранее размещённые блоки остаются на месте; изменённый
@@ -15839,8 +16605,33 @@ export default function App() {
       let next = { ...d, loads: nextLoads };
       if (d.schedule) next = { ...next, schedule: syncScheduleInstancesToGraph(d, nextLoads, { changedLoadIds:[...changedLoadIds] }) };
       if (role === "admin") next = appendHistory(next, "Графики", "Изменён недельный график", "Новые/изменённые блоки отправлены в «Не размещено»; сетка заполняется только через Авто или вручную");
+      latestDataRef.current = next;
       return next;
       });
+
+      // v1699: гарантированный autosave именно пользовательского изменения.
+      // Даже если между setData и useEffect пришёл server rebase и выставил
+      // skipAutosaveRef=true, этот таймер не теряется. Последовательность всех
+      // записей всё равно проходит через saveChainRef внутри persistSnapshot.
+      if (graphSaveTimerRef.current) clearTimeout(graphSaveTimerRef.current);
+      pendingSaveTabsRef.current.add("graphs");
+      dirtyRef.current = true;
+      setSaveState("dirty");
+      const revision = ++dataRevisionRef.current;
+      pageSaveRevisionRef.current.set("graphs", revision);
+      graphSaveTimerRef.current = setTimeout(() => {
+        graphSaveTimerRef.current = null;
+        const current = latestDataRef.current;
+        if (!current) return;
+        // Если после постановки таймера уже была ещё одна graphSet-правка,
+        // сохраняем всё равно самый свежий snapshot; serial нужен лишь чтобы
+        // не считать старый ответ окончательным.
+        persistSnapshot(current, revision, { scopeTab: "graphs" }).catch((err) => {
+          console.error("Graph direct autosave failed", err);
+          setSaveState("error");
+        });
+      }, 450);
+      graphObservedEditSerialRef.current = editSerial;
     };
   };
 
@@ -15848,6 +16639,7 @@ export default function App() {
     const current = latestDataRef.current || data;
     if (!current) return;
     clearTimeout(saveTimer.current);
+    if (tab === "graphs" && graphSaveTimerRef.current) { clearTimeout(graphSaveTimerRef.current); graphSaveTimerRef.current = null; }
     const pageTimer = pageSaveTimersRef.current.get(tab); if (pageTimer) clearTimeout(pageTimer);
     pageSaveTimersRef.current.delete(tab);
     return persistSnapshot(current, dataRevisionRef.current, { manual: true, scopeTab: tab, scheduleGroupId: tab === "schedule" ? scheduleRouteGroupIdRef.current : "" });
@@ -15856,6 +16648,7 @@ export default function App() {
   const saveNow = async () => {
     if (!data) return;
     clearTimeout(saveTimer.current);
+    if (tab === "graphs" && graphSaveTimerRef.current) { clearTimeout(graphSaveTimerRef.current); graphSaveTimerRef.current = null; }
     const pageTimer = pageSaveTimersRef.current.get(tab); if (pageTimer) clearTimeout(pageTimer);
     pageSaveTimersRef.current.delete(tab);
     const revision = dataRevisionRef.current;
@@ -16203,6 +16996,11 @@ export default function App() {
         publishedBy: by,
         historyEntry,
         lockedAdd,
+        publishChange: {
+          scope,
+          groupIds: groupId ? [groupId] : [],
+          weekNumbers: scope === "week" ? [requestedWeek] : (scope === "weeks" ? requestedWeeks : []),
+        },
       }, {
         userId: currentUser?.id || "",
         by,
@@ -17705,6 +18503,20 @@ input[type="text"], select { width: 100%; }
 .lesson-chip.availability-warn .lesson-subject { color: #5F4700; }
 .lesson-chip.availability-warn .lesson-meta { color: #786321; }
 .avail-warn-icon { position: absolute; bottom: 5px; right: 5px; color: #A87500; }
+/* v1702: разрешённая или случайная двойная занятость преподавателя всегда заметна. */
+.lesson-chip.teacher-concurrent-warn {
+  background: #FFF0A8 !important;
+  border-color: #DFAE22 !important;
+  box-shadow: inset 5px 0 0 #D39A00, 0 0 0 1px rgba(211,154,0,.14);
+}
+.lesson-chip.teacher-concurrent-warn .lesson-subject { color: #5B4200; }
+.lesson-chip.teacher-concurrent-warn .lesson-meta { color: #705A16; }
+.teacher-concurrent-note {
+  display:flex; align-items:flex-start; gap:4px; margin-top:5px; padding:4px 6px;
+  border-radius:6px; background:#FFE58A; color:#684A00; font-size:10.5px; line-height:1.25;
+  border:1px solid rgba(184,128,0,.28);
+}
+.teacher-concurrent-note svg { flex:0 0 auto; margin-top:1px; color:#9A6A00; }
 
 .resizable-cols th{resize:horizontal;overflow:auto;min-width:90px;max-width:520px}.resizable-cols td input:not([type="checkbox"]),.resizable-cols td select{width:100%;min-width:0;box-sizing:border-box}
 

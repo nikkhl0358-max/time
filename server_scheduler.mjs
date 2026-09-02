@@ -1197,14 +1197,38 @@ function generateSchedule(data, prior, perfScope = null) {
   // v1587: единая каноническая схема форматов для комбинированной нагрузки.
   // Она применяется ДО создания schedule.instances, поэтому «Не размещено»
   // сразу получает правильные очные/ДО recurring-блоки.
+  // v1689: в потоковой строке графика число 2 означает 2 ак.ч., то есть ОДНУ пару.
+  // Раньше потоковый план трактовал weeklyPairs=2 как две полноценные пары и
+  // создавал два одинаковых stream-instance на одну неделю. Обычные/подгрупповые
+  // строки не меняем: исправление локально только для потоков.
+  // v1692: делить часы на 2 можно только для РЕАЛЬНОГО потока, а не просто
+  // потому, что у строки остался старый streamId/streamGroupIds. Иначе обычная
+  // нагрузка с weeklyPairs=1 превращалась в 0.5 пары и получала подпись
+  // «1-я половина», хотя в графике пользователь задал одну обычную пару.
+  const isGraphHourStreamLoad = (l) => {
+    if (!l) return false;
+    const linkedIds = new Set([l.groupId, ...(l.streamGroupIds || [])].filter(Boolean));
+    return loads.some((other) => {
+      if (!other || other.id === l.id) return false;
+      const sameExplicitStream = !!l.streamId && !!other.streamId && l.streamId === other.streamId;
+      const linkedGroup = linkedIds.has(other.groupId) || (other.streamGroupIds || []).includes(l.groupId);
+      if (!sameExplicitStream && !linkedGroup) return false;
+      return other.subjectId === l.subjectId && other.teacherId === l.teacherId && other.typeId === l.typeId;
+    });
+  };
+  // v1695: weeklyPairs хранит КОЛИЧЕСТВО ПАР, а не академические часы.
+  // Значение 2 у потока означает две отдельные пары этой недели.
+  // Половинная механика относится только к конкретной подгрупповой строке.
+  const loadMayUseHalfPair = (l) => Number(l?.subgroup || 0) > 0;
+  const occurrencePairUnitsForLoad = (_l, raw) => Math.max(0, Number(raw) || 0);
   const occurrenceKeysForLoad = (l) => {
     const keys = [];
     if ((l.weekPattern || "perWeek") !== "perWeek") return keys;
     for (const [weekRaw, countRaw] of Object.entries(l.weeklyPairs || {}).sort((a,b)=>Number(a[0])-Number(b[0]))) {
-      const week = Number(weekRaw), count = Math.max(0, Number(countRaw) || 0);
+      const week = Number(weekRaw), count = occurrencePairUnitsForLoad(l, countRaw);
       const whole = Math.floor(count + 1e-9);
       for (let layer = 1; layer <= whole; layer++) keys.push(`${week}:${layer}`);
-      if (count - whole >= 0.49) keys.push(`${week}:H`);
+      if (loadMayUseHalfPair(l) && count - whole >= 0.49) keys.push(`${week}:H`);
     }
     return keys;
   };
@@ -1666,8 +1690,9 @@ function generateSchedule(data, prior, perfScope = null) {
       // «Графики»: разное число пар на разных неделях — раскладываем на слои,
       // каждый слой — обычный шаблонный инстанс с custom-набором недель.
       const wp = load.weeklyPairs || {};
-      const weekNums = Object.keys(wp).map(Number).filter((w) => (Number(wp[w]) || 0) > 0);
-      const maxCount = weekNums.length ? Math.max(...weekNums.map((w) => Number(wp[w]) || 0)) : 0;
+      const graphPairUnitsAt = (w) => occurrencePairUnitsForLoad(load, wp[w]);
+      const weekNums = Object.keys(wp).map(Number).filter((w) => graphPairUnitsAt(w) > 0);
+      const maxCount = weekNums.length ? Math.max(...weekNums.map((w) => graphPairUnitsAt(w))) : 0;
       const maxWhole = Math.floor(maxCount + 1e-9);
       const mandatoryPlan = practicalAssemblyPlanByLoadId.get(load.id) || null;
       const lecturePlan = isLectureLessonTypeName(lessonTypeById[load.typeId]?.name) ? lectureStreamPlanByLoadId.get(load.id) : null;
@@ -1675,7 +1700,7 @@ function generateSchedule(data, prior, perfScope = null) {
       const graphPairing = load.pairing || "none";
       const graphBlockSize = { block2: 2, block3: 3, block4: 4 }[graphPairing] || 0;
       for (let layer = 1; layer <= maxWhole; layer++) {
-        const weeksForLayer = weekNums.filter((w) => (Number(wp[w]) || 0) >= layer && !(mandatoryPlan?.selectedKeys?.has(`${w}:${layer}`)) && !(lecturePlan?.selectedKeys?.has(`${w}:${layer}`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:${layer}`)));
+        const weeksForLayer = weekNums.filter((w) => graphPairUnitsAt(w) >= layer && !(mandatoryPlan?.selectedKeys?.has(`${w}:${layer}`)) && !(lecturePlan?.selectedKeys?.has(`${w}:${layer}`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:${layer}`)));
         if (weeksForLayer.length === 0) continue;
         const blockIndex = graphBlockSize ? (layer - 1) % graphBlockSize : 0;
         const blockStart = graphBlockSize ? (layer - blockIndex) : 0;
@@ -1687,7 +1712,9 @@ function generateSchedule(data, prior, perfScope = null) {
         });
       }
       // v109: 1 ак.ч. = половина пары. Две разные половины могут делить один номер пары.
-      const halfWeeks = weekNums.filter((w) => ((Number(wp[w]) || 0) - Math.floor(Number(wp[w]) || 0)) >= 0.49 && !(mandatoryPlan?.selectedKeys?.has(`${w}:H`)) && !(lecturePlan?.selectedKeys?.has(`${w}:H`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:H`)));
+      const halfWeeks = loadMayUseHalfPair(load)
+        ? weekNums.filter((w) => (graphPairUnitsAt(w) - Math.floor(graphPairUnitsAt(w))) >= 0.49 && !(mandatoryPlan?.selectedKeys?.has(`${w}:H`)) && !(lecturePlan?.selectedKeys?.has(`${w}:H`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:H`)))
+        : [];
       if (halfWeeks.length) instances.push({ instId: `${load.id}__H`, ...common, halfPair: true, weekPattern: "custom", customWeeks: halfWeeks, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
       return;
     }
@@ -1723,7 +1750,7 @@ function generateSchedule(data, prior, perfScope = null) {
 
     // "none" и "single" — обычные независимые инстансы.
     for (let i = 0; i < n; i++) instances.push({ instId: `${load.id}__${i}`, ...common, ...weekFields, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
-    if (hasHalf) instances.push({ instId: `${load.id}__H`, ...common, ...weekFields, halfPair: true, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
+    if (loadMayUseHalfPair(load) && hasHalf) instances.push({ instId: `${load.id}__H`, ...common, ...weekFields, halfPair: true, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
   });
 
   // v1656: страховка графика от потери отдельной week:layer потребности внутри потока.
@@ -1738,6 +1765,13 @@ function generateSchedule(data, prior, perfScope = null) {
     const id = String(inst?.instId || "");
     let m = id.match(/__L(\d+)$/);
     if (m) return m[1];
+    // v1687: для обычной нагрузки с pairsPerWeek > 1 генератор создаёт
+    // instId вида load__0, load__1, ... . Раньше они все падали в fallback
+    // layer="1", поэтому после размещения первой пары вторая считалась
+    // тем же самым требованием и исчезала из picker/«Не размещено».
+    // Индекс 0 соответствует первому слою, поэтому переводим его в 1-based layer.
+    m = id.match(/__(\d+)$/);
+    if (m) return String((Number(m[1]) || 0) + 1);
     m = id.match(/__(?:LECTURE_STREAM|PRACTICAL_STREAM)_\d+_([^_]+)_/);
     if (m) return m[1];
     m = id.match(/__MANDO_([^_]+)$/);
@@ -1778,11 +1812,11 @@ function generateSchedule(data, prior, perfScope = null) {
     const wp = load.weeklyPairs || {};
     const template = instances.find((inst) => String(inst?.loadId || "") === String(load.id)) || null;
     for (const [weekRaw, countRaw] of Object.entries(wp)) {
-      const week = Number(weekRaw), count = Math.max(0, Number(countRaw) || 0);
+      const week = Number(weekRaw), count = occurrencePairUnitsForLoad(load, countRaw);
       if (!Number.isFinite(week) || week <= 0 || count <= 0) continue;
       const whole = Math.floor(count + 1e-9);
       const requiredLayers = Array.from({length: whole}, (_,i)=>String(i+1));
-      if (count - whole >= 0.49) requiredLayers.push("H");
+      if (loadMayUseHalfPair(load) && count - whole >= 0.49) requiredLayers.push("H");
       for (const layer of requiredLayers) {
         const covKey = `${load.id}|${week}|${layer}`;
         if (graphCoverage.has(covKey)) continue;
@@ -4072,6 +4106,43 @@ function generateSchedule(data, prior, perfScope = null) {
     }
   }
 
+  // v1696: два слоя ОДНОЙ строки графика (например weeklyPairs=2 -> L1/L2)
+  // никогда не могут занимать одну и ту же физическую пару на пересекающихся
+  // неделях. Это структурное правило сильнее locked: lock фиксирует место
+  // корректного занятия, но не является разрешением склеить L1 и L2 в один слот.
+  // Именно такой legacy/graph-locked дубль давал две одинаковые карточки
+  // «Экономика организации» в одной ячейке.
+  const sameLoadSlotBuckets1696 = new Map();
+  const sameLoadAssigned1696 = instances
+    .filter((inst) => finalAssignment[inst.instId] && inst.loadId)
+    .sort((a,b) => {
+      const al = lockedIds.has(a.instId) ? 0 : 1;
+      const bl = lockedIds.has(b.instId) ? 0 : 1;
+      if (al !== bl) return al - bl;
+      return String(a.instId).localeCompare(String(b.instId), 'ru', { numeric:true });
+    });
+  for (const inst of sameLoadAssigned1696) {
+    const a = finalAssignment[inst.instId];
+    if (!a) continue;
+    let conflict = false;
+    for (const week of weeksOf(inst)) {
+      const base = `${inst.loadId}|${week}|${a.day}|${a.period}`;
+      const keys = a.half == null ? [`${base}|full`, `${base}|0`, `${base}|1`] : [`${base}|full`, `${base}|${Number(a.half)}`];
+      if (keys.some((k)=>(sameLoadSlotBuckets1696.get(k)||[]).length)) { conflict = true; break; }
+    }
+    if (conflict) {
+      delete finalAssignment[inst.instId];
+      finalUnplaced.add(inst.instId);
+      lockedIds.delete(inst.instId);
+      continue;
+    }
+    for (const week of weeksOf(inst)) {
+      const k = `${inst.loadId}|${week}|${a.day}|${a.period}|${a.half == null ? 'full' : Number(a.half)}`;
+      if (!sameLoadSlotBuckets1696.has(k)) sameLoadSlotBuckets1696.set(k, []);
+      sameLoadSlotBuckets1696.get(k).push(inst.instId);
+    }
+  }
+
   // v1635: финальный абсолютный барьер двойной занятости преподавателя.
   // В нескольких специальных ветках (co-schedule/потоки/оптимизация) кандидат
   // мог попасть в assignment, минуя обычную проверку busyTeacherOccupants.
@@ -4515,6 +4586,34 @@ function syncScheduleInstancesToGraph(data, nextLoads) {
     if (!oldInst || !nextInst) continue;
     if (occurrenceSignature(oldInst) !== occurrenceSignature(nextInst)) continue;
     assignment[id] = { ...oldA };
+  }
+
+  // v1695: разные слои одной строки графика нельзя хранить в одной физической
+  // ячейке. Старое ошибочное состояние L1/L2 в одном day/period разворачиваем:
+  // младший слой остаётся, следующий снова становится неразмещённым.
+  const instById1695 = new Map(instances.map((x)=>[String(x?.instId||""),x]));
+  const layerRank1695 = (inst) => {
+    if (inst?.halfPair) return 100000;
+    const id=String(inst?.instId||"");
+    let m=id.match(/__L(\d+)$/); if(m) return Number(m[1])||1;
+    m=id.match(/__(?:LECTURE_STREAM|PRACTICAL_STREAM)_\d+_([^_]+)_/); if(m) return Number(String(m[1]).replace(/^L/,""))||1;
+    m=id.match(/__(\d+)$/); if(m) return (Number(m[1])||0)+1;
+    return 1;
+  };
+  const assignedIds1695=Object.keys(assignment).filter((id)=>assignment[id]);
+  for(let i=0;i<assignedIds1695.length;i++){
+    const aId=assignedIds1695[i], a=assignment[aId], ai=instById1695.get(String(aId));
+    if(!a||!ai) continue;
+    for(let j=i+1;j<assignedIds1695.length;j++){
+      const bId=assignedIds1695[j], b=assignment[bId], bi=instById1695.get(String(bId));
+      if(!b||!bi||!ai.loadId||String(ai.loadId)!==String(bi.loadId||"")) continue;
+      if(Number(a.day)!==Number(b.day)||Number(a.period)!==Number(b.period)) continue;
+      const aw=new Set(weekNumbersForInstance(source.config,ai).map(Number));
+      if(!weekNumbersForInstance(source.config,bi).some((w)=>aw.has(Number(w)))) continue;
+      const ar=layerRank1695(ai), br=layerRank1695(bi);
+      const victim=br>ar?bId:(ar>br?aId:(String(aId)>String(bId)?aId:bId));
+      delete assignment[victim];
+    }
   }
 
   // v1546: график — источник истины. Синхронизация структуры расписания

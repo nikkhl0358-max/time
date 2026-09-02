@@ -227,18 +227,38 @@ export async function storageSectionMerge(key, base, local, meta = {}) {
 // Manual cell placement uses this before the debounced page autosave, so a stale
 // full-page request cannot make a freshly placed lesson disappear.
 export async function storageSchedulePatch(key, patch = {}, meta = {}) {
-  const res = await fetch(`/api/storage-schedule-patch/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ patch, meta }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data?.error || `Ошибка быстрого сохранения ячейки: HTTP ${res.status}`);
-    err.status = res.status;
-    throw err;
+  // v1686: cell patches are idempotent (set/remove by instId), so transient
+  // overload/gateway errors can be retried safely. Previously the first 502/503
+  // immediately rolled the optimistic UI back even when the first request was
+  // only delayed and could still be committed by the server a moment later.
+  const transient = new Set([425, 429, 500, 502, 503, 504]);
+  const attempts = 7;
+  let lastError = null;
+  const requestId = String(meta?.requestId || `cell-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const requestMeta = { ...(meta || {}), requestId };
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const res = await fetch(`/api/storage-schedule-patch/${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ patch, meta: requestMeta }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) return data;
+      const err = new Error(data?.error || `Ошибка быстрого сохранения ячейки: HTTP ${res.status}`);
+      err.status = res.status;
+      lastError = err;
+      if (!transient.has(res.status) || attempt >= attempts - 1) throw err;
+    } catch (err) {
+      lastError = err;
+      const status = Number(err?.status || 0);
+      // Network errors (status 0) and temporary gateway/server overload are retried.
+      if ((status && !transient.has(status)) || attempt >= attempts - 1) throw err;
+    }
+    const delay = Math.min(2400, 180 * (2 ** attempt)) + Math.floor(Math.random() * 120);
+    await new Promise((resolve) => setTimeout(resolve, delay));
   }
-  return data;
+  throw lastError || new Error("Не удалось сохранить ячейку");
 }
 
 
@@ -346,18 +366,36 @@ export async function storageGraphMerge(key, base, local, meta = {}) {
 // v1533: lightweight graph autosave. Only changed graph fields are sent and
 // only the merged rows come back, instead of the whole semester project.
 export async function storageGraphPatch(key, changes = [], historyAppend = [], meta = {}, schedulePatch = null) {
-  const res = await fetch(`/api/storage-graph-patch/${encodeURIComponent(key)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ changes, historyAppend, meta, schedulePatch }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = new Error(data?.error || `Ошибка быстрого сохранения графиков: HTTP ${res.status}`);
-    err.status = res.status;
-    throw err;
+  // v1698: graph cells are tiny, idempotent three-way patches. Under load the
+  // gateway can briefly answer 502/503/504 before the request reaches Flask.
+  // Retrying the same graph delta is safe and prevents a cell from remaining
+  // only in React because of one transient overload response.
+  const transient = new Set([425, 429, 500, 502, 503, 504]);
+  const attempts = 7;
+  let lastError = null;
+  const requestId = String(meta?.requestId || `graph-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const requestMeta = { ...(meta || {}), requestId };
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const res = await fetch(`/api/storage-graph-patch/${encodeURIComponent(key)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ changes, historyAppend, meta: requestMeta, schedulePatch }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) return data;
+      const err = new Error(data?.error || `Ошибка быстрого сохранения графиков: HTTP ${res.status}`);
+      err.status = res.status;
+      lastError = err;
+      if (!transient.has(res.status) || attempt >= attempts - 1) throw err;
+    } catch (err) {
+      lastError = err;
+      const status = Number(err?.status || 0);
+      if ((status && !transient.has(status)) || attempt >= attempts - 1) throw err;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(4500, 180 * (2 ** attempt)) + Math.floor(Math.random() * 120)));
   }
-  return data;
+  throw lastError || new Error("Не удалось сохранить график");
 }
 
 export async function presenceHeartbeat(payload) {
@@ -458,7 +496,7 @@ export async function serverAutoGraphStatus(jobId) {
 
 export async function publicIndexGet() {
   try {
-    const res = await fetch('/api/public-index', { cache: 'default' });
+    const res = await fetch('/api/public-index', { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -472,7 +510,7 @@ export async function publicScheduleGet(kind, id, options = {}) {
     const safeKind = kind === 'teacher' ? 'teacher' : 'group';
     const scope = options?.scope === 'week' && Number(options?.week) > 0 ? 'week' : 'semester';
     const qs = scope === 'week' ? `?scope=week&week=${encodeURIComponent(Number(options.week))}` : '?scope=semester';
-    const res = await fetch(`/api/public-schedule/${safeKind}/${encodeURIComponent(String(id || ''))}${qs}`, { cache: 'default' });
+    const res = await fetch(`/api/public-schedule/${safeKind}/${encodeURIComponent(String(id || ''))}${qs}`, { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -483,7 +521,7 @@ export async function publicScheduleGet(kind, id, options = {}) {
 
 export async function publicStatusGet() {
   try {
-    const res = await fetch('/api/public-status', { cache: 'default' });
+    const res = await fetch('/api/public-status', { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -496,7 +534,7 @@ export async function publicBootstrapGet() {
   try {
     // v1628: публичный bootstrap имеет короткий HTTP cache + ETag на сервере.
     // Не запрещаем браузеру использовать его: повторные открытия заметно быстрее.
-    const res = await fetch('/api/public-bootstrap', { cache: 'no-cache' });
+    const res = await fetch('/api/public-bootstrap', { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {

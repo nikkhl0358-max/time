@@ -34,7 +34,36 @@ PRESENCE_TTL_SECONDS = 75
 # backup. Called under `_lock` (all callers already hold it), so no separate
 # lock is needed for the timestamp.
 _last_periodic_backup_at = 0.0
-_PERIODIC_BACKUP_INTERVAL_SECONDS = 300  # 5 minutes
+_PERIODIC_BACKUP_INTERVAL_SECONDS = 900  # v1686: 15 minutes; hot cell saves never copy backups under the storage lock
+_periodic_backup_thread_running = False
+_periodic_backup_thread_lock = threading.Lock()
+
+def _maybe_periodic_backup_async():
+    """Schedule a consistent backup without blocking timetable cell writes.
+
+    storage.json is replaced atomically, so copying the currently visible inode
+    outside `_lock` is safe: the copy is either the previous or the next complete
+    file, never a half-written JSON.
+    """
+    global _last_periodic_backup_at, _periodic_backup_thread_running
+    now = time.time()
+    if now - _last_periodic_backup_at < _PERIODIC_BACKUP_INTERVAL_SECONDS:
+        return
+    with _periodic_backup_thread_lock:
+        if _periodic_backup_thread_running or now - _last_periodic_backup_at < _PERIODIC_BACKUP_INTERVAL_SECONDS:
+            return
+        _periodic_backup_thread_running = True
+        _last_periodic_backup_at = now
+    def run():
+        global _periodic_backup_thread_running
+        try:
+            _backup_current_store()
+        except Exception:
+            pass
+        finally:
+            with _periodic_backup_thread_lock:
+                _periodic_backup_thread_running = False
+    threading.Thread(target=run, name="storage-backup", daemon=True).start()
 
 def _maybe_periodic_backup():
     global _last_periodic_backup_at
@@ -72,7 +101,7 @@ _schedule_patch_queue_event = threading.Event()
 _schedule_patch_queue = []
 _schedule_patch_worker_started = False
 SCHEDULE_PATCH_BATCH_WINDOW_SECONDS = float(os.environ.get("SCHEDULE_PATCH_BATCH_WINDOW_SECONDS", "0.035"))
-SCHEDULE_PATCH_BATCH_MAX = int(os.environ.get("SCHEDULE_PATCH_BATCH_MAX", "96"))
+SCHEDULE_PATCH_BATCH_MAX = int(os.environ.get("SCHEDULE_PATCH_BATCH_MAX", "24"))
 
 def _invalidate_store_cache():
     _store_cache["mtime"] = None
@@ -631,51 +660,161 @@ def _write_public_shard_file(path, payload):
     return hashlib.sha1(plain).hexdigest(), len(plain), len(gz)
 
 
-def _prebuild_public_snapshot_shards(project, marker):
-    """v1683: publication-time, two-level public storage.
+def _clone_public_snapshot_tree(src_dir, dst_dir):
+    """Clone an immutable public snapshot cheaply using hard links when possible."""
+    if not src_dir or not os.path.isdir(src_dir):
+        return False
+    try:
+        shutil.copytree(src_dir, dst_dir, copy_function=os.link)
+        return True
+    except Exception:
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        try:
+            shutil.copytree(src_dir, dst_dir, copy_function=shutil.copy2)
+            return True
+        except Exception:
+            shutil.rmtree(dst_dir, ignore_errors=True)
+            return False
 
-    The heavy published schedule is expanded once into deterministic
-    group/teacher directories, and each entity is split again by semester week.
-    Public requests then read one ready file and never parse storage.json.
+
+def _publication_teacher_ids_for_groups(project, group_ids):
+    group_ids = {str(x) for x in (group_ids or []) if str(x)}
+    if not group_ids:
+        return set()
+    schedule = project.get("schedule") if isinstance(project.get("schedule"), dict) else {}
+    inst_ids = set()
+    teacher_ids = set()
+    for inst in (schedule.get("instances") or []):
+        if not isinstance(inst, dict):
+            continue
+        if not group_ids.intersection(_instance_group_ids(inst)):
+            continue
+        if inst.get("instId"):
+            inst_ids.add(str(inst.get("instId")))
+        if inst.get("teacherId"):
+            teacher_ids.add(str(inst.get("teacherId")))
+        for part in (inst.get("streamParticipants") or []):
+            if isinstance(part, dict) and part.get("teacherId"):
+                teacher_ids.add(str(part.get("teacherId")))
+    for sub in (project.get("substitutions") or []):
+        if not isinstance(sub, dict):
+            continue
+        if str(sub.get("groupId") or "") in group_ids or str(sub.get("instId") or "") in inst_ids:
+            tid = str(sub.get("teacherId") or sub.get("newTeacherId") or "")
+            if tid:
+                teacher_ids.add(tid)
+    return teacher_ids
+
+
+def _prebuild_public_snapshot_shards(project, marker, change=None):
+    """Build the public shard snapshot, reusing the previous one when possible.
+
+    v1705: publishing one group/week no longer regenerates every group x teacher x
+    semester-week JSON file. We hard-link the previous immutable snapshot and only
+    replace files affected by this publication. Full publication still performs a
+    clean rebuild.
     """
     source = _public_source_project(project)
     snapshot_name = _public_snapshot_dir_name(marker)
     final_dir = os.path.join(PUBLIC_SHARD_DIR, snapshot_name)
     tmp_dir = final_dir + ".building-" + uuid.uuid4().hex[:8]
-    os.makedirs(tmp_dir, exist_ok=True)
     total_weeks = _total_semester_weeks_py(source.get("config") or {})
     published_weeks = set(range(1, total_weeks + 1))
     if source.get("publicWeekSelectionEnabled") is True:
         published_weeks = {int(x) for x in (source.get("publishedWeeks") or []) if str(x).isdigit() and 1 <= int(x) <= total_weeks}
-    stats = {"group": 0, "teacher": 0, "weekFiles": 0}
+
+    change = change if isinstance(change, dict) else {}
+    scope = str(change.get("scope") or "all")
+    group_ids = {str(x) for x in (change.get("groupIds") or []) if str(x)}
+    week_numbers = {int(x) for x in (change.get("weekNumbers") or []) if str(x).isdigit() and 1 <= int(x) <= total_weeks}
+    teacher_ids = {str(x) for x in (change.get("teacherIds") or []) if str(x)}
+    if group_ids:
+        teacher_ids.update(_publication_teacher_ids_for_groups(source, group_ids))
+
+    previous_manifest = _load_public_shard_manifest()
+    previous_dir = None
+    previous_weeks = set()
+    if isinstance(previous_manifest, dict):
+        prev_name = str(previous_manifest.get("snapshot") or "")
+        candidate = os.path.join(PUBLIC_SHARD_DIR, prev_name)
+        if prev_name and os.path.isdir(candidate):
+            previous_dir = candidate
+            previous_weeks = {int(x) for x in (previous_manifest.get("publishedWeeks") or []) if str(x).isdigit()}
+
+    incremental = scope in {"group", "week", "weeks"} and previous_dir is not None
+    if incremental:
+        incremental = _clone_public_snapshot_tree(previous_dir, tmp_dir)
+    if not incremental:
+        os.makedirs(tmp_dir, exist_ok=True)
+        scope = "all"
+
+    stats = {"group": 0, "teacher": 0, "weekFiles": 0, "reused": bool(incremental), "scope": scope}
+
+    def write_entity(kind, row, rebuild_semester=True, weeks_to_write=None):
+        if not isinstance(row, dict) or not row.get("id"):
+            return
+        entity_id = str(row.get("id"))
+        full_schedule = _build_public_schedule_shard(source, kind, entity_id)
+        full_instances = full_schedule.get("instances") or []
+        entity_dir = _public_entity_dir(tmp_dir, kind, entity_id)
+        os.makedirs(entity_dir, exist_ok=True)
+        if rebuild_semester:
+            full_payload = {
+                "schedule": full_schedule,
+                "dataPatch": _public_entity_data_patch(source, full_instances),
+                "marker": marker, "kind": kind, "id": entity_id, "scope": "semester",
+            }
+            _write_public_shard_file(os.path.join(entity_dir, "semester.json"), full_payload)
+            stats[kind] += 1
+        for week in sorted(weeks_to_write if weeks_to_write is not None else published_weeks):
+            if week not in published_weeks:
+                continue
+            week_schedule = _public_schedule_shard_for_week(source, full_schedule, week)
+            week_instances = week_schedule.get("instances") or []
+            week_payload = {
+                "schedule": week_schedule,
+                "dataPatch": _public_entity_data_patch(source, week_instances),
+                "marker": marker, "kind": kind, "id": entity_id, "scope": "week", "week": week,
+            }
+            _write_public_shard_file(os.path.join(entity_dir, f"week-{week}.json"), week_payload)
+            stats["weekFiles"] += 1
+
     try:
-        for kind, rows in (("group", source.get("groups") or []), ("teacher", source.get("teachers") or [])):
-            for row in rows:
-                if not isinstance(row, dict) or not row.get("id"):
-                    continue
-                entity_id = str(row.get("id"))
-                full_schedule = _build_public_schedule_shard(source, kind, entity_id)
-                full_instances = full_schedule.get("instances") or []
-                entity_dir = _public_entity_dir(tmp_dir, kind, entity_id)
-                os.makedirs(entity_dir, exist_ok=True)
-                full_payload = {
-                    "schedule": full_schedule,
-                    "dataPatch": _public_entity_data_patch(source, full_instances),
-                    "marker": marker, "kind": kind, "id": entity_id, "scope": "semester",
-                }
-                _write_public_shard_file(os.path.join(entity_dir, "semester.json"), full_payload)
-                stats[kind] += 1
-                for week in sorted(published_weeks):
-                    week_schedule = _public_schedule_shard_for_week(source, full_schedule, week)
-                    week_instances = week_schedule.get("instances") or []
-                    week_payload = {
-                        "schedule": week_schedule,
-                        "dataPatch": _public_entity_data_patch(source, week_instances),
-                        "marker": marker, "kind": kind, "id": entity_id, "scope": "week", "week": week,
-                    }
-                    _write_public_shard_file(os.path.join(entity_dir, f"week-{week}.json"), week_payload)
-                    stats["weekFiles"] += 1
-        # Switch the whole public snapshot atomically only after every shard exists.
+        if scope == "all":
+            for kind, rows in (("group", source.get("groups") or []), ("teacher", source.get("teachers") or [])):
+                for row in rows:
+                    write_entity(kind, row, rebuild_semester=True, weeks_to_write=published_weeks)
+        elif scope == "group":
+            for row in (source.get("groups") or []):
+                if isinstance(row, dict) and str(row.get("id") or "") in group_ids:
+                    write_entity("group", row, rebuild_semester=True, weeks_to_write=published_weeks)
+            for row in (source.get("teachers") or []):
+                if isinstance(row, dict) and str(row.get("id") or "") in teacher_ids:
+                    write_entity("teacher", row, rebuild_semester=True, weeks_to_write=published_weeks)
+        elif scope == "week":
+            # Semester view changes too, but only the published week file itself
+            # needs replacement; other immutable week files are reused as links.
+            targets = week_numbers or published_weeks
+            for kind, rows in (("group", source.get("groups") or []), ("teacher", source.get("teachers") or [])):
+                for row in rows:
+                    write_entity(kind, row, rebuild_semester=True, weeks_to_write=targets)
+        elif scope == "weeks":
+            # Visibility selection can add/remove week files. Semester files must
+            # reflect the new allowed week set, while unchanged week files remain.
+            added = published_weeks - previous_weeks
+            removed = previous_weeks - published_weeks
+            for kind, rows in (("group", source.get("groups") or []), ("teacher", source.get("teachers") or [])):
+                for row in rows:
+                    write_entity(kind, row, rebuild_semester=True, weeks_to_write=added)
+                    if isinstance(row, dict) and row.get("id"):
+                        entity_dir = _public_entity_dir(tmp_dir, kind, str(row.get("id")))
+                        for week in removed:
+                            for suffix in ("", ".gz"):
+                                try:
+                                    os.remove(os.path.join(entity_dir, f"week-{week}.json" + suffix))
+                                except FileNotFoundError:
+                                    pass
+
         if os.path.exists(final_dir):
             shutil.rmtree(final_dir, ignore_errors=True)
         os.replace(tmp_dir, final_dir)
@@ -688,7 +827,6 @@ def _prebuild_public_snapshot_shards(project, marker):
             "stats": stats,
         }
         _atomic_write_bytes(PUBLIC_SHARD_SNAPSHOT_FILE, json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        # Keep only the current and one previous completed snapshot directory.
         try:
             dirs = [d for d in os.listdir(PUBLIC_SHARD_DIR) if d.startswith("snapshot-") and os.path.isdir(os.path.join(PUBLIC_SHARD_DIR, d))]
             dirs.sort(key=lambda d: os.path.getmtime(os.path.join(PUBLIC_SHARD_DIR, d)), reverse=True)
@@ -701,13 +839,81 @@ def _prebuild_public_snapshot_shards(project, marker):
         if tmp_dir:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-
 def _load_public_shard_manifest():
     try:
         with open(PUBLIC_SHARD_SNAPSHOT_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return None
+
+
+def _ensure_public_shard_on_demand(kind, entity_id, scope="semester", week=0):
+    """Create only the requested public shard after a cold deploy/restart.
+
+    v1706: a missing shard manifest must never make a public visitor rebuild the
+    whole semester synchronously.  We read the published source once per worker
+    and materialise just one group/teacher file (and only one week when asked).
+    Normal publication can still replace this lazy snapshot atomically later.
+    """
+    project, marker = _public_project_for_shard()
+    if not isinstance(project, dict) or not marker:
+        return None
+    if kind not in {"group", "teacher"}:
+        return None
+
+    rows = project.get("groups") if kind == "group" else project.get("teachers")
+    exists = any(isinstance(row, dict) and str(row.get("id") or "") == str(entity_id) for row in (rows or []))
+    if not exists:
+        return None
+
+    total_weeks = _total_semester_weeks_py(project.get("config") or {})
+    published_weeks = set(range(1, total_weeks + 1))
+    if project.get("publicWeekSelectionEnabled") is True:
+        published_weeks = {int(x) for x in (project.get("publishedWeeks") or []) if str(x).isdigit() and 1 <= int(x) <= total_weeks}
+
+    if scope == "week":
+        week = int(week or 0)
+        if week <= 0 or week not in published_weeks:
+            return None
+    else:
+        scope = "semester"
+        week = 0
+
+    snapshot_name = _public_snapshot_dir_name(marker)
+    snapshot_dir = os.path.join(PUBLIC_SHARD_DIR, snapshot_name)
+    entity_dir = _public_entity_dir(snapshot_dir, kind, entity_id)
+    os.makedirs(entity_dir, exist_ok=True)
+
+    filename = f"week-{week}.json" if scope == "week" else "semester.json"
+    plain_path = os.path.join(entity_dir, filename)
+    if not os.path.exists(plain_path):
+        full_schedule = _build_public_schedule_shard(project, kind, str(entity_id))
+        if scope == "week":
+            schedule = _public_schedule_shard_for_week(project, full_schedule, week)
+        else:
+            schedule = full_schedule
+        instances = schedule.get("instances") or []
+        payload = {
+            "schedule": schedule,
+            "dataPatch": _public_entity_data_patch(project, instances),
+            "marker": marker, "kind": kind, "id": str(entity_id), "scope": scope,
+        }
+        if scope == "week":
+            payload["week"] = week
+        _write_public_shard_file(plain_path, payload)
+
+    manifest = _load_public_shard_manifest()
+    if not isinstance(manifest, dict) or str(manifest.get("marker") or "") != str(marker) or str(manifest.get("snapshot") or "") != snapshot_name:
+        manifest = {
+            "marker": marker,
+            "snapshot": snapshot_name,
+            "totalWeeks": total_weeks,
+            "publishedWeeks": sorted(published_weeks),
+            "stats": {"lazy": True},
+        }
+        _atomic_write_bytes(PUBLIC_SHARD_SNAPSHOT_FILE, json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return manifest
+
 
 def _public_project_for_shard():
     with _public_index_cache_lock:
@@ -1239,7 +1445,9 @@ def public_index():
                 resp.headers["Content-Encoding"] = "gzip"
         resp.headers["ETag"] = f'"{etag}"'
         resp.headers["Vary"] = "Accept-Encoding"
-        resp.headers["Cache-Control"] = "public, max-age=30, stale-while-revalidate=300"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
         resp.headers["X-Public-Snapshot"] = marker[:96]
         return resp
     except Exception as exc:
@@ -1259,7 +1467,9 @@ def public_status():
         with open(PUBLIC_STATUS_FILE, "rb") as f:
             body = f.read()
         resp = Response(body, status=200, mimetype="application/json")
-        resp.headers["Cache-Control"] = "public, max-age=5, stale-while-revalidate=30"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
         return resp
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
@@ -1279,16 +1489,12 @@ def public_schedule_shard(kind, entity_id):
             week = 0
 
         manifest = _load_public_shard_manifest()
-        # Rolling-deploy/cold-install fallback: build once from canonical storage,
-        # then all following public requests remain file-only.
+        # v1706: never rebuild the whole public semester in a visitor request.
+        # After deploy/restart create only the requested entity/week shard.
         if not manifest:
-            store = load_store()
-            working = _public_project_from_store(store)
-            if not working:
-                return jsonify({"error": "Рабочие данные отсутствуют"}), 404
-            marker = _public_marker(working)
-            _refresh_public_index_from_store(store, force=True)
-            manifest = _prebuild_public_snapshot_shards(working, marker)
+            manifest = _ensure_public_shard_on_demand(kind, entity_id, scope, week)
+            if not manifest:
+                return jsonify({"error": "Расписание не опубликовано для выбранной недели/объекта"}), 404
         marker = str(manifest.get("marker") or "")
         snapshot_name = str(manifest.get("snapshot") or "")
         snapshot_dir = os.path.join(PUBLIC_SHARD_DIR, snapshot_name)
@@ -1296,6 +1502,14 @@ def public_schedule_shard(kind, entity_id):
         filename = f"week-{week}.json" if scope == "week" else "semester.json"
         plain_path = os.path.join(entity_dir, filename)
         gzip_path = plain_path + ".gz"
+        if not os.path.exists(plain_path):
+            manifest = _ensure_public_shard_on_demand(kind, entity_id, scope, week) or manifest
+            marker = str(manifest.get("marker") or marker)
+            snapshot_name = str(manifest.get("snapshot") or snapshot_name)
+            snapshot_dir = os.path.join(PUBLIC_SHARD_DIR, snapshot_name)
+            entity_dir = _public_entity_dir(snapshot_dir, kind, entity_id)
+            plain_path = os.path.join(entity_dir, filename)
+            gzip_path = plain_path + ".gz"
         if not os.path.exists(plain_path):
             return jsonify({"error": "Расписание не опубликовано для выбранной недели/объекта"}), 404
 
@@ -1318,7 +1532,9 @@ def public_schedule_shard(kind, entity_id):
         resp.headers["Vary"] = "Accept-Encoding"
         # Published snapshot files are immutable by snapshot id. The endpoint URL
         # itself is stable, so keep a short freshness window + long stale grace.
-        resp.headers["Cache-Control"] = "public, max-age=120, stale-while-revalidate=1800"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
         resp.headers["X-Public-Snapshot"] = marker[:96]
         resp.headers["X-Public-Scope"] = scope
         return resp
@@ -1364,7 +1580,9 @@ def public_bootstrap():
         # v1637: проверяем актуальность на каждом открытии, но ETag позволяет
         # получить дешёвый 304 без повторной передачи/разбора большого JSON.
         # Это убирает до 30 секунд расхождения между редактором и публичным контуром.
-        resp.headers["Cache-Control"] = "public, no-cache, must-revalidate"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
         resp.headers["X-Public-Snapshot"] = marker[:96]
         return resp
     except Exception as exc:
@@ -2423,7 +2641,8 @@ def _schedule_group_overlap_pairs(project, schedule, only_ids=None):
         t1, t2 = str(inst.get("teacherId") or ""), str(other.get("teacherId") or "")
         vacancy = bool(inst.get("isVacancyTeacher")) or bool(other.get("isVacancyTeacher"))
         explicit = bool(a.get("manualTeacherMultiRoom") or oa.get("manualTeacherMultiRoom") or
-                        a.get("manualSameSubjectTeacherSameRoom") or oa.get("manualSameSubjectTeacherSameRoom"))
+                        a.get("manualSameSubjectTeacherSameRoom") or oa.get("manualSameSubjectTeacherSameRoom") or
+                        a.get("manualMultiGroupRoom") or oa.get("manualMultiGroupRoom"))
         if t1 and t1 == t2 and not vacancy and not explicit:
             same_group_subgroups = False
             for gid in groups_a.intersection(groups(oid)):
@@ -2637,7 +2856,7 @@ def storage_schedule_patch(key):
     with _schedule_patch_queue_lock:
         _schedule_patch_queue.append(item)
         _schedule_patch_queue_event.set()
-    if not item["event"].wait(timeout=20.0):
+    if not item["event"].wait(timeout=45.0):
         return jsonify({"error": "Сервер не успел подтвердить сохранение ячейки"}), 503
     result = item.get("result") or {"status": 500, "body": {"error": "Неизвестная ошибка сохранения"}}
     return jsonify(result.get("body") or {}), int(result.get("status") or 500)
@@ -2734,7 +2953,9 @@ def _schedule_patch_batch_loop():
                         # string inside JSON. Old backups remain readable, while new
                         # saves avoid a second full json.dumps + escaping pass.
                         store[storage_key] = project
-                        _maybe_periodic_backup()
+                        # v1686: never copy the multi-megabyte backup while holding
+                        # the hot storage lock. That pause was long enough to make
+                        # queued cell requests hit HTTP 503 under load.
                         save_store(store, backup=False, durable=False, refresh_public=False)
                         for item in successful:
                             item["result"] = {
@@ -2746,6 +2967,8 @@ def _schedule_patch_batch_loop():
                                     "_syncMeta": sync_meta,
                                 },
                             }
+                if successful:
+                    _maybe_periodic_backup_async()
             except FileNotFoundError as exc:
                 for item in items:
                     if item.get("result") is None:
@@ -2886,6 +3109,7 @@ def storage_publication_commit(key):
     weeks_raw = body.get("publishedWeeks") or []
     history_entry = body.get("historyEntry") or {}
     locked_add = body.get("lockedAdd") or []
+    publish_change = body.get("publishChange") or {}
     meta = body.get("meta") or {}
     if not isinstance(version, dict) or not version.get("id") or not isinstance(snapshot, dict):
         return jsonify({"error": "Неверные данные публикации"}), 400
@@ -2945,16 +3169,21 @@ def storage_publication_commit(key):
         }
         store[key] = project
         _maybe_periodic_backup()
-        save_store(store, backup=False)
-        # Copy only once while the canonical object is stable; the expensive
-        # thousands-of-small-files public build runs AFTER releasing _lock so
-        # publication never blocks other editors' cell saves.
+        # v1704: do not expose the new public index/bootstrap before the matching
+        # shard snapshot is completely built. Otherwise a public client can see
+        # new publication metadata while /api/public-schedule still points at the
+        # previous snapshot. The public files are switched only after shard build.
+        save_store(store, backup=False, refresh_public=False)
         public_build_project = copy.deepcopy(project)
 
     try:
-        _prebuild_public_snapshot_shards(public_build_project, _public_marker(public_build_project))
+        marker = _public_marker(public_build_project)
+        _prebuild_public_snapshot_shards(public_build_project, marker, publish_change)
+        public_store = {"schedule-data-v2": public_build_project}
+        _refresh_public_index_from_store(public_store, force=True)
+        _refresh_public_sidecar_from_store(public_store, force=True)
     except Exception as exc:
-        app.logger.warning("public shard snapshot build failed after publication: %s", exc)
+        app.logger.warning("public snapshot build failed after publication: %s", exc)
 
     return jsonify({"ok": True, "token": save_id, "versionId": version.get("id"), "publishedWeeks": cleaned})
 
@@ -3016,13 +3245,18 @@ def storage_publish_weeks(key):
         }
         store[key] = project
         _maybe_periodic_backup()
-        save_store(store, backup=False)
+        # v1704: same atomic public switch for week-selection publication.
+        save_store(store, backup=False, refresh_public=False)
         public_build_project = copy.deepcopy(project)
 
     try:
-        _prebuild_public_snapshot_shards(public_build_project, _public_marker(public_build_project))
+        marker = _public_marker(public_build_project)
+        _prebuild_public_snapshot_shards(public_build_project, marker, {"scope": "weeks", "weekNumbers": cleaned})
+        public_store = {"schedule-data-v2": public_build_project}
+        _refresh_public_index_from_store(public_store, force=True)
+        _refresh_public_sidecar_from_store(public_store, force=True)
     except Exception as exc:
-        app.logger.warning("public shard snapshot build failed after publish-weeks: %s", exc)
+        app.logger.warning("public snapshot build failed after publish-weeks: %s", exc)
 
     return jsonify({
         "ok": True,
