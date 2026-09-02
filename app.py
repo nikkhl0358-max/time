@@ -1744,13 +1744,19 @@ def _apply_generation_group_progress(storage_key, progress, backup=False, job_id
             schedule["stats"] = {**(schedule.get("stats") or {}), **patch.get("stats")}
 
         remote["schedule"] = schedule
+        # Preserve the editor session that last touched the project.  Progress
+        # checkpoints are written from a background scheduler thread, where no
+        # request-local `meta` variable exists.  The old code referenced `meta`
+        # here and crashed with NameError as soon as the first server progress
+        # patch was persisted.
+        current_sync_meta = remote.get("_syncMeta") if isinstance(remote.get("_syncMeta"), dict) else {}
         remote["_syncMeta"] = {
             "at": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
             "saveId": "schedule-generate-progress-" + uuid.uuid4().hex,
             "userId": "",
             "by": "Авторасчёт",
             "scope": "schedule",
-            "sessionId": str(meta.get("sessionId") or ""),
+            "sessionId": str(current_sync_meta.get("sessionId") or ""),
         }
         store[storage_key] = remote
         # Internal auto checkpoints are recoverable and are followed by a durable
