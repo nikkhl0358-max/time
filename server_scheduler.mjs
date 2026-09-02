@@ -1049,7 +1049,7 @@ function roomIdsEquivalent(rooms, a, b) {
   return !!na && na === nb;
 }
 
-function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null, allowMixedDayFormat = false) {
+function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null) {
   const inst = instances.find((i) => i.instId === instId);
   if (!inst) return { ok: false, reason: "Занятие не найдено" };
 
@@ -1108,15 +1108,11 @@ function canPlace(assignment, instances, rooms, instId, day, period, roomId, ext
       const other = instances.find((i) => i.instId === otherId);
       if (!other || !overlaps(other)) continue;
 
-      // Формат дня должен совпадать только на реально пересекающихся неделях.
-      // v1613: `allowMixedDayFormat` is a manual-only override (never set by
-      // auto-scheduling, which still enforces "one format per day" strictly
-      // via dayFormatOk/slotFreeForOwners in generateSchedule) — lets a
-      // person deliberately place an in-person lesson on an otherwise-ДО day
-      // for that group/teacher, or vice versa.
-      if (!allowMixedDayFormat && a.day === day && other.format !== inst.format) {
-        if (sameParticipantGroup(other)) { reason = `В этот день у группы уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
-        if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId) { reason = `В этот день у преподавателя уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
+      // v1717: формат дня — абсолютный hard constraint и для автоматики, и
+      // для ручного режима. Проверяется только на пересекающихся неделях.
+      if (a.day === day && other.format !== inst.format) {
+        if (sameParticipantGroup(other)) { reason = `Смешение ДО и очного формата в один день запрещено: у группы уже есть ${other.format === "remote" ? "ДО" : "очное"} занятие на пересекающихся неделях`; break; }
+        if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId) { reason = `Смешение ДО и очного формата в один день запрещено: у преподавателя уже есть ${other.format === "remote" ? "ДО" : "очное"} занятие на пересекающихся неделях`; break; }
       }
       if (a.day !== day || a.period !== period) continue;
 
@@ -1962,25 +1958,28 @@ function generateSchedule(data, prior, perfScope = null) {
     return !!oa && !!other && weeksOverlap(other, inst, config) && halfConflicts(oa.half ?? null, half);
   };
 
-  function groupDayFormat(groupId, day) {
-    const set = groupDayInstances.get(dpKey(groupId, day));
-    if (!set || set.size === 0) return null;
-    const firstId = set.values().next().value;
-    return byInst[firstId]?.format || "inperson";
-  }
-  function teacherDayFormatOf(teacherId, day) {
-    const set = teacherDayInstances.get(dpKey(teacherId, day));
-    if (!set || set.size === 0) return null;
-    const firstId = set.values().next().value;
-    return byInst[firstId]?.format || "inperson";
-  }
+  // v1717: ОЧНО/ДО в один день — ЖЁСТКОЕ ограничение, но только для
+  // реально пересекающихся недель. Старый вариант смотрел на первый инстанс
+  // этого weekday без проверки week overlap и поэтому мог запрещать, например,
+  // очную пару на 8-й неделе из-за ДО-пары, существующей только на 7-й.
   function dayFormatOk(inst, day) {
     for (const gid of streamGroups(inst)) {
-      const gf = groupDayFormat(gid, day);
-      if (gf && gf !== inst.format) return false;
+      const set = groupDayInstances.get(dpKey(gid, day));
+      if (!set) continue;
+      for (const otherId of set) {
+        const other = byInst[otherId];
+        if (!other || other.instId === inst.instId || !weeksOverlap(other, inst, config)) continue;
+        if (other.format !== inst.format) return false;
+      }
     }
-    const tf = teacherDayFormatOf(inst.teacherId, day);
-    if (tf && tf !== inst.format) return false;
+    if (!inst.isVacancyTeacher && inst.teacherId) {
+      const set = teacherDayInstances.get(dpKey(inst.teacherId, day));
+      if (set) for (const otherId of set) {
+        const other = byInst[otherId];
+        if (!other || other.instId === inst.instId || other.isVacancyTeacher || !weeksOverlap(other, inst, config)) continue;
+        if (other.format !== inst.format) return false;
+      }
+    }
     return true;
   }
 
@@ -4679,8 +4678,8 @@ function diagnosticFastCanPlace(data, assignment, index, inst, day, period, room
   for (const gid of streamGroups(inst)) for (const id of (index.groupDay.get(`${day}|${gid}`)||[])) dayCandidates.add(id);
   if (!inst.isVacancyTeacher && inst.teacherId) for (const id of (index.teacherDay.get(`${day}|${inst.teacherId}`)||[])) dayCandidates.add(id);
   for (const id of dayCandidates) { const other=index.byInst.get(id); if (!other || !overlaps(other) || other.format===inst.format) continue;
-    if (sameParticipantGroup(other)) return {ok:false,reason:`В этот день у группы уже стоят занятия ${other.format==='remote'?'дистанционно':'очно'} на пересекающихся неделях — весь день недели должен быть в одном формате`};
-    if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId===inst.teacherId) return {ok:false,reason:`В этот день у преподавателя уже стоят занятия ${other.format==='remote'?'дистанционно':'очно'} на пересекающихся неделях — весь день недели должен быть в одном формате`};
+    if (sameParticipantGroup(other)) return {ok:false,reason:`Смешение ДО и очного формата в один день запрещено: у группы уже есть ${other.format==='remote'?'ДО':'очное'} занятие на пересекающихся неделях`};
+    if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId===inst.teacherId) return {ok:false,reason:`Смешение ДО и очного формата в один день запрещено: у преподавателя уже есть ${other.format==='remote'?'ДО':'очное'} занятие на пересекающихся неделях`};
   }
   const sk=`${day}_${period}`, candidates=new Set();
   for (const gid of streamGroups(inst)) for (const id of (index.groupSlot.get(`${sk}|${gid}`)||[])) candidates.add(id);

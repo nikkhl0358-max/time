@@ -496,7 +496,7 @@ export async function serverAutoGraphStatus(jobId) {
 
 export async function publicIndexGet() {
   try {
-    const res = await fetch(`/api/public-index?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await fetch(`/api/public-index?_t=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -510,8 +510,7 @@ export async function publicScheduleGet(kind, id, options = {}) {
     const safeKind = kind === 'teacher' ? 'teacher' : 'group';
     const scope = options?.scope === 'week' && Number(options?.week) > 0 ? 'week' : 'semester';
     const qs = scope === 'week' ? `?scope=week&week=${encodeURIComponent(Number(options.week))}` : '?scope=semester';
-    const sep = qs.includes('?') ? '&' : '?';
-    const res = await fetch(`/api/public-schedule/${safeKind}/${encodeURIComponent(String(id || ''))}${qs}${sep}_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await fetch(`/api/public-schedule/${safeKind}/${encodeURIComponent(String(id || ''))}${qs}${qs.includes('?') ? '&' : '?'}_t=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -522,7 +521,7 @@ export async function publicScheduleGet(kind, id, options = {}) {
 
 export async function publicStatusGet() {
   try {
-    const res = await fetch(`/api/public-status?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await fetch(`/api/public-status?_t=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -535,7 +534,7 @@ export async function publicBootstrapGet() {
   try {
     // v1628: публичный bootstrap имеет короткий HTTP cache + ETag на сервере.
     // Не запрещаем браузеру использовать его: повторные открытия заметно быстрее.
-    const res = await fetch(`/api/public-bootstrap?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await fetch(`/api/public-bootstrap?_t=${Date.now()}`, { cache: 'no-store' });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {

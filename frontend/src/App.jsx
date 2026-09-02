@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useDeferredValue, Fragment } from "react";
 import Papa from "papaparse";
-import * as XLSX from "xlsx-js-style";
+import * as XLSX from "xlsx";
 import { storageGet, storageGetStrict, publicBootstrapGet, publicIndexGet, publicScheduleGet, publicStatusGet, storageSet, storageGraphMerge, storageGraphPatch, storageScheduleMerge, storageScheduleGroupMerge, storageSchedulePatch, storagePublishWeeks, storagePublicationCommit, storageSectionMerge, storageMeta, storageBackups, storageDownloadBackup, storageRestoreBackup, storageVersionGet, presenceHeartbeat, presenceLeave, serverGenerateStart, serverGenerateStatus, serverGenerateCancel, serverAutoGraphStart, serverAutoGraphStatus } from "./storage.js";
 import {
   Plus, Trash2, Wand2, Download, Settings, Users, MapPin, BookOpen,
@@ -1205,7 +1205,7 @@ function roomIdsEquivalent(rooms, a, b) {
   return !!na && na === nb;
 }
 
-function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null, allowMixedDayFormat = false) {
+function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null) {
   const inst = instances.find((i) => i.instId === instId);
   if (!inst) return { ok: false, reason: "Занятие не найдено" };
 
@@ -1264,15 +1264,11 @@ function canPlace(assignment, instances, rooms, instId, day, period, roomId, ext
       const other = instances.find((i) => i.instId === otherId);
       if (!other || !overlaps(other)) continue;
 
-      // Формат дня должен совпадать только на реально пересекающихся неделях.
-      // v1613: `allowMixedDayFormat` is a manual-only override (never set by
-      // auto-scheduling, which still enforces "one format per day" strictly
-      // via dayFormatOk/slotFreeForOwners in generateSchedule) — lets a
-      // person deliberately place an in-person lesson on an otherwise-ДО day
-      // for that group/teacher, or vice versa.
-      if (!allowMixedDayFormat && a.day === day && other.format !== inst.format) {
-        if (sameParticipantGroup(other)) { reason = `В этот день у группы уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
-        if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId) { reason = `В этот день у преподавателя уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
+      // v1717: формат дня — абсолютный hard constraint и для автоматики, и
+      // для ручного режима. Проверяется только на пересекающихся неделях.
+      if (a.day === day && other.format !== inst.format) {
+        if (sameParticipantGroup(other)) { reason = `Смешение ДО и очного формата в один день запрещено: у группы уже есть ${other.format === "remote" ? "ДО" : "очное"} занятие на пересекающихся неделях`; break; }
+        if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId) { reason = `Смешение ДО и очного формата в один день запрещено: у преподавателя уже есть ${other.format === "remote" ? "ДО" : "очное"} занятие на пересекающихся неделях`; break; }
       }
       if (a.day !== day || a.period !== period) continue;
 
@@ -5189,168 +5185,6 @@ function TeachersTable({ teachers, setTeachers, depOptions, employmentTypes, set
     ])
   );
 
-  const exportTeacherAvailability = () => {
-    const activeDayIndices = (config.activeDays || []).map((on, i) => (on ? i : null)).filter((v) => v !== null);
-    const periods = Math.max(1, Number(config.periodsPerDay || 0));
-    const sortedTeachers = teachers
-      .filter((t) => (t.name || "").trim())
-      .slice()
-      .sort((a, b) => (a.name || "").localeCompare(b.name || "", "ru", { sensitivity: "base" }));
-    if (!sortedTeachers.length) {
-      alert("Нет преподавателей для выгрузки.");
-      return;
-    }
-
-    const wb = XLSX.utils.book_new();
-    const defaultPeriodTimes = ["8:30–10:00", "10:10–11:40", "11:50–13:20", "14:00–15:30", "15:40–17:10", "17:20–18:50", "19:00–20:30"];
-    const periodTime = (p) => String(config.periodTimes?.[p] || defaultPeriodTimes[p] || "").trim();
-
-    const thinBorder = {
-      top: { style: "thin", color: { rgb: "C9C9C9" } },
-      bottom: { style: "thin", color: { rgb: "C9C9C9" } },
-      left: { style: "thin", color: { rgb: "C9C9C9" } },
-      right: { style: "thin", color: { rgb: "C9C9C9" } },
-    };
-    const styles = {
-      teacher: {
-        font: { name: "Calibri", sz: 14, bold: false, color: { rgb: "222222" } },
-        alignment: { vertical: "center", horizontal: "left" },
-      },
-      corner: {
-        font: { name: "Times New Roman", sz: 14, bold: true, color: { rgb: "2F75B5" } },
-        alignment: { vertical: "center", horizontal: "left", wrapText: true },
-      },
-      period: {
-        font: { name: "Calibri", sz: 11, bold: false, color: { rgb: "111111" } },
-        alignment: { vertical: "center", horizontal: "center", wrapText: true },
-      },
-      day: {
-        font: { name: "Times New Roman", sz: 11, bold: true, color: { rgb: "111111" } },
-        fill: { fgColor: { rgb: "F2F2F2" } },
-        alignment: { vertical: "center", horizontal: "left" },
-        border: thinBorder,
-      },
-      free: {
-        font: { name: "Calibri", sz: 11, color: { rgb: "222222" } },
-        alignment: { horizontal: "center", vertical: "center" },
-        border: thinBorder,
-      },
-      blocked: {
-        font: { name: "Arial", sz: 18, bold: false, color: { rgb: "D44734" } },
-        fill: { fgColor: { rgb: "FCE1E1" } },
-        alignment: { horizontal: "center", vertical: "center" },
-        border: thinBorder,
-      },
-      legend: {
-        font: { name: "Calibri", sz: 11, color: { rgb: "222222" } },
-        alignment: { vertical: "center", horizontal: "left" },
-      },
-    };
-
-    const buildParitySheet = (parity) => {
-      const aoa = [];
-      const rowKinds = [];
-      const merges = [];
-      const blocks = [];
-      let r = 0;
-
-      sortedTeachers.forEach((t) => {
-        const unavailable = t.availabilityByParity
-          ? (parity === "even" ? (t.unavailableEven || []) : (t.unavailableOdd || []))
-          : (t.unavailable || []);
-        const blockStart = r;
-
-        aoa.push([]); rowKinds.push("spacerTop"); r += 1;
-        aoa.push([t.name || "Преподаватель"]); rowKinds.push("teacher");
-        merges.push({ s: { r, c: 0 }, e: { r, c: periods } });
-        r += 1;
-
-        const header = ["День \\ Пара"];
-        for (let p = 0; p < periods; p++) {
-          const tm = periodTime(p);
-          header.push(tm ? `${p + 1}\n${tm}` : `${p + 1}`);
-        }
-        aoa.push(header); rowKinds.push("header"); r += 1;
-
-        activeDayIndices.forEach((day) => {
-          const row = [DAY_LABELS_FULL[day] || DAY_LABELS[day] || `День ${day + 1}`];
-          for (let p = 0; p < periods; p++) row.push(unavailable.includes(slotOf(day, p)) ? "×" : "");
-          aoa.push(row); rowKinds.push("day"); r += 1;
-        });
-
-        aoa.push([]); rowKinds.push("gap"); r += 1;
-        aoa.push([]); rowKinds.push("gap"); r += 1;
-        const legendFreeRow = r;
-        aoa.push(["", "", "преподаватель свободен"]); rowKinds.push("legendFree"); r += 1;
-        const legendBusyRow = r;
-        aoa.push(["", "×", "преподаватель занят"]); rowKinds.push("legendBusy"); r += 1;
-        aoa.push([]); rowKinds.push("separator"); r += 1;
-
-        blocks.push({ start: blockStart, legendFreeRow, legendBusyRow, unavailable });
-      });
-
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
-      ws["!merges"] = merges;
-      ws["!cols"] = [{ wch: 29 }, ...Array.from({ length: periods }, () => ({ wch: 13.5 }))];
-      ws["!rows"] = rowKinds.map((kind) => ({
-        hpt: kind === "teacher" ? 24
-          : kind === "header" ? 38
-          : kind === "day" ? 28
-          : kind === "gap" ? 12
-          : kind === "legendFree" || kind === "legendBusy" ? 24
-          : kind === "separator" ? 16
-          : 8,
-      }));
-      ws["!freeze"] = { xSplit: 1, ySplit: 3, topLeftCell: "B4", activePane: "bottomRight", state: "frozen" };
-
-      const setStyle = (r0, c0, style) => {
-        const ref = XLSX.utils.encode_cell({ r: r0, c: c0 });
-        if (!ws[ref]) ws[ref] = { t: "s", v: "" };
-        ws[ref].s = style;
-      };
-
-      let cursor = 0;
-      sortedTeachers.forEach((t) => {
-        cursor += 1; // blank top spacer
-        setStyle(cursor, 0, styles.teacher);
-        cursor += 1;
-        setStyle(cursor, 0, styles.corner);
-        for (let p = 0; p < periods; p++) setStyle(cursor, p + 1, styles.period);
-        cursor += 1;
-
-        const unavailable = t.availabilityByParity
-          ? (parity === "even" ? (t.unavailableEven || []) : (t.unavailableOdd || []))
-          : (t.unavailable || []);
-        activeDayIndices.forEach((day) => {
-          setStyle(cursor, 0, styles.day);
-          for (let p = 0; p < periods; p++) {
-            setStyle(cursor, p + 1, unavailable.includes(slotOf(day, p)) ? styles.blocked : styles.free);
-          }
-          cursor += 1;
-        });
-
-        cursor += 2; // two blank rows
-        setStyle(cursor, 2, styles.legend);
-        cursor += 1;
-        setStyle(cursor, 1, styles.blocked);
-        setStyle(cursor, 2, styles.legend);
-        cursor += 2; // busy legend + separator
-      });
-
-      return ws;
-    };
-
-    const hasParity = sortedTeachers.some((t) => !!t.availabilityByParity);
-    if (hasParity) {
-      XLSX.utils.book_append_sheet(wb, buildParitySheet("odd"), "Нечётные недели");
-      XLSX.utils.book_append_sheet(wb, buildParitySheet("even"), "Чётные недели");
-    } else {
-      XLSX.utils.book_append_sheet(wb, buildParitySheet("all"), "Занятость");
-    }
-
-    XLSX.writeFile(wb, `zanyatost_prepodavateley_${new Date().toISOString().slice(0, 10)}.xlsx`, { cellStyles: true });
-  };
-
   const editingTeacher = teachers.find((t) => t.id === editing);
   const filtered = teachers
     .filter((t) => !search || (t.name || "").toLocaleLowerCase("ru").includes(search.toLocaleLowerCase("ru")))
@@ -5384,7 +5218,6 @@ function TeachersTable({ teachers, setTeachers, depOptions, employmentTypes, set
           Импорт из CSV/Excel
         </button>
         <button className="btn ghost sm" onClick={exportTeachers}><Download size={14}/> Выгрузить Excel</button>
-        <button className="btn primary sm" onClick={exportTeacherAvailability} title="Скачать наглядную матрицу недоступности преподавателей по дням и парам"><Download size={14}/> Выгрузить занятость</button>
       </div>
       {importMsg && <div className="import-msg">{importMsg}</div>}
       <table>
@@ -8643,9 +8476,6 @@ function Modal({ title, onClose, children, backdropClass = "", modalClass = "" }
 function SchedulePanel({ data, set, generating, generationStatus, onGenerate, onCancelGenerate, onPublish, onCellPatch, activeUsers = [], currentUser = null, onPresenceEditing = null, routeGroupId = "", onRouteGroupChange = null }) {
   const [viewKind, setViewKind] = useState("group");
   const [viewId, setViewId] = useState(routeGroupId || "");
-  // v1707: автогенерация временно скрыта из интерфейса, но обработчики и серверный
-  // функционал намеренно оставлены — достаточно вернуть флаг в true.
-  const SHOW_AUTO_CALC_CONTROLS = false;
   const [manualMode, setManualMode] = useState(true);
   const selectScheduleViewId = (id) => {
     const next = String(id || "");
@@ -9215,7 +9045,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     };
   }, [sched, data.groups, data.teachers, data.config]);
 
-  const rawList = viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll" ? data.groups : (viewKind === "teacher" || viewKind === "allTeachers") ? data.teachers : data.rooms;
+  const rawList = viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll" ? data.groups : viewKind === "teacher" ? data.teachers : data.rooms;
   const list = (viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll") && filterSpec ? rawList.filter((g) => g.specialtyId === filterSpec) : rawList;
   const scheduleGroupPresence = useMemo(() => {
     const map = new Map();
@@ -9510,11 +9340,6 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
   const visibleSemesterTeacherConflictBlocks = useMemo(() => {
     let src = semesterTeacherSlotConflicts;
     if (viewKind === "teacher") src = viewId ? src.filter((c) => c.teacherId === viewId) : [];
-    // v1703: в режиме «По группам» сводка двойной занятости намеренно ГЛОБАЛЬНАЯ.
-    // Преподаватель может быть занят одновременно в двух совершенно других группах,
-    // поэтому привязка баннера к текущей выбранной группе скрывала часть проблем.
-    // Сетка выбранной группы остаётся локальной, а верхняя сводка сразу показывает
-    // все неразрешённые двойные назначения преподавателей во всём расписании.
     else if (viewKind === "group") src = src;
     else if (viewKind === "allGroups" && filterSpec) {
       const allowed = new Set(data.groups.filter((g) => g.specialtyId === filterSpec).map((g) => g.id));
@@ -9531,7 +9356,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     return [...m.values()].map((c)=>({...c,weeks:[...new Set(c.weeks)].sort((a,b)=>a-b)}));
   }, [semesterTeacherSlotConflicts, viewKind, viewId, filterSpec, data.groups]);
 
-  const currentViewName = viewKind === "allGroups" ? "Все группы" : viewKind === "allTeachers" ? "Все преподаватели" : viewKind === "allRooms" ? "Все аудитории" : (byId(list, viewId)?.name || "");
+  const currentViewName = viewKind === "allGroups" ? "Все группы" : (byId(list, viewId)?.name || "");
   const isGroupDayTemporarilyBlocked = (day) => {
     if (viewKind !== "group" || weekScope !== "week" || !viewId) return false;
     const date = dateForScheduleDay(day);
@@ -9657,8 +9482,6 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       const match =
         (viewKind === "group" && belongsToScheduleGroup(inst, viewId)) ||
         (viewKind === "allGroups") ||
-        (viewKind === "allTeachers") ||
-        (viewKind === "allRooms") ||
         (viewKind === "teacher" && inst.teacherId === viewId) ||
         (viewKind === "room" && assignmentRoomIds(a).includes(viewId));
       if (match) out.push({ inst, a });
@@ -9676,7 +9499,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === subDate && Number(x.targetPeriod) === Number(period))) {
         const cell = movedCellForSubstitution(data, sub);
         if (!cell) continue;
-        const match = (viewKind === "group" && belongsToScheduleGroup(cell.inst, viewId)) || viewKind === "allGroups" || viewKind === "allTeachers" || viewKind === "allRooms" || (viewKind === "teacher" && (cell.subOverride?.teacherId || cell.inst.teacherId) === viewId) || (viewKind === "room" && assignmentRoomIds(cell.a).includes(viewId));
+        const match = (viewKind === "group" && belongsToScheduleGroup(cell.inst, viewId)) || viewKind === "allGroups" || (viewKind === "teacher" && (cell.subOverride?.teacherId || cell.inst.teacherId) === viewId) || (viewKind === "room" && assignmentRoomIds(cell.a).includes(viewId));
         if (match) out.push(cell);
       }
     }
@@ -9715,36 +9538,6 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === subDate && Number(x.targetPeriod) === Number(period))) {
         const cell = movedCellForSubstitution(data, sub);
         if (cell && belongsToScheduleGroup(cell.inst, groupId)) out.push(cell);
-      }
-    }
-    return out;
-  };
-
-  // v1707: агрегированные представления «Все преподаватели» / «Все аудитории».
-  // Они используют тот же недельный индекс, что и «Все группы», поэтому не требуют
-  // отдельного расчёта расписания и отражают замены на выбранную дату.
-  const aggregateEntityCellFor = (kind, entityId, day, period) => {
-    if (!sched) return [];
-    const out = [];
-    const sourceRows = weekScope === "all"
-      ? (semesterCellIndex.byDayPeriod.get(`${Number(day)}:${Number(period)}`) || [])
-      : (semesterCellIndex.bySlot.get(`${Number(scheduleWeek)}:${Number(day)}:${Number(period)}`) || []);
-    const matches = (cell) => {
-      if (kind === "teacher") return String(cell.subOverride?.teacherId || cell.inst.teacherId || "") === String(entityId);
-      return assignmentRoomIds(cell.a).map(String).includes(String(entityId));
-    };
-    for (const row of sourceRows) {
-      const inst = row.inst, a = row.a;
-      if (!a || a.day !== day || a.period !== period) continue;
-      if (weekScope === "week" && totalWeeksInSchedule > 0 && !instanceVisibleInScheduleWeek(inst, day, period, scheduleWeek)) continue;
-      if (weekScope === "all" && totalWeeksInSchedule > 0 && actualWeeksForAssignedDay(inst, day).length === 0) continue;
-      const cell = (subDate && weekdayOf(subDate) === day) ? overlayForCell(inst, a, subDate, data.substitutions) : { inst, a, subOverride: null };
-      if (matches(cell)) out.push(cell);
-    }
-    if (subDate && weekdayOf(subDate) === day) {
-      for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === subDate && Number(x.targetPeriod) === Number(period))) {
-        const cell = movedCellForSubstitution(data, sub);
-        if (cell && matches(cell)) out.push(cell);
       }
     }
     return out;
@@ -10114,7 +9907,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const eventConflicts = recurringManualConflicts(data, selectedInst, Number(day), Number(period), effectiveRoomId);
     if (eventConflicts.length) return { ok:false, reason:`Нельзя поставить: ${eventConflicts.slice(0,3).join("; ")}` };
 
-    const assignment = { ...assignmentBefore, [splitId]: { day:Number(day), period:Number(period), roomId:effectiveRoomId, extraRoomId:null, half:selectedInst.halfPair ? (check.half ?? 0) : null, ...(check.manualTeacherMultiRoom ? { manualTeacherMultiRoom:true } : {}), ...(check.manualSameSubjectTeacherSameRoom ? { manualSameSubjectTeacherSameRoom:true } : {}), ...(check.manualMultiGroupRoom ? { manualMultiGroupRoom:true } : {}), ...(check.manualOccupiedRoomOverride ? { manualOccupiedRoomOverride:true } : {}), ...(check.manualMixedDayFormat ? { manualMixedDayFormat:true } : {}) } };
+    const assignment = { ...assignmentBefore, [splitId]: { day:Number(day), period:Number(period), roomId:effectiveRoomId, extraRoomId:null, half:selectedInst.halfPair ? (check.half ?? 0) : null, ...(check.manualTeacherMultiRoom ? { manualTeacherMultiRoom:true } : {}), ...(check.manualSameSubjectTeacherSameRoom ? { manualSameSubjectTeacherSameRoom:true } : {}), ...(check.manualMultiGroupRoom ? { manualMultiGroupRoom:true } : {}), ...(check.manualOccupiedRoomOverride ? { manualOccupiedRoomOverride:true } : {}) } };
     const unplacedBase = (sched.unplaced || []).filter((id)=>!sourceSet.has(String(id)) && id!==splitId);
     const unplaced = remainingWeeks.length ? [...new Set([...unplacedBase, anchorId])] : unplacedBase;
     const lockedBase = (sched.locked || []).filter((id)=>!sourceSet.has(String(id)));
@@ -10428,15 +10221,6 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     if (base.ok) return base;
     const target = (instancesList || []).find((i) => i.instId === instId);
     if (!target) return base;
-
-    // v1613: explicit manual-only exception — a person may deliberately place
-    // an in-person lesson on an otherwise-ДО day (or vice versa) for a given
-    // group/teacher. Auto-scheduling never sets `allowMixedDayFormat`, so it
-    // keeps enforcing "one format per day" strictly as before.
-    if (String(base.reason || "").includes("весь день недели должен быть в одном формате")) {
-      const retryMixedFormat = canPlace(assignmentMap, instancesList, data.rooms, instId, day, period, roomId, extraRoomId, proposedHalf, data.config, true);
-      if (retryMixedFormat.ok) return { ...retryMixedFormat, manualMixedDayFormat:true };
-    }
 
     // First soften only explicit manual same-teacher exceptions.
     let softened = { ...(assignmentMap || {}) };
@@ -10910,7 +10694,7 @@ ${[...new Set(forceReasons)].join("\n")}
       return { ok:false, reason:"Размещение отменено пользователем" };
     }
     const prev=sched.assignment[instId]||{};
-    const assignment = { ...sched.assignment, [instId]: { day, period, roomId, extraRoomId: effectiveExtra, half: inst.halfPair ? (check.half ?? prev.half ?? 0) : null, ...(check.manualTeacherMultiRoom ? { manualTeacherMultiRoom:true } : {}), ...(check.manualSameSubjectTeacherSameRoom ? { manualSameSubjectTeacherSameRoom:true } : {}), ...(check.manualMultiGroupRoom ? { manualMultiGroupRoom:true } : {}), ...(check.manualOccupiedRoomOverride ? { manualOccupiedRoomOverride:true } : {}), ...(check.manualMixedDayFormat ? { manualMixedDayFormat:true } : {}) } };
+    const assignment = { ...sched.assignment, [instId]: { day, period, roomId, extraRoomId: effectiveExtra, half: inst.halfPair ? (check.half ?? prev.half ?? 0) : null, ...(check.manualTeacherMultiRoom ? { manualTeacherMultiRoom:true } : {}), ...(check.manualSameSubjectTeacherSameRoom ? { manualSameSubjectTeacherSameRoom:true } : {}), ...(check.manualMultiGroupRoom ? { manualMultiGroupRoom:true } : {}), ...(check.manualOccupiedRoomOverride ? { manualOccupiedRoomOverride:true } : {}) } };
     // v88: в ручном режиме и дневной, и недельный лимиты являются мягкими.
     // Недельный объём меняется только при добавлении ранее неразмещённой пары,
     // а дневной может измениться и при обычном drag & drop.
@@ -10955,14 +10739,6 @@ ${[...new Set(forceReasons)].join("\n")}
       const otherLabel = other ? `${byId(data.groups, other.groupId)?.name || "другая группа"} (${byId(data.teachers, other.teacherId)?.name || "преп. не указан"})` : "другая группа";
       setManualError(`⚠ Аудитория «${roomName}» на это время также используется: ${otherLabel}. Совмещение разрешено вручную.`);
       setTimeout(() => setManualError((cur) => cur.startsWith("⚠ Аудитория") ? "" : cur), 6000);
-    }
-    // v1613: same non-blocking notice pattern as the gym exception — placing
-    // an in-person lesson on an otherwise-ДО day (or vice versa) succeeds
-    // without an extra click, but the person doing it should still see that
-    // this day is now mixed-format for that group/teacher, not just infer it.
-    if (check.manualMixedDayFormat) {
-      setManualError(`⚠ ${DAY_LABELS_FULL[day]} у этой группы/преподавателя теперь смешанного формата (и очно, и ДО). Разрешено вручную.`);
-      setTimeout(() => setManualError((cur) => cur.startsWith("⚠") ? "" : cur), 6000);
     }
     return { ok: true };
   };
@@ -11389,7 +11165,7 @@ ${check.reason || "Конфликт расписания"}
     for (const id of ids) {
       const src = (sched.instances || []).find((x)=>String(x.instId)===String(id));
       if (!src) continue;
-      const a = { day, period, roomId, extraRoomId, half: src.halfPair ? (check.half ?? 0) : null, ...(check.manualTeacherMultiRoom ? { manualTeacherMultiRoom:true } : {}), ...(check.manualSameSubjectTeacherSameRoom ? { manualSameSubjectTeacherSameRoom:true } : {}), ...(check.manualMultiGroupRoom ? { manualMultiGroupRoom:true } : {}), ...(check.manualOccupiedRoomOverride ? { manualOccupiedRoomOverride:true } : {}), ...(check.manualMixedDayFormat ? { manualMixedDayFormat:true } : {}) };
+      const a = { day, period, roomId, extraRoomId, half: src.halfPair ? (check.half ?? 0) : null, ...(check.manualTeacherMultiRoom ? { manualTeacherMultiRoom:true } : {}), ...(check.manualSameSubjectTeacherSameRoom ? { manualSameSubjectTeacherSameRoom:true } : {}), ...(check.manualMultiGroupRoom ? { manualMultiGroupRoom:true } : {}), ...(check.manualOccupiedRoomOverride ? { manualOccupiedRoomOverride:true } : {}) };
       assignment[id] = a; assignmentSet[String(id)] = a;
     }
     const unplaced = (sched.unplaced || []).filter((id) => !idSet.has(String(id)));
@@ -11422,10 +11198,6 @@ ${check.reason || "Конфликт расписания"}
       const otherLabel = other ? `${byId(data.groups, other.groupId)?.name || "другая группа"} (${byId(data.teachers, other.teacherId)?.name || "преп. не указан"})` : "другая группа";
       setManualError(`⚠ Аудитория «${roomName}» на это время также используется: ${otherLabel}. Совмещение разрешено вручную.`);
       setTimeout(() => setManualError((cur) => cur.startsWith("⚠ Аудитория") ? "" : cur), 6000);
-    }
-    if (check.manualMixedDayFormat) {
-      setManualError(`⚠ ${DAY_LABELS_FULL[day]} у этой группы/преподавателя теперь смешанного формата (и очно, и ДО). Разрешено вручную.`);
-      setTimeout(() => setManualError((cur) => cur.startsWith("⚠") ? "" : cur), 6000);
     }
     return { ok:true };
   };
@@ -11772,8 +11544,6 @@ ${check.reason || "Конфликт расписания"}
         if (viewKind === "group" && !belongsToScheduleGroup(inst, viewId)) return false;
         if (viewKind === "allGroups" && (!groupId || !belongsToScheduleGroup(inst, groupId))) return false;
         if (viewKind === "teacher" && inst.teacherId !== viewId) return false;
-        if (viewKind === "allTeachers" && !inst.teacherId) return false;
-        if (viewKind === "allRooms" && inst.format === "remote") return false;
         if (viewKind === "room") {
           if (inst.format === "remote") return false; // дистанту аудитория не нужна
           const room = byId(data.rooms, viewId);
@@ -11850,8 +11620,7 @@ ${check.reason || "Конфликт расписания"}
       if (viewKind === "group" && !belongsToScheduleGroup(inst, viewId)) continue;
       if (viewKind === "allGroups" && (!groupId || !belongsToScheduleGroup(inst, groupId))) continue;
       if (viewKind === "teacher" && inst.teacherId !== viewId) continue;
-      if (viewKind === "allTeachers" && !inst.teacherId) continue;
-      if ((viewKind === "room" || viewKind === "allRooms") && inst.format === "remote") continue;
+      if (viewKind === "room" && inst.format === "remote") continue;
       // v107: в недельном просмотре предложение должно относиться к реально
       // видимой паре этой недели. Раньше сюда попадали шаблоны из других недель,
       // из-за чего в списке появлялись переносы, которых пользователь не видел.
@@ -12060,280 +11829,39 @@ ${check.reason || "Конфликт расписания"}
     URL.revokeObjectURL(url);
   };
 
-  // v1707: Excel-выгрузка расписания в формате шаблона СПбГУ,
-  // присланного пользователем: вертикальный день слева, время, название,
-  // место и преподаватель/группа; для семестра отдельная колонка «Даты».
-  const excelSafeSheetName = (value, fallback = "Расписание") => {
-    const cleaned = String(value || fallback).replace(/[\\/?*\[\]:]/g, " ").trim().slice(0, 31) || fallback;
-    return cleaned;
-  };
-
-  const excelLongDate = (dateStr) => {
-    if (!dateStr) return "";
-    const d = new Date(dateStr + "T00:00:00");
-    return `${d.getDate()} ${RU_MONTHS[d.getMonth()]} ${d.getFullYear()}`;
-  };
-
-  const excelPeriodCaption = (startDate, endDate) => {
-    if (!startDate || !endDate) return "";
-    return `${excelLongDate(startDate)} - ${excelLongDate(endDate)} г. на дату ${formatDateDM(todayISO())}`;
-  };
-
-  const excelEntityTitle = (kind, entity) => {
-    if (kind === "room") return `Аудитория ${entity?.name || ""}`.trim();
-    return entity?.name || "Расписание";
-  };
-
-  const excelHeadersForKind = (kind, semester = false) => {
-    if (kind === "teacher") return semester
-      ? ["", "Время", "Даты", "Название", "Места проведения", "Учебные группы"]
-      : ["", "Время", "Название", "Места проведения", "Учебные группы"];
-    if (kind === "room") return semester
-      ? ["", "Время", "Даты", "Название", "Учебные группы", "Преподаватели"]
-      : ["", "Время", "Название", "Учебные группы", "Преподаватели"];
-    return semester
-      ? ["", "Время", "Даты", "Название", "Места проведения", "Преподаватели"]
-      : ["", "Время", "Название", "Места проведения", "Преподаватели"];
-  };
-
-  const excelLessonRecord = (kind, entityId, cell, day, period, date = "") => {
-    if (!cell?.inst || !cell?.a || cell.subOverride?.cancelled) return null;
-    const { subj, type } = lessonLabel(cell.inst, data);
-    const subgroup = Number(cell.inst.subgroup || 0) > 0 ? `\nПодгруппа ${cell.inst.subgroup}` : "";
-    const title = `${subj}, ${type}${subgroup}`;
-    const teacher = byId(data.teachers, cell.subOverride?.teacherId || cell.inst.teacherId)?.name || "";
-    const groups = instanceGroupNames(data, cell.inst).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
-    const room = cell.inst.format === "remote"
-      ? "С использованием информационно-коммуникационных технологий"
-      : (assignmentRoomLabel(data, cell.a) || "");
-    // v1708: время берём по фактической группе и дате пары. Это важно для
-    // групп, у которых сетка звонков различается на числителе/знаменателе.
-    // Работает одинаково и в листах групп, и в листах преподавателей/аудиторий.
-    const groupIdForTime = cell.inst.groupId || (kind === "group" ? entityId : "");
-    const time = groupIdForTime
-      ? (periodTimeForGroupDay(data, groupIdForTime, day, period, date || "") || data.config.periodTimes?.[period] || "")
-      : (data.config.periodTimes?.[period] || "");
-    return { day, period, date, time, title, teacher, groups, room };
-  };
-
-  const excelWeekRowsForEntity = (kind, entityId) => {
-    const rows = [];
-    const weekMonday = data.config.semesterStart
-      ? addDays(mondayOf(data.config.semesterStart), (scheduleWeek - 1) * 7)
-      : "";
-    for (const day of activeDayIndices) {
-      const actualDate = weekMonday ? addDays(weekMonday, day) : "";
-      for (let period = 0; period < data.config.periodsPerDay; period++) {
-        const cells = kind === "group"
-          ? groupCellFor(entityId, day, period)
-          : aggregateEntityCellFor(kind, entityId, day, period);
-        for (const cell of cells) {
-          // groupCellFor/aggregateEntityCellFor уже фильтруют выбранную неделю по
-          // weekPattern/customWeeks. Передаём дату ещё и для чётностной сетки звонков.
-          const rec = excelLessonRecord(kind, entityId, cell, day, period, actualDate);
-          if (rec) rows.push(rec);
-        }
-      }
-    }
-    return rows.sort((a,b)=>a.day-b.day || a.period-b.period || a.title.localeCompare(b.title,"ru"));
-  };
-
-  const excelSemesterRowsForEntity = (kind, entityId) => {
-    if (!sched || !data.config.semesterStart) return [];
-    const records = [];
-    const total = totalSemesterWeeks(data.config);
-    for (let week = 1; week <= total; week++) {
-      const wm = addDays(mondayOf(data.config.semesterStart), (week - 1) * 7);
-      for (const day of activeDayIndices) {
-        const date = addDays(wm, day);
-        if (date < data.config.semesterStart || date > data.config.semesterEnd || isNoClassDate(data, date)) continue;
-        for (const inst of sched.instances || []) {
-          const base = sched.assignment?.[inst.instId];
-          if (!base || base.day !== day || !instanceAppliesToDate(data.config, inst, date)) continue;
-          const overlay = overlayForCell(inst, base, date, data.substitutions || []);
-          if (overlay?.subOverride?.cancelled) continue;
-          const teacherId = String(overlay?.subOverride?.teacherId || inst.teacherId || "");
-          const roomIds = assignmentRoomIds(overlay?.a || base).map(String);
-          const match = kind === "group"
-            ? belongsToScheduleGroup(inst, entityId)
-            : kind === "teacher"
-              ? teacherId === String(entityId)
-              : roomIds.includes(String(entityId));
-          if (!match) continue;
-          const rec = excelLessonRecord(kind, entityId, overlay, day, overlay.a.period, date);
-          if (rec) records.push(rec);
-        }
-        // Перенесённые пары живут в дате назначения и не обязательно присутствуют
-        // в обычном индексе дня/пары, поэтому добавляем их отдельно.
-        for (const sub of (data.substitutions || []).filter((x) => x.type === "moved" && x.targetDate === date)) {
-          const cell = movedCellForSubstitution(data, sub);
-          if (!cell) continue;
-          const teacherId = String(cell.subOverride?.teacherId || cell.inst.teacherId || "");
-          const roomIds = assignmentRoomIds(cell.a).map(String);
-          const match = kind === "group"
-            ? belongsToScheduleGroup(cell.inst, entityId)
-            : kind === "teacher"
-              ? teacherId === String(entityId)
-              : roomIds.includes(String(entityId));
-          if (!match) continue;
-          const rec = excelLessonRecord(kind, entityId, cell, day, Number(cell.a.period), date);
-          if (rec) records.push(rec);
-        }
-      }
-    }
-    const grouped = new Map();
-    for (const r of records) {
-      const key = [r.day,r.period,r.time,r.title,r.room,r.teacher,r.groups].join("|");
-      if (!grouped.has(key)) grouped.set(key,{...r,dates:[]});
-      grouped.get(key).dates.push(r.date);
-    }
-    return [...grouped.values()].sort((a,b)=>a.day-b.day || a.period-b.period || a.title.localeCompare(b.title,"ru"));
-  };
-
-  const applySpbuExcelTemplate = (ws, rows, semester, kind) => {
-    const colCount = semester ? 6 : 5;
-    ws["!cols"] = semester
-      ? [{wch:7.14},{wch:21.43},{wch:28.57},{wch:57.14},{wch:42.86},{wch:57.14}]
-      : [{wch:7.14},{wch:21.43},{wch:57.14},{wch:42.86},{wch:57.14}];
-    ws["!rows"] = ws["!rows"] || [];
-    ws["!rows"][0] = { hpt: 22.5 };
-    const merges = ws["!merges"] || [];
-    merges.push({s:{r:0,c:0},e:{r:0,c:colCount-1}});
-    merges.push({s:{r:1,c:0},e:{r:1,c:colCount-1}});
-
-    const titleStyle = { font:{name:"Times New Roman",sz:18,bold:true,color:{rgb:"000000"}}, alignment:{horizontal:"center",vertical:"center"} };
-    const headerStyle = { font:{name:"Times New Roman",sz:11,bold:true}, alignment:{horizontal:"center",vertical:"center",wrapText:true} };
-    const bodyStyle = { font:{name:"Times New Roman",sz:11}, alignment:{horizontal:"center",vertical:"center",wrapText:true} };
-    const dayStyle = { font:{name:"Times New Roman",sz:11}, alignment:{horizontal:"center",vertical:"center",textRotation:90,wrapText:true} };
-    if (ws.A1) ws.A1.s = titleStyle;
-    if (ws.A2) ws.A2.s = headerStyle;
-    for (let c=1;c<colCount;c++) {
-      const addr=XLSX.utils.encode_cell({r:3,c});
-      if (ws[addr]) ws[addr].s=headerStyle;
-    }
-
-    let excelRow = 4; // 0-based; data begins on Excel row 5
-    const dayRanges = [];
-    let activeDay = null, dayStart = null;
-    rows.forEach((row, idx) => {
-      if (activeDay !== row.day) {
-        if (activeDay != null && dayStart != null && excelRow-1 > dayStart) dayRanges.push([dayStart,excelRow-1]);
-        activeDay = row.day;
-        dayStart = excelRow;
-      }
-      for (let c=0;c<colCount;c++) {
-        const addr=XLSX.utils.encode_cell({r:excelRow,c});
-        if (ws[addr]) ws[addr].s = c===0 ? dayStyle : bodyStyle;
-      }
-      const longText = Math.max(String(row.title||"").length, String(row.room||"").length, String(row.groups||"").length);
-      if (longText > 85 || String(row.title||"").includes("\n")) ws["!rows"][excelRow] = {hpt:45};
-      else if (longText > 55) ws["!rows"][excelRow] = {hpt:30};
-      excelRow++;
-    });
-    if (activeDay != null && dayStart != null && excelRow-1 > dayStart) dayRanges.push([dayStart,excelRow-1]);
-    for (const [r1,r2] of dayRanges) merges.push({s:{r:r1,c:0},e:{r:r2,c:0}});
-    ws["!merges"] = merges;
-  };
-
-  // v1708: формат дат с учётом числителя/знаменателя. Если одно и то же
-  // занятие повторяется через неделю, не маскируем это диапазоном "каждую неделю".
-  const excelSemesterDatesCaption = (dates = []) => {
-    const sorted = [...new Set((dates || []).filter(Boolean))].sort();
-    if (!sorted.length) return "";
-    const paritySet = new Set(sorted.map((d) => weekParityForDate(data.config, d)).filter(Boolean));
-    const oneParity = paritySet.size === 1 ? [...paritySet][0] : null;
-    const parityLabel = oneParity === "odd" ? "числитель" : oneParity === "even" ? "знаменатель" : "";
-
-    const chunks = [];
-    let start = sorted[0], prev = sorted[0], step = null, count = 1;
-    const flush = () => {
-      if (count === 1) chunks.push(formatDateDM(start));
-      else if (step === 7) chunks.push(`${formatDateDM(start)}–${formatDateDM(prev)} (${count})`);
-      else if (step === 14) chunks.push(`${formatDateDM(start)}–${formatDateDM(prev)} (через неделю, ${count})`);
-      else chunks.push(`${formatDateDM(start)}–${formatDateDM(prev)} (${count})`);
-    };
-    for (let i=1;i<sorted.length;i++) {
-      const diff = Math.round((new Date(sorted[i]+"T00:00:00") - new Date(prev+"T00:00:00"))/86400000);
-      if ((step == null && (diff === 7 || diff === 14)) || diff === step) {
-        step = step == null ? diff : step;
-        prev = sorted[i]; count++; continue;
-      }
-      flush(); start = prev = sorted[i]; step = null; count = 1;
-    }
-    flush();
-    const base = chunks.join("; ");
-    return parityLabel ? `${base} — ${parityLabel}` : base;
-  };
-
-  const makeSpbuExcelSheet = (kind, entity, semester = false) => {
-    const rows = semester ? excelSemesterRowsForEntity(kind, entity.id) : excelWeekRowsForEntity(kind, entity.id);
-    const headers = excelHeadersForKind(kind, semester);
-    const startDate = semester
-      ? data.config.semesterStart
-      : addDays(mondayOf(data.config.semesterStart), (scheduleWeek - 1) * 7);
-    // В присланном недельном шаблоне период подписан от понедельника до
-    // следующего понедельника, поэтому повторяем формат буквально (+7 дней).
-    const endDate = semester ? data.config.semesterEnd : addDays(startDate, 7);
-    const aoa = [
-      [excelEntityTitle(kind, entity)],
-      [excelPeriodCaption(startDate, endDate)],
-      [],
-      headers,
-    ];
-    for (const row of rows) {
-      const dayDate = semester ? "" : addDays(startDate, row.day);
-      const dayLabel = semester
-        ? DAY_LABELS_FULL[row.day]
-        : `${DAY_LABELS_FULL[row.day].toLowerCase()}\n ${formatRuDate(dayDate)}`;
-      if (kind === "teacher") {
-        aoa.push(semester
-          ? [dayLabel,row.time,excelSemesterDatesCaption(row.dates || []),row.title,row.room,row.groups]
-          : [dayLabel,row.time,row.title,row.room,row.groups]);
-      } else if (kind === "room") {
-        aoa.push(semester
-          ? [dayLabel,row.time,excelSemesterDatesCaption(row.dates || []),row.title,row.groups,row.teacher]
-          : [dayLabel,row.time,row.title,row.groups,row.teacher]);
-      } else {
-        aoa.push(semester
-          ? [dayLabel,row.time,excelSemesterDatesCaption(row.dates || []),row.title,row.room,row.teacher]
-          : [dayLabel,row.time,row.title,row.room,row.teacher]);
-      }
-    }
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    applySpbuExcelTemplate(ws, rows, semester, kind);
-    return ws;
-  };
-
-  const exportScheduleExcel = () => {
+  const exportCSV = () => {
     if (!sched) return;
-    const wb = XLSX.utils.book_new();
-    const semester = weekScope === "all" || viewKind === "semesterAll";
-    const used = new Set();
-    const appendEntity = (kind, entity) => {
-      if (!entity?.id) return;
-      let name = excelSafeSheetName(entity.name || (kind === "room" ? `Аудитория ${entity.id}` : "Расписание"));
-      let base=name, n=2;
-      while (used.has(name)) name=`${base.slice(0,27)} ${n++}`;
-      used.add(name);
-      XLSX.utils.book_append_sheet(wb, makeSpbuExcelSheet(kind, entity, semester), name);
-    };
-
-    if (viewKind === "allTeachers") {
-      [...data.teachers].sort((a,b)=>String(a.name||"").localeCompare(String(b.name||""),"ru")).forEach((x)=>appendEntity("teacher",x));
-    } else if (viewKind === "allRooms") {
-      [...data.rooms].sort((a,b)=>String(a.name||"").localeCompare(String(b.name||""),"ru",{numeric:true})).forEach((x)=>appendEntity("room",x));
-    } else if (viewKind === "allGroups" || viewKind === "semesterAll") {
-      [...data.groups].sort((a,b)=>String(a.name||"").localeCompare(String(b.name||""),"ru",{numeric:true})).forEach((x)=>appendEntity("group",x));
-    } else if (viewKind === "teacher") {
-      appendEntity("teacher",byId(data.teachers,viewId));
-    } else if (viewKind === "room") {
-      appendEntity("room",byId(data.rooms,viewId));
-    } else {
-      appendEntity("group",byId(data.groups,viewId));
+    const rows = [["№", "Время", ...activeDayIndices.map((d) => DAY_LABELS_FULL[d])]];
+    for (let p = 0; p < data.config.periodsPerDay; p++) {
+      const row = [String(p + 1), data.config.periodTimes[p] || ""];
+      for (const day of activeDayIndices) {
+        const cells = cellFor(day, p);
+        if (cells.length === 0) { row.push(""); continue; }
+        const texts = cells.map((cell) => {
+          if (cell.subOverride?.cancelled) return "отменено";
+          const { subj } = lessonLabel(cell.inst, data);
+          const teacher = byId(data.teachers, cell.subOverride?.teacherId || cell.inst.teacherId)?.name || "";
+          const group = instanceGroupNames(data, cell.inst).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
+          const room = assignmentRoomLabel(data, cell.a) || "";
+          const parts = [subj];
+          if (viewKind !== "teacher") parts.push(teacher);
+          if (viewKind !== "group") parts.push(group);
+          if (viewKind !== "room") parts.push(cell.inst.format === "remote" ? "дистанционно" : room);
+          if (cell.inst.weekPattern && cell.inst.weekPattern !== "all") parts.push(weekNumbersLabel(data.config, cell.inst));
+          return parts.join(" / ");
+        });
+        row.push(texts.join("  |  "));
+      }
+      rows.push(row);
     }
-    if (!wb.SheetNames.length) return;
-    const scope = semester ? "ves_semester" : `nedelya_${scheduleWeek}`;
-    XLSX.writeFile(wb, `raspisanie_${currentViewName || "raspisanie"}_${scope}.xlsx`.replace(/[\\/:*?"<>|\s]+/g,"_"), { cellStyles: true });
+    const csv = rows.map((r) => r.map(csvEscape).join(";")).join("\n");
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `raspisanie_${currentViewName || "grid"}.csv`.replace(/\s+/g, "_");
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const exportWord = () => {
@@ -12412,33 +11940,35 @@ th{background:#1E3A5F;color:#ffffff;}
     <div className="section">
       <header className="section-head">
         <h1>Расписание</h1>
-        <p>Ручное редактирование расписания. Функции автоматического расчёта временно скрыты из интерфейса.</p>
+        <p>Автоматический, ручной и комбинированный режим — закреплённые вручную пары алгоритм не трогает при повторной генерации.</p>
       </header>
 
       <div className="schedule-toolbar">
-        {SHOW_AUTO_CALC_CONTROLS && <>
-          <button className="btn primary" onClick={() => onGenerate()} disabled={generating}>
-            {generating ? <Loader2 className="spin" size={16} /> : <Wand2 size={16} />}
-            {generating ? (generationStatus || "Считаю на сервере…") : sched ? "Пересчитать (сохранив закреплённые)" : "Сгенерировать расписание"}
-          </button>
-          {!generating && <button className="btn ghost" onClick={() => onGenerate("", { fastMode: true })} title="Быстрый расчёт: короткие пакеты и минимальная доводка; данные и закреплённые пары сохраняются">⚡ Быстрый расчёт</button>}
-          {generating && <button className="btn ghost" onClick={onCancelGenerate} title="Остановить серверный расчёт; уже готовые пакеты останутся сохранены"><X size={16}/> Остановить расчёт</button>}
-        </>}
+        <button className="btn primary" onClick={() => onGenerate()} disabled={generating}>
+          {generating ? <Loader2 className="spin" size={16} /> : <Wand2 size={16} />}
+          {generating ? (generationStatus || "Считаю на сервере…") : sched ? "Пересчитать (сохранив закреплённые)" : "Сгенерировать расписание"}
+        </button>
+        {!generating && <button className="btn ghost" onClick={() => onGenerate("", { fastMode: true })} title="Быстрый расчёт: короткие пакеты и минимальная доводка; данные и закреплённые пары сохраняются">
+          ⚡ Быстрый расчёт
+        </button>}
+        {generating && <button className="btn ghost" onClick={onCancelGenerate} title="Остановить серверный расчёт; уже готовые пакеты останутся сохранены">
+          <X size={16}/> Остановить расчёт
+        </button>}
 
         {sched && (
           <>
-            {SHOW_AUTO_CALC_CONTROLS && viewKind === "group" && viewId && <button className="btn ghost" onClick={() => onGenerate(viewId)} disabled={generating} title="Пересчитать только выбранную группу, сохранив расписание остальных групп">
+            {viewKind === "group" && viewId && <button className="btn ghost" onClick={() => onGenerate(viewId)} disabled={generating} title="Пересчитать только выбранную группу, сохранив расписание остальных групп">
               <Wand2 size={15}/> Пересчитать группу
             </button>}
-            {SHOW_AUTO_CALC_CONTROLS && viewKind === "group" && viewId && !generating && <button className="btn ghost" onClick={() => onGenerate(viewId, { fastMode: true })} title="Быстро пересчитать только выбранную группу; остальные группы и закреплённые пары не меняются">
+            {viewKind === "group" && viewId && !generating && <button className="btn ghost" onClick={() => onGenerate(viewId, { fastMode: true })} title="Быстро пересчитать только выбранную группу; остальные группы и закреплённые пары не меняются">
               ⚡ Быстро группу
             </button>}
             {viewKind === "group" && viewId && !generating && <button className={"btn ghost" + (isCurrentGroupScheduleFrozen() ? " on" : "")} onClick={toggleCurrentGroupScheduleFreeze} title={isCurrentGroupScheduleFrozen() ? "Разрешить автогенератору снова менять эту группу" : "Зафиксировать все текущие пары группы: общая генерация других групп больше не сможет их передвигать или удалять"}>
               {isCurrentGroupScheduleFrozen() ? "🔒 Группа зафиксирована" : "🔓 Зафиксировать группу"}
             </button>}
             <div className="view-switch">
-              {[{ k: "group", label: "По группам" }, { k: "allGroups", label: "Все группы" }, { k: "semesterAll", label: "Весь семестр" }, { k: "teacher", label: "По преподавателям" }, { k: "allTeachers", label: "Все преподаватели" }, { k: "room", label: "По аудиториям" }, { k: "allRooms", label: "Все аудитории" }].map((o) => (
-                <button key={o.k} className={"pill" + (viewKind === o.k ? " on" : "")} onClick={() => { setViewKind(o.k); if (o.k !== "group" && typeof onRouteGroupChange === "function") onRouteGroupChange(""); if (["allGroups","allTeachers","allRooms"].includes(o.k)) setWeekScope("week"); }}>{o.label}</button>
+              {[{ k: "group", label: "По группам" }, { k: "allGroups", label: "Все группы" }, { k: "semesterAll", label: "Весь семестр" }, { k: "teacher", label: "По преподавателям" }, { k: "room", label: "По аудиториям" }].map((o) => (
+                <button key={o.k} className={"pill" + (viewKind === o.k ? " on" : "")} onClick={() => { setViewKind(o.k); if (o.k !== "group" && typeof onRouteGroupChange === "function") onRouteGroupChange(""); if (o.k === "allGroups") setWeekScope("week"); }}>{o.label}</button>
               ))}
             </div>
             {(viewKind === "group" || viewKind === "allGroups" || viewKind === "semesterAll") && (
@@ -12447,18 +11977,18 @@ th{background:#1E3A5F;color:#ffffff;}
                 {data.specialties.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
               </select>
             )}
-            {!["allGroups","allTeachers","allRooms","semesterAll"].includes(viewKind) && <SearchableSelect value={viewId} onChange={selectScheduleViewId} options={listOptions} placeholder={viewKind === "group" ? "Выберите группу…" : viewKind === "teacher" ? "Выберите преподавателя…" : "Выберите аудиторию…"} />}
+            {viewKind !== "allGroups" && viewKind !== "semesterAll" && <SearchableSelect value={viewId} onChange={selectScheduleViewId} options={listOptions} placeholder={viewKind === "group" ? "Выберите группу…" : viewKind === "teacher" ? "Выберите преподавателя…" : "Выберите аудиторию…"} />}
             {viewKind !== "semesterAll" && totalWeeksInSchedule > 0 && <div className="admin-week-nav">
               <button className="icon-btn" disabled={weekScope !== "week" || scheduleWeek <= 1} onClick={()=>setScheduleWeek((w)=>Math.max(1,w-1))}>«</button>
               <button className={"week-chip " + (weekScope === "week" ? (parityForWeekNumber(data.config,scheduleWeek)==="odd" ? "odd" : "even") : "")} onClick={()=>setWeekScope("week")} title="Показывать одну неделю"><span className="week-chip-num">{scheduleWeek}</span><span className="week-chip-label">{parityForWeekNumber(data.config,scheduleWeek)==="odd" ? "числ." : "знам."}</span></button>
               <button className="icon-btn" disabled={weekScope !== "week" || scheduleWeek >= totalWeeksInSchedule} onClick={()=>setScheduleWeek((w)=>Math.min(totalWeeksInSchedule,w+1))}>»</button>
-              {!["allGroups","allTeachers","allRooms"].includes(viewKind) && <button className={"btn ghost sm" + (weekScope === "all" ? " on" : "")} onClick={()=>setWeekScope("all")}>Все недели</button>}
+              {viewKind !== "allGroups" && <button className={"btn ghost sm" + (weekScope === "all" ? " on" : "")} onClick={()=>setWeekScope("all")}>Все недели</button>}
             </div>}
             {viewKind !== "semesterAll" && <div className="weekly-mode-controls">
               {!weeklyPlanningMode ? <button className="btn ghost" onClick={enterWeeklyPlanningMode}>📅 Перейти в недельный режим</button> : <>
                 <span className="week-mode-badge">Неделя {scheduleWeek}</span>
-                {SHOW_AUTO_CALC_CONTROLS && <button className="btn primary" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate("", { fastMode:true, weekNumber:scheduleWeek })}>⚡ Собрать неделю автоматически</button>}
-                {SHOW_AUTO_CALC_CONTROLS && viewKind === "group" && viewId && <button className="btn ghost" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate(viewId, { fastMode:true, weekNumber:scheduleWeek })}>⚡ Только эту группу</button>}
+                <button className="btn primary" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate("", { fastMode:true, weekNumber:scheduleWeek })}>⚡ Собрать неделю автоматически</button>
+                {viewKind === "group" && viewId && <button className="btn ghost" disabled={generating || selectedWeekIsPastPublished} onClick={()=>onGenerate(viewId, { fastMode:true, weekNumber:scheduleWeek })}>⚡ Только эту группу</button>}
                 <button className="btn ghost" onClick={()=>setWeeklyPlanningMode(false)}>Выйти из недельного режима</button>
               </>}
             </div>}
@@ -12467,9 +11997,9 @@ th{background:#1E3A5F;color:#ffffff;}
               Ручное редактирование
             </label>
             <input type="date" className="date-input" value={subDate} onChange={(e) => setSubDate(e.target.value)} title="Показать замены на дату" />
-            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
+            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportCSV}><Download size={15} /> CSV / Excel</button>}
             {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportWord}><Download size={15} /> Word (.doc)</button>}
-            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
+            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportSemesterAllExcel}><Download size={15} /> Excel (.xlsx)</button>}
             {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportSemesterAllWord}><Download size={15} /> Word (.doc)</button>}
             <button className="btn ghost" onClick={() => window.print()}>Печать / HTML</button>
             <div className="publish-controls">
@@ -12536,7 +12066,7 @@ th{background:#1E3A5F;color:#ffffff;}
       {sched && visibleSemesterTeacherConflictBlocks.length > 0 && (viewKind === "group" || viewKind === "teacher" || viewKind === "allGroups") && (
         <div className="schedule-hard-conflict-banner">
           <strong>⚠ Двойная занятость преподавателя: {visibleSemesterTeacherConflictBlocks.length}{viewKind === "group" ? " · по всем группам" : ""}</strong>
-          <span>{viewKind === "group" ? "Сводка общая для всего расписания и не зависит от выбранной группы. " : ""}Один преподаватель назначен на два разных занятия в одну и ту же неделю, день и пару. Осознанные ручные исключения и параллельные п/г 1 + п/г 2 сюда не попадают.</span>
+          <span>Один преподаватель назначен на два разных занятия в одну и ту же неделю, день и пару. Осознанные ручные исключения и параллельные п/г 1 + п/г 2 сюда не попадают.</span>
           {visibleSemesterTeacherConflictBlocks.slice(0,6).map((c,idx)=>{
             const teacherName=byId(data.teachers,c.teacherId)?.name||"Преподаватель";
             const ga=instanceGroupNames(data,c.a).join(", ")||byId(data.groups,c.a?.groupId)?.name||"группа";
@@ -12777,45 +12307,6 @@ th{background:#1E3A5F;color:#ffffff;}
         </div>
       )}
 
-      {sched && (viewKind === "allTeachers" || viewKind === "allRooms") && list.length > 0 && (
-        <div className="grid-wrap all-groups-wrap">
-          <table className="schedule-grid all-groups-grid">
-            <thead><tr>
-              <th className="group-col">{viewKind === "allTeachers" ? "Преподаватель" : "Аудитория"}</th>
-              <th className="time-col">Пара</th>
-              {activeDayIndices.map((d)=><th key={d}><div>{DAY_LABELS_FULL[d]}</div>{weekScope === "week" && dateForScheduleDay(d) && <div className="schedule-day-date">{formatDateDM(dateForScheduleDay(d))}</div>}</th>)}
-            </tr></thead>
-            <tbody>
-              {list.flatMap((entity) => Array.from({length:data.config.periodsPerDay}).map((_,p)=><tr key={`${entity.id}_${p}`}>
-                {p===0 && <td className="group-col" rowSpan={data.config.periodsPerDay}><div className="all-groups-name">{entity.name}</div>{viewKind === "allRooms" && <div className="all-groups-spec">{entity.capacity ? `${entity.capacity} мест` : ""}</div>}</td>}
-                <td className="time-col"><div className="period-badge">{p+1}</div><div className="period-time">{data.config.periodTimes[p]||""}</div></td>
-                {activeDayIndices.map((day)=>{
-                  const cells=aggregateEntityCellFor(viewKind === "allTeachers" ? "teacher" : "room", entity.id, day, p);
-                  return <td key={day} className={`cell ${cells.length?"filled":"empty"}${cells.length>1?" multi":""}`}>
-                    {cells.map((cell)=>{
-                      const {subj,type}=lessonLabel(cell.inst,data);
-                      const groups=instanceGroupNames(data,cell.inst).join(", ") || byId(data.groups,cell.inst.groupId)?.name || "";
-                      const teacher=byId(data.teachers,cell.subOverride?.teacherId||cell.inst.teacherId)?.name||"";
-                      const room=cell.inst.format==="remote"?"дистанционно":(assignmentRoomLabel(data,cell.a)?`ауд. ${assignmentRoomLabel(data,cell.a)}`:"");
-                      if(cell.subOverride?.cancelled) return <div key={scheduleRenderKey(cell.inst)} className="lesson-chip cancelled-chip"><span>Занятие отменено</span><span className="sub-badge cancel">отмена</span></div>;
-                      return <div key={scheduleRenderKey(cell.inst)} className={`lesson-chip${cell.inst.format==="remote"?" remote-chip":""}${cell.subOverride?.substituted?" substituted":""}`} onClick={()=>manualMode&&setInspecting(cell.inst.instId)}>
-                        <div className="lesson-subject">{subj}{scheduleSubgroupLabel(cell.inst)}</div>
-                        <div className="lesson-meta">
-                          <span>{groups}</span>
-                          {viewKind === "allTeachers" ? <span>{room}</span> : <span>{teacher}</span>}
-                          <span className="lesson-type">{type}</span>
-                        </div>
-                        {cell.subOverride?.substituted&&<span className="sub-badge">замена</span>}
-                      </div>;
-                    })}
-                  </td>;
-                })}
-              </tr>))}
-            </tbody>
-          </table>
-        </div>
-      )}
-
       {sched && viewKind === "semesterAll" && (() => {
         const rows = buildSemesterAllRows();
         const rowsByGroup = new Map();
@@ -12836,7 +12327,7 @@ th{background:#1E3A5F;color:#ffffff;}
         </div>;
       })()}
 
-      {sched && !["allGroups","allTeachers","allRooms","semesterAll"].includes(viewKind) && !viewId && (
+      {sched && viewKind !== "allGroups" && viewKind !== "semesterAll" && !viewId && (
         <div className="empty-row">Выберите {viewKind === "group" ? "группу" : viewKind === "teacher" ? "преподавателя" : "аудиторию"}, чтобы открыть расписание и сводку.</div>
       )}
 
@@ -14024,9 +13515,9 @@ function VersionsPanel({data,onRestore,currentUser}){
     finally{setBackupDownloadBusy("");}
   };
   return <div className="section"><header className="section-head"><h1>Версии расписания</h1><p>Каждая публикация создаёт точку восстановления. Восстановление возвращает рабочий черновик к выбранной версии; публичная версия не меняется, пока вы снова не нажмёте «Опубликовать».</p></header>
-    <div className="card" style={{padding:16,marginBottom:18}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><div><b>Серверные резервные копии</b><div className="muted" style={{marginTop:4}}>Скачивание идёт напрямую из <code>/data/backups</code> рабочего контейнера и не использует загрузчик файлов Amvera.</div></div><button className="btn ghost sm" onClick={refreshBackups}>Обновить список</button></div>
+    <div className="card" style={{padding:16,marginBottom:18}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><div><b>Серверные резервные копии</b><div className="muted" style={{marginTop:4}}>При PostgreSQL резервные копии хранятся в самой базе данных; в файловом fallback-режиме — в <code>/data/backups</code>.</div></div><button className="btn ghost sm" onClick={refreshBackups}>Обновить список</button></div>
       {backupLoadError&&<div className="notice danger" style={{marginTop:10}}>{backupLoadError}</div>}
-      <div style={{display:"grid",gap:6,marginTop:12,maxHeight:360,overflow:"auto"}}>{serverBackups.map((b)=><div key={b.name} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"8px 10px",border:"1px solid #e5e7eb",borderRadius:8}}><span><b>{b.name}</b>{b.size?` · ${Math.round(b.size/1024)} КБ`:""}{b.valid===false?<span style={{marginLeft:8,color:"#b91c1c"}}>повреждён</span>:""}</span><button className="btn ghost sm" disabled={backupDownloadBusy===b.name||b.valid===false} onClick={()=>downloadBackup(b.name)}>{backupDownloadBusy===b.name?"Скачивание…":"Скачать backup"}</button></div>)}{!serverBackups.length&&!backupLoadError&&<div className="muted">Резервных копий не найдено.</div>}</div>
+      <div style={{display:"grid",gap:6,marginTop:12,maxHeight:360,overflow:"auto"}}>{serverBackups.map((b)=><div key={b.name} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"8px 10px",border:"1px solid #e5e7eb",borderRadius:8}}><span><b>{b.name}</b>{b.size?` · ${Math.round(b.size/1024)} КБ`:""}{b.valid===false?<span style={{marginLeft:8,color:"#b91c1c"}}>повреждён</span>:""}</span><button className="btn ghost sm" disabled={backupDownloadBusy===b.name||b.valid===false} onClick={()=>downloadBackup(b.name)}>{backupDownloadBusy===b.name?"Скачивание…":"Скачать JSON"}</button></div>)}{!serverBackups.length&&!backupLoadError&&<div className="muted">Резервных копий не найдено.</div>}</div>
     </div>
     <div className="table-wrap"><table><thead><tr><th>Дата</th><th>Автор</th><th>Размещено</th><th>Комментарий</th><th></th></tr></thead><tbody>{rows.map((v)=><tr key={v.id}><td>{new Date(v.at).toLocaleString("ru-RU")}</td><td>{v.by||"—"}</td><td>{v.placed??v.snapshot?.schedule?.stats?.placed??"—"}</td><td>{v.note||"Публикация"}</td><td><button className="btn ghost sm" onClick={()=>onRestore(v)}>Восстановить эту версию</button></td></tr>)}{!rows.length&&<tr><td colSpan={5} className="empty-row">Версии появятся после первой публикации</td></tr>}</tbody></table></div></div>;
 }
@@ -14548,12 +14039,6 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
   const publicationStatusLabel = publicationStatus === "published"
     ? "Расписание опубликовано"
     : (publicationStatus === "changed" ? "В расписание внесены изменения" : "Расписание не опубликовано");
-  const forcePublicRefresh = () => {
-    if (typeof window === "undefined") return;
-    const url = new URL(window.location.href);
-    url.searchParams.set("refresh", String(Date.now()));
-    window.location.replace(url.toString());
-  };
 
   useEffect(() => {
     if (list.length === 0) return;
@@ -14917,12 +14402,9 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
           ) : COLLEGE_NAME}
         </div>
         <h1>{kind === "group" ? "Расписание занятий" : "Расписание преподавателя"}</h1>
-        <div className="public-status-row">
-          <div className={`public-publication-status ${publicationStatus}`} title={data.publishedAt ? `Последняя публикация: ${new Date(data.publishedAt).toLocaleString("ru-RU")}` : "Публикаций ещё не было"}>
-            <span className="public-publication-dot" aria-hidden="true"></span>
-            <span>{publicationStatusLabel}</span>
-          </div>
-          <button type="button" className="public-refresh-btn" onClick={forcePublicRefresh} title="Загрузить последнюю опубликованную версию без кэша">↻ Обновить расписание</button>
+        <div className={`public-publication-status ${publicationStatus}`} title={data.publishedAt ? `Последняя публикация: ${new Date(data.publishedAt).toLocaleString("ru-RU")}` : "Публикаций ещё не было"}>
+          <span className="public-publication-dot" aria-hidden="true"></span>
+          <span>{publicationStatusLabel}</span>
         </div>
       </div>
 
@@ -17168,11 +16650,6 @@ export default function App() {
         publishedBy: by,
         historyEntry,
         lockedAdd,
-        publishChange: {
-          scope,
-          groupIds: groupId ? [groupId] : [],
-          weekNumbers: scope === "week" ? [requestedWeek] : (scope === "weeks" ? requestedWeeks : []),
-        },
       }, {
         userId: currentUser?.id || "",
         by,
@@ -18586,22 +18063,23 @@ input[type="text"], select { width: 100%; }
 /* v1503: denser semester public view */
 .semester-public-view{margin-top:8px;min-width:0}
 .semester-public-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:0 0 8px;color:#667085;font-size:11px}
-.semester-public-days{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:12px;align-items:start}
+.semester-public-days{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;align-items:start}
 .semester-public-day-card{border:1px solid var(--line);border-radius:8px;background:#fff;overflow:hidden;min-width:0}
-.semester-public-day-head{background:#ebe8df;padding:7px 10px;font-size:14px;font-weight:700;color:#26313d;position:sticky;top:0;z-index:3}
+.semester-public-day-head{background:#ebe8df;padding:7px 10px;font-size:14px;font-weight:700;color:#26313d;position:sticky;top:0;z-index:1}
 .semester-public-day-body{display:flex;flex-direction:column}
-.semester-public-item{display:grid;grid-template-columns:88px minmax(180px,1fr) minmax(128px,168px);gap:10px;padding:8px 10px;border-top:1px solid #ece8de;align-items:start;min-width:0}
+.semester-public-item{display:grid;grid-template-columns:88px minmax(0,1fr) minmax(118px,156px);gap:8px;padding:7px 9px;border-top:1px solid #ece8de;align-items:start;min-width:0}
 .semester-public-item.remote-event{background:#E8F7F0;box-shadow:inset 4px 0 0 #4E9D7C}.semester-public-item.remote-event .semester-public-item-title{color:#245C49}.semester-public-item.remote-event .semester-public-item-dates{background:#F4FBF8;border-color:#CFE8DD}
 .semester-public-item:first-child{border-top:0}
 .semester-public-item-time{display:flex;flex-direction:column;gap:1px;color:#354052;font-size:10.5px;line-height:1.2;white-space:nowrap}
 .semester-public-period{font-size:8px;text-transform:uppercase;letter-spacing:.02em;color:#8a94a3}
-.semester-public-item-title{font-size:13px;font-weight:700;line-height:1.24;color:#202938;overflow-wrap:break-word;word-break:normal;hyphens:auto}
+.semester-public-item-title{font-size:13px;font-weight:700;line-height:1.18;color:#202938;overflow-wrap:anywhere}
 .semester-public-item-meta{display:flex;flex-direction:column;gap:1px;margin-top:3px;color:#667085;font-size:10px;line-height:1.2}
-.semester-public-item-meta span{overflow-wrap:break-word;word-break:normal}
+.semester-public-item-meta span{overflow-wrap:anywhere}
 .semester-public-item-dates{background:#f7f8fa;border:1px solid #eceef2;border-radius:6px;padding:5px 6px;display:flex;flex-direction:column;gap:1px;font-size:9px;line-height:1.18;min-width:0}
 .semester-public-dates-label{font-size:7.5px;text-transform:uppercase;letter-spacing:.04em;color:#98a2b3}
-.semester-public-item-dates b{font-size:9px;line-height:1.2;color:#354052;overflow-wrap:break-word;word-break:normal}
+.semester-public-item-dates b{font-size:9px;line-height:1.18;color:#354052;overflow-wrap:anywhere}
 .semester-public-item-dates small{font-size:8px;color:#98a2b3}
+@media(min-width:1500px){.semester-public-days{grid-template-columns:repeat(3,minmax(0,1fr))}.semester-public-item{grid-template-columns:82px minmax(0,1fr) minmax(110px,140px)}}
 @media(max-width:980px){.semester-public-days{grid-template-columns:1fr}.semester-public-item{grid-template-columns:88px minmax(0,1fr) minmax(120px,160px)}}
 @media(max-width:620px){.semester-public-item{grid-template-columns:1fr;gap:5px;padding:7px 8px}.semester-public-item-time{flex-direction:row;align-items:baseline;gap:6px}.semester-public-item-dates{width:auto}.semester-public-day-head{position:static}}
 .public-days { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; align-items:start; }
@@ -18701,9 +18179,6 @@ input[type="text"], select { width: 100%; }
 .practice-filters{padding:10px 12px;border:1px solid #E5E7EB;border-radius:12px;background:#FAFBFC}.practice-filter-grid{display:grid;grid-template-columns:minmax(180px,1fr) minmax(170px,.8fr) minmax(210px,1fr) minmax(260px,1.4fr) auto;gap:8px;align-items:center}@media(max-width:1050px){.practice-filter-grid{grid-template-columns:1fr 1fr}}@media(max-width:650px){.practice-filter-grid{grid-template-columns:1fr}}
 .practice-week-cell{position:relative;background:#FDECEC!important;box-shadow:inset 0 0 0 1px #F0B7B7}.practice-week-cell .graphs-input{opacity:.45;cursor:not-allowed}.practice-week-partial-cell{position:relative;background:#FFF7D6!important;box-shadow:inset 0 0 0 1px #E8D28B}.practice-week-partial-cell .graphs-input{background:#FFFDF3}.practice-week-mark{font-size:9px;font-weight:800;color:#8A5A00;line-height:1;margin-bottom:2px}.practice-week-cell .practice-week-mark{color:#A33}.graphs-week-partial-practice-head{background:#FFF3BF!important}.graphs-week-full-practice-head{background:#FDECEC!important}.graphs-partial-practice-label{display:block;margin-top:2px;color:#8A5A00;font-weight:800;font-size:9px}.graphs-week-partial-practice-total{background:#FFF8DB!important}.graph-row-actions{min-width:255px;white-space:nowrap}.graph-row-actions .btn{margin:2px}.btn.xs{padding:5px 7px;font-size:11px}
 .schedule-grid{width:100%;table-layout:fixed}.schedule-grid .time-col{width:105px}.schedule-grid th:not(.time-col),.schedule-grid td.cell{min-width:120px}
-/* v1709: keep weekday/date row visible while the timetable itself scrolls. */
-.schedule-grid:not(.graphs-table) thead th{position:sticky;top:0;z-index:30;box-shadow:0 2px 0 rgba(0,0,0,.10),0 5px 10px rgba(0,0,0,.06);background-clip:padding-box}
-.schedule-grid:not(.graphs-table) thead .time-col,.schedule-grid:not(.graphs-table) thead .group-col{z-index:31}
 .semester-public-table{width:100%;table-layout:auto}.semester-table-wrap,.grid-wrap{max-width:100%;overflow-x:auto}
 @media(max-width:1100px){.schedule-grid{min-width:860px}.schedule-grid .lesson-chip{padding:6px}.lesson-meta{font-size:10.5px}.graphs-table{min-width:max-content}.all-groups-grid{min-width:1050px}}
 @media(max-width:720px){.section{padding-left:12px!important;padding-right:12px!important}.schedule-grid{min-width:760px}.schedule-grid th:not(.time-col),.schedule-grid td.cell{min-width:105px}.period-time{font-size:9px}.lesson-subject{font-size:11px}.schedule-toolbar,.lists-toolbar{flex-wrap:wrap}.semester-public-table{min-width:820px}}
