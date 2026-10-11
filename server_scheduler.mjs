@@ -221,6 +221,10 @@ function instanceAppliesToDate(config, inst, dateStr) {
     const n = weekNumberOf(config.semesterStart, dateStr);
     return n !== null && (inst.customWeeks || []).includes(n);
   }
+  if (pattern === "perWeek") {
+    const n = weekNumberOf(config.semesterStart, dateStr);
+    return n !== null && Number((inst.weeklyPairs || {})[n] || 0) > 0;
+  }
   const parity = weekParityForDate(config, dateStr);
   return !parity || pattern === parity;
 }
@@ -234,7 +238,11 @@ function weekNumbersForInstance(config, inst) {
   const total = totalSemesterWeeks(config);
   if (!total) return [];
   const pattern = inst?.weekPattern || "all";
-  if (pattern === "custom") return (inst.customWeeks || []).filter((n) => n >= 1 && n <= total).slice().sort((a,b)=>a-b);
+  if (pattern === "custom") return (inst.customWeeks || []).map(Number).filter((n) => n >= 1 && n <= total).slice().sort((a,b)=>a-b);
+  if (pattern === "perWeek") {
+    const wp = inst?.weeklyPairs || {};
+    return Object.keys(wp).map(Number).filter((n) => n >= 1 && n <= total && Number(wp[n] || wp[String(n)] || 0) > 0).sort((a,b)=>a-b);
+  }
   if (pattern === "all") return Array.from({ length: total }, (_, i) => i + 1);
   return Array.from({ length: total }, (_, i) => i + 1).filter((n) => parityForWeekNumber(config, n) === pattern);
 }
@@ -428,6 +436,27 @@ function normalizeStoredData(raw) {
     const remoteIds = normalizedLoadsBase.filter((row) => row.id !== load.id && wantedGroups.has(row.groupId) && row.subjectId === load.subjectId && row.teacherId === load.teacherId && row.typeId === load.typeId).map((row) => row.id);
     return remoteIds.length ? { ...load, remoteSubgroupLoadIds: remoteIds, streamGroupIds: [], streamId: "" } : load;
   });
+  // v1722: ДО-связка относится к КОНКРЕТНОМУ виду занятия. Старые версии
+  // разрешали связать, например, лекцию и практику одной дисциплины, из-за чего
+  // практика начинала отображаться/генерироваться как ДО-поток, хотя ДО было
+  // настроено только на лекционной строке. При нормализации удаляем такие
+  // устаревшие cross-type ссылки и любые ДО-ссылки у чисто очной строки.
+  const normalizedLoadByIdForRemote = new Map(normalizedLoadsBase.map((row) => [String(row?.id || ""), row]));
+  normalizedLoadsBase = normalizedLoadsBase.map((load) => {
+    const delivery = load.format || "inperson";
+    const hasRemotePart = delivery === "remote" || (delivery === "auto" && !!load.canBeRemote && ((Number(load.remotePercent) || 0) > 0 || (Number(load.mandatoryRemoteAssemblies) || 0) > 0));
+    if (!hasRemotePart) return (load.remoteSubgroupLoadIds || []).length ? { ...load, remoteSubgroupLoadIds: [] } : load;
+    const refs = [...new Set((load.remoteSubgroupLoadIds || []).map(String).filter(Boolean))].filter((id) => {
+      const other = normalizedLoadByIdForRemote.get(id);
+      const otherDelivery = other?.format || "inperson";
+      const otherHasRemotePart = otherDelivery === "remote" || (otherDelivery === "auto" && !!other?.canBeRemote && ((Number(other?.remotePercent) || 0) > 0 || (Number(other?.mandatoryRemoteAssemblies) || 0) > 0));
+      return !!other && otherHasRemotePart && String(other.id) !== String(load.id) &&
+        String(other.subjectId || "") === String(load.subjectId || "") &&
+        String(other.teacherId || "") === String(load.teacherId || "") &&
+        String(other.typeId || "") === String(load.typeId || "");
+    });
+    return refs.length === (load.remoteSubgroupLoadIds || []).length ? load : { ...load, remoteSubgroupLoadIds: refs };
+  });
   let recoveredGraphRows = 0;
   const normalizedLoads = normalizedLoadsBase.map((load) => {
     const persisted = persistedGraphState[String(load.id)] || persistedGraphState[`sig:${graphPersistenceSignature(load)}`];
@@ -505,15 +534,14 @@ function normalizeStoredData(raw) {
     publishedBy: data.publishedBy || "",
   };
 
-  // v1550: графики и расписание обязаны сходиться уже при загрузке данных.
-  // Раньше после сохранения/перезагрузки мог остаться старый schedule.instances:
-  // график уже показывал новые недели (например, чётные), а «Не размещено» —
-  // старые нечётные недели и не содержал позднее добавленные практические строки.
-  // Перестраиваем ТОЛЬКО структуру instances/unplaced из актуального weeklyPairs.
-  // Существующие assignment сохраняются syncScheduleInstancesToGraph без переноса.
-  if (normalized.schedule && Array.isArray(normalized.schedule.instances)) {
-    normalized.schedule = syncScheduleInstancesToGraph(normalized, normalized.loads);
-  }
+  // v1850: НИКОГДА не перестраиваем расписание из графиков при обычной
+  // нормализации/загрузке проекта. Сохранённая сетка является самостоятельным
+  // источником истины: reload, autosave другого раздела, restart сервера или
+  // исправление weeklyPairs не должны менять instances/assignment/unplaced.
+  //
+  // Если в графике есть требование, которого нет в расписании, администратор
+  // добавляет его явно через «Восстановить пропавшие по графику». Это действие
+  // добавляет недостающее в «Неразмещённые», не двигая уже поставленные пары.
   return normalized;
 }
 function weeksOverlap(instA, instB, config = null) {
@@ -664,18 +692,33 @@ function linkedRemoteLoadRows(data, load) {
   if (!load?.id) return [];
   const index = remoteLinkIndex(data);
   if (index.clusters.has(load.id)) return index.clusters.get(load.id);
+  const remoteCapable = (row) => {
+    const delivery = row?.format || "inperson";
+    return delivery === "remote" || (delivery === "auto" && !!row?.canBeRemote && ((Number(row?.remotePercent) || 0) > 0 || (Number(row?.mandatoryRemoteAssemblies) || 0) > 0));
+  };
+  const compatible = (row) => !!row && remoteCapable(row) &&
+    String(row.subjectId || "") === String(load.subjectId || "") &&
+    String(row.teacherId || "") === String(load.teacherId || "") &&
+    String(row.typeId || "") === String(load.typeId || "");
   const seen = new Set();
   const queue = [load.id];
   while (queue.length) {
     const id = queue.shift();
     if (!id || seen.has(id)) continue;
-    seen.add(id);
     const row = index.byLoadId.get(id);
-    if (row) for (const ref of (row.remoteSubgroupLoadIds || [])) if (!seen.has(ref)) queue.push(ref);
-    for (const sourceId of (index.reverse.get(id) || [])) if (!seen.has(sourceId)) queue.push(sourceId);
+    if (!compatible(row)) continue;
+    seen.add(id);
+    for (const ref of (row.remoteSubgroupLoadIds || [])) {
+      const target = index.byLoadId.get(ref);
+      if (compatible(target) && !seen.has(ref)) queue.push(ref);
+    }
+    for (const sourceId of (index.reverse.get(id) || [])) {
+      const source = index.byLoadId.get(sourceId);
+      if (compatible(source) && !seen.has(sourceId)) queue.push(sourceId);
+    }
   }
-  const rows = [...seen].map((id) => index.byLoadId.get(id)).filter(Boolean);
-  // Компоненты одной связной ДО-связки всегда имеют один и тот же кластер.
+  const rows = [...seen].map((id) => index.byLoadId.get(id)).filter(compatible);
+  // v1722: один кластер ДО = одна дисциплина + преподаватель + вид занятия.
   for (const row of rows) if (row?.id) index.clusters.set(row.id, rows);
   return rows;
 }
@@ -688,21 +731,33 @@ function linkedInPersonLoadRows(data, load) {
 }
 function enrichInstanceStreamGroups(data, inst) {
   if (!inst) return inst;
-  const load = (data?.loads || []).find((l) => l.id === inst.loadId);
+  const load = (data?.loads || []).find((l) => String(l.id) === String(inst.loadId));
   if (!load) return inst;
+  // v1810: loadId -> Нагрузка является источником истины для подгруппы.
+  // После ручной смены п/г старые schedule.instance могли продолжать хранить
+  // прежнее значение и давать ложный конфликт п/г1 с п/г2.
+  const authoritativeSubgroup = Number(load.subgroup) || 0;
+  const baseInst = Number(inst.subgroup || 0) === authoritativeSubgroup
+    ? inst
+    : { ...inst, subgroup: authoritativeSubgroup };
   // v1529: очная и ДО-связки — разные контуры. Для конкретного occurrence
   // добавляем только тот состав, который относится к его фактическому формату.
-  const rows = inst.format === "remote" ? linkedRemoteLoadRows(data, load) : linkedInPersonLoadRows(data, load);
-  const ids = new Set([inst.groupId, ...(inst.groupIds || []), ...(inst.streamGroupIds || []), load.groupId].filter(Boolean));
-  const participants = [...(Array.isArray(inst.streamParticipants) ? inst.streamParticipants : [])];
+  const rows = baseInst.format === "remote" ? linkedRemoteLoadRows(data, load) : linkedInPersonLoadRows(data, load);
+  const ids = new Set([baseInst.groupId, ...(baseInst.groupIds || []), ...(baseInst.streamGroupIds || []), load.groupId].filter(Boolean));
+  const participants = [...(Array.isArray(baseInst.streamParticipants) ? baseInst.streamParticipants : [])].map((part) => {
+    if (!part?.loadId) return part;
+    const partLoad = (data?.loads || []).find((l) => String(l.id) === String(part.loadId));
+    if (!partLoad || String(partLoad.groupId || "") !== String(part.groupId || "")) return part;
+    return { ...part, subgroup: Number(partLoad.subgroup) || 0 };
+  });
   for (const row of rows) {
     if (row?.groupId) ids.add(row.groupId);
     if (row?.groupId && row.id !== load.id && !participants.some((p) => p.loadId === row.id || (p.groupId === row.groupId && Number(p.subgroup || 0) === Number(row.subgroup || 0)))) {
       participants.push({ groupId: row.groupId, subgroup: Number(row.subgroup) || 0, loadId: row.id });
     }
   }
-  const primary = inst.groupId || load.groupId;
-  return { ...inst, streamGroupIds: [...ids].filter((gid) => gid !== primary), streamParticipants: participants.filter((p) => p.groupId !== primary || Number(p.subgroup || 0) !== Number(inst.subgroup || 0)) };
+  const primary = baseInst.groupId || load.groupId;
+  return { ...baseInst, streamGroupIds: [...ids].filter((gid) => gid !== primary), streamParticipants: participants.filter((p) => p.groupId !== primary || Number(p.subgroup || 0) !== Number(baseInst.subgroup || 0)) };
 }
 function instanceGroupNames(data, inst) {
   const enriched = enrichInstanceStreamGroups(data, inst);
@@ -993,8 +1048,8 @@ function belongsToGroup(inst, groupId) {
 }
 
 // v1619: один преподаватель может одновременно вести две разные подгруппы
-// ОДНОЙ группы как одно фактически объединённое занятие. Разрешаем это только
-// для одинаковых дисциплины, вида занятия и формата; потоки/разные группы не
+// ОДНОЙ группы как одно фактически объединённое занятие — и ОЧНО, и ДО.
+// Разрешаем это только для одинаковых дисциплины, вида занятия и формата; потоки/разные группы не
 // попадают под исключение. Это защищает от случайного разрешения преподавателю
 // вести два разных предмета одновременно.
 function sameTeacherSiblingSubgroupsCompatible(a, b) {
@@ -1049,12 +1104,15 @@ function roomIdsEquivalent(rooms, a, b) {
   return !!na && na === nb;
 }
 
-function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null) {
+function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null, allowMixedDayFormat = false) {
   const inst = instances.find((i) => i.instId === instId);
   if (!inst) return { ok: false, reason: "Занятие не найдено" };
 
   const overlaps = (other) => !!other && weeksOverlap(other, inst, config);
-  const sameParticipantGroup = (other) => streamGroups(inst).some((gid) => belongsToGroup(other, gid) && participantSubgroupsOverlap(other, inst, gid));
+  const sameParticipantGroup = (other) => streamGroups(inst).some((gid) =>
+    belongsToGroup(other, gid) && (dataContext
+      ? normalizedParticipantSubgroupsOverlap(dataContext, other, inst, gid)
+      : participantSubgroupsOverlap(other, inst, gid)));
   const siblingTeacherPartnersAt = (half) => Object.entries(assignment || {}).filter(([otherId, a]) => {
     if (otherId === instId || !a || Number(a.day) !== Number(day) || Number(a.period) !== Number(period)) return false;
     const other = instances.find((i) => i.instId === otherId);
@@ -1096,23 +1154,23 @@ function canPlace(assignment, instances, rooms, instId, day, period, roomId, ext
     let reason = "";
     const teacherPartners = siblingTeacherPartnersAt(half);
     const allowedSiblingTeacherId = teacherPartners.length === 1 && sameTeacherSiblingSubgroupsCompatible(inst, instances.find((i) => i.instId === teacherPartners[0][0])) ? teacherPartners[0][0] : null;
-    if (allowedSiblingTeacherId && inst.format !== "remote") {
-      const partnerAssignment = assignment?.[allowedSiblingTeacherId];
-      if (partnerAssignment?.roomId && roomId && !roomIdsEquivalent(rooms, partnerAssignment.roomId, roomId)) {
-        reason = "Две подгруппы одной группы у одного преподавателя должны находиться в одной аудитории";
-      }
-    }
+    // v1631: sibling subgroups of one group with one teacher may use
+    // the same OR different rooms simultaneously.
     if (reason) { firstReason = reason; continue; }
     for (const [otherId, a] of Object.entries(assignment || {})) {
       if (otherId === instId || !a) continue;
       const other = instances.find((i) => i.instId === otherId);
       if (!other || !overlaps(other)) continue;
 
-      // v1717: формат дня — абсолютный hard constraint и для автоматики, и
-      // для ручного режима. Проверяется только на пересекающихся неделях.
-      if (a.day === day && other.format !== inst.format) {
-        if (sameParticipantGroup(other)) { reason = `Смешение ДО и очного формата в один день запрещено: у группы уже есть ${other.format === "remote" ? "ДО" : "очное"} занятие на пересекающихся неделях`; break; }
-        if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId) { reason = `Смешение ДО и очного формата в один день запрещено: у преподавателя уже есть ${other.format === "remote" ? "ДО" : "очное"} занятие на пересекающихся неделях`; break; }
+      // Формат дня должен совпадать только на реально пересекающихся неделях.
+      // v1613: `allowMixedDayFormat` is a manual-only override (never set by
+      // auto-scheduling, which still enforces "one format per day" strictly
+      // via dayFormatOk/slotFreeForOwners in generateSchedule) — lets a
+      // person deliberately place an in-person lesson on an otherwise-ДО day
+      // for that group/teacher, or vice versa.
+      if (!allowMixedDayFormat && a.day === day && other.format !== inst.format) {
+        if (sameParticipantGroup(other)) { reason = `В этот день у группы уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
+        if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId) { reason = `В этот день у преподавателя уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
       }
       if (a.day !== day || a.period !== period) continue;
 
@@ -1187,7 +1245,7 @@ function generateSchedule(data, prior, perfScope = null) {
     // для нескольких направлений. Флаг canBeRemote у ПРИСОЕДИНЯЕМОЙ строки
     // не является ограничением: явное ручное ДО-совмещение составителя имеет приоритет
     // и переводит именно общие выбранные слои этой нагрузки в ДО.
-    return !!ag && !!og && other.subjectId === anchor.subjectId && other.teacherId === anchor.teacherId;
+    return !!ag && !!og && other.subjectId === anchor.subjectId && other.teacherId === anchor.teacherId && other.typeId === anchor.typeId;
   };
 
   // v1587: единая каноническая схема форматов для комбинированной нагрузки.
@@ -1232,63 +1290,138 @@ function generateSchedule(data, prior, perfScope = null) {
     const [, layerRaw] = String(key).split(":");
     return layerRaw === "H" ? 999 : (Number(layerRaw) || 0);
   };
+  // v1723: общий лекционный поток не имеет права создавать пары сверх часов
+  // учебного плана. Исторические цифры в строках участников можно объединять
+  // как один общий график, но итоговое число слоёв потока жёстко ограничено
+  // остатком часов каждого участника.
+  const curriculumPairLimitForLoad = (load) => {
+    const group = groupById[load?.groupId];
+    if (!group?.specialtyId) return null;
+    const rows = (data.curriculumPlan || []).filter((p) =>
+      p.specialtyId === group.specialtyId &&
+      (p.educationBase || "9") === (group.educationBase || "9") &&
+      Number(p.semesterNumber || 1) === Number(group.curriculumSemester || 1) &&
+      p.subjectId === load.subjectId &&
+      (!p.lessonTypeId || p.lessonTypeId === load.typeId)
+    );
+    if (!rows.length) return null;
+    return Math.max(0, rows.reduce((sum,p)=>sum+(Number(p.totalHours)||0),0) / 2);
+  };
+  const occurrenceKeyUnits = (key) => String(key).endsWith(":H") ? 0.5 : 1;
+  const graphPairUnitsForLoad = (load) => occurrenceKeysForLoad(load).reduce((sum,key)=>sum+occurrenceKeyUnits(key),0);
+  // v1724: часы у участников лекционного потока могут различаться. Поэтому
+  // лимит считается для КАЖДОЙ строки/группы отдельно, а не общим минимумом
+  // потока. Общий поток берёт только пересекающийся объём; лишние слои остаются
+  // у тех групп, которым они действительно положены по учебному плану.
+  const lectureStreamPairLimitForLoad = (load, bucket=[]) => {
+    const plan = curriculumPairLimitForLoad(load);
+    if (plan == null) return null;
+    const bucketIds = new Set((bucket || []).map((l)=>String(l.id||"")));
+    const other = (loads || []).filter((row)=>
+      row && !bucketIds.has(String(row.id||"")) &&
+      String(row.groupId||"")===String(load.groupId||"") &&
+      row.subjectId===load.subjectId && row.typeId===load.typeId &&
+      Number(row.subgroup||0)===Number(load.subgroup||0)
+    ).reduce((sum,row)=>sum+graphPairUnitsForLoad(row),0);
+    return Math.max(0, plan-other);
+  };
+  const capOccurrenceKeysToPairs = (keys, cap) => {
+    if (cap == null) return [...keys];
+    const out=[]; let used=0;
+    for (const key of keys) {
+      const units=occurrenceKeyUnits(key);
+      if (used+units > cap+1e-9) continue;
+      out.push(key); used+=units;
+    }
+    return out;
+  };
+  const lectureStreamMembership = (bucket) => {
+    const ordered = [...new Set((bucket||[]).flatMap(occurrenceKeysForLoad))].sort((a,b)=>{
+      const aw=Number(String(a).split(":")[0])||0, bw=Number(String(b).split(":")[0])||0;
+      return aw-bw || occurrenceLayerOrder(a)-occurrenceLayerOrder(b);
+    });
+    const result = new Map();
+    for (const load of bucket || []) {
+      const cap = lectureStreamPairLimitForLoad(load, bucket);
+      const explicit = new Set(capOccurrenceKeysToPairs(occurrenceKeysForLoad(load), cap));
+      let used = [...explicit].reduce((sum,key)=>sum+occurrenceKeyUnits(key),0);
+      const effectiveCap = cap == null ? used : cap;
+      // Старые несинхронные строки потока: если одна группа содержала общий слой,
+      // а у другой ячейка была пустой, достраиваем общий слой до ЕЁ собственного
+      // лимита. При меньшем числе часов группа просто перестаёт участвовать дальше.
+      for (const key of ordered) {
+        if (explicit.has(key)) continue;
+        const units=occurrenceKeyUnits(key);
+        if (used+units > effectiveCap+1e-9) continue;
+        explicit.add(key); used+=units;
+      }
+      result.set(String(load.id||""), explicit);
+    }
+    return result;
+  };
   const selectCombinedRemoteKeys = (rawKeys, remotePercent, preferRemoteFirst = false) => {
     const commonKeys = [...new Set(rawKeys)].sort((a,b)=>{
       const aw=Number(String(a).split(":")[0])||0, bw=Number(String(b).split(":")[0])||0;
       return aw-bw || occurrenceLayerOrder(a)-occurrenceLayerOrder(b);
     });
-    // v1589: в комбинированном режиме ДО жёстко ограничено 50%.
-    // Используем floor, чтобы на нечётном числе слоёв никогда не превысить 50%.
-    const pct = 50;
     if (!commonKeys.length) return new Set();
+
+    // v1708: «Можно ДО» больше не имеет жёсткого ритма вида
+    // очно/ДО/очно/ДО или «первая пара недели всегда очно».
+    // Формат пересчитывается заново из текущего weeklyPairs. Сохраняем только
+    // мягкое ограничение по доле ДО (для авто режима максимум 50%) и стараемся
+    // равномерно распределить ДО по всему фактическому графику.
+    const pct = Math.max(0, Math.min(50, Number(remotePercent) || 50));
     const requested = Math.max(0, Math.min(commonKeys.length, Math.floor((commonKeys.length * pct + 1e-9) / 100)));
+    if (requested <= 0) return new Set();
+
     const byWeek = new Map();
     for (const key of commonKeys) {
-      const week = Number(String(key).split(":")[0]);
+      const week = Number(String(key).split(":")[0]) || 0;
       if (!byWeek.has(week)) byWeek.set(week, []);
       byWeek.get(week).push(key);
     }
     for (const list of byWeek.values()) list.sort((a,b)=>occurrenceLayerOrder(a)-occurrenceLayerOrder(b));
-    const activeWeeks=[...byWeek.keys()].sort((a,b)=>a-b);
-    const allowedRemote=[];
-    if (preferRemoteFirst) {
-      // v1599: комбинированная Лек строится в порядке ДО-поток -> очно.
-      // При 2+ лекциях в неделю хотя бы последняя остаётся очной, а ДО берём
-      // с первых слоёв. При одной лекции в неделю чередование начинается с ДО.
-      const maxRemoteLayer=Math.max(0,...activeWeeks.map((week)=>Math.max(0,(byWeek.get(week)||[]).length-1)));
-      for (let layerIndex=0; layerIndex<maxRemoteLayer; layerIndex++) {
-        for (const week of activeWeeks) {
-          const list=byWeek.get(week)||[];
-          if (list.length>=2 && layerIndex<list.length-1) allowedRemote.push(list[layerIndex]);
-        }
+
+    // Кандидаты не запрещаются жёстко. Штрафы лишь помогают оставить
+    // очное присутствие в неделе, когда это возможно, и не складывать всё ДО
+    // подряд. При изменении графика набор и порядок кандидатов пересчитываются.
+    const weekSelected = new Map();
+    const selected = new Set();
+    const targetPositions = Array.from({length: requested}, (_,i)=>
+      Math.min(commonKeys.length-1, Math.floor((i + 0.5) * commonKeys.length / requested))
+    );
+
+    for (let pick=0; pick<requested; pick++) {
+      const target = targetPositions[pick];
+      let bestKey = null, bestScore = Infinity;
+      for (let idx=0; idx<commonKeys.length; idx++) {
+        const key = commonKeys[idx];
+        if (selected.has(key)) continue;
+        const [weekRaw] = String(key).split(":");
+        const week = Number(weekRaw) || 0;
+        const weekList = byWeek.get(week) || [];
+        const already = weekSelected.get(week) || 0;
+        const wouldConsumeWholeWeek = already + 1 >= weekList.length;
+
+        let score = Math.abs(idx - target);
+        // Это именно штраф, не запрет: если другого разумного варианта нет,
+        // единственная пара недели тоже может стать ДО.
+        if (wouldConsumeWholeWeek) score += weekList.length > 1 ? 2.5 : 1.25;
+        score += already * 1.5; // распределяем ДО между неделями
+        if (preferRemoteFirst) score += occurrenceLayerOrder(key) * 0.05;
+
+        // Не любим соседние ДО-слои, но допускаем их при необходимости.
+        if (idx > 0 && selected.has(commonKeys[idx-1])) score += 1.0;
+        if (idx + 1 < commonKeys.length && selected.has(commonKeys[idx+1])) score += 1.0;
+
+        if (score < bestScore - 1e-9) { bestScore = score; bestKey = key; }
       }
-      activeWeeks.forEach((week,activeIndex)=>{
-        const list=byWeek.get(week)||[];
-        if (list.length===1 && activeIndex%2===0) allowedRemote.push(list[0]);
-      });
-    } else {
-      activeWeeks.forEach((week,activeIndex)=>{
-        const list=byWeek.get(week)||[];
-        if (list.length >= 2) {
-          // Для прочих комбинированных занятий сохраняем минимум одну очную пару
-          // в начале недели, а ДО распределяем по остальным слоям.
-          allowedRemote.push(...list.slice(1));
-        } else if (list.length === 1 && activeIndex % 2 === 1) {
-          // При одной паре: очно / ДО / очно / ДО по активным неделям.
-          allowedRemote.push(list[0]);
-        }
-      });
+      if (bestKey == null) break;
+      selected.add(bestKey);
+      const week = Number(String(bestKey).split(":")[0]) || 0;
+      weekSelected.set(week, (weekSelected.get(week) || 0) + 1);
     }
-    const target=Math.min(requested,allowedRemote.length);
-    if (target<=0) return new Set();
-    if (preferRemoteFirst) return new Set(allowedRemote.slice(0,target));
-    if (target>=allowedRemote.length) return new Set(allowedRemote);
-    const selected=new Set();
-    for (let i=0;i<target;i++) {
-      const idx=Math.min(allowedRemote.length-1,Math.floor((i+0.5)*allowedRemote.length/target));
-      selected.add(allowedRemote[idx]);
-    }
-    if (selected.size<target) for (const key of allowedRemote) { selected.add(key); if (selected.size>=target) break; }
     return selected;
   };
   const subgroupCombinedSchemeCache = new Map();
@@ -1329,12 +1462,26 @@ function generateSchedule(data, prior, perfScope = null) {
     const manualRequested = Math.max(0, ...bucket.map((l) => Math.round(Number(l.mandatoryRemoteAssemblies) || 0)));
     const remotePercent = delivery === "auto" ? 50 : Math.max(0, Math.min(100, ...bucket.map((l) => Number(l.remotePercent) || 0)));
     const primary = bucket[0];
-    const occurrenceLists = bucket.map(occurrenceKeysForLoad);
-    let commonKeys = bucket.length >= 1 ? (occurrenceLists[0] || []) : [];
-    for (const list of occurrenceLists.slice(1)) {
-      const allowed = new Set(list);
-      commonKeys = commonKeys.filter((k) => allowed.has(k));
+    const lectureBucket = bucket.length > 1 && bucket.every((row)=>isLectureLessonTypeName(lessonTypeById[row.typeId]?.name));
+    const lectureMembership = lectureBucket ? lectureStreamMembership(bucket) : null;
+    const occurrenceLists = bucket.map((row)=>lectureMembership ? [...(lectureMembership.get(String(row.id||""))||[])] : occurrenceKeysForLoad(row));
+    // v1724: для лекций используем union только как шкалу возможных слоёв.
+    // Состав участников каждого week:layer определяется отдельно по персональному
+    // лимиту группы. Поэтому 2/1/1/1 превращается в общий слой для всех + один
+    // дополнительный слой только для первой группы, а не в две пары для всех.
+    let commonKeys = lectureBucket
+      ? [...new Set(occurrenceLists.flat())]
+      : (bucket.length >= 1 ? (occurrenceLists[0] || []) : []);
+    if (!lectureBucket) {
+      for (const list of occurrenceLists.slice(1)) {
+        const allowed = new Set(list);
+        commonKeys = commonKeys.filter((k) => allowed.has(k));
+      }
     }
+    commonKeys.sort((a,b)=>{
+      const aw=Number(String(a).split(":")[0])||0, bw=Number(String(b).split(":")[0])||0;
+      return aw-bw || occurrenceLayerOrder(a)-occurrenceLayerOrder(b);
+    });
     // v102: для практик процент ДО автоматически переводится в точное число
     // общих ДО-сборок по реально общим слоям недельного графика выбранных подгрупп.
     // Если процент не задан, сохраняется обратная совместимость с ручным числом сборок.
@@ -1360,14 +1507,36 @@ function generateSchedule(data, prior, perfScope = null) {
         if (idx>=0) selectedKeys.add(commonKeys[idx]);
       }
     }
-    const plan = {
-      primary, bucket, requested: selectedKeys.size, selectedKeys,
-      shortfall: delivery === "auto" && remotePercent > 0 ? 0 : Math.max(0, requested - selectedKeys.size),
-      streamGroupIds: [...new Set(bucket.slice(1).map((l)=>l.groupId).filter(Boolean))],
-      streamParticipants: bucket.slice(1).map((l) => ({ groupId: l.groupId, subgroup: Number(l.subgroup) || 0, loadId: l.id })),
-    };
-    practicalAssemblyPlans.push(plan);
-    for (const load of bucket) practicalAssemblyPlanByLoadId.set(load.id, plan);
+    if (lectureBucket) {
+      // v1724: ДО-лекция тоже собирается по конкретному слою и только из тех
+      // групп, которым этот слой положен. Разный объём часов не размножается.
+      for (const key of selectedKeys) {
+        const members=bucket.filter((row)=>lectureMembership?.get(String(row.id||""))?.has(key));
+        if (!members.length) continue;
+        const p=members[0];
+        const plan={
+          primary:p, bucket:members, requested:1, selectedKeys:new Set([key]), shortfall:0,
+          streamId:members.length>1?`remote_stream:${members.map((l)=>String(l.id||"")).sort().join("+")}`:"",
+          streamGroupIds:[...new Set(members.slice(1).map((l)=>l.groupId).filter(Boolean))],
+          streamParticipants:members.slice(1).map((l)=>({groupId:l.groupId,subgroup:Number(l.subgroup)||0,loadId:l.id})),
+        };
+        practicalAssemblyPlans.push(plan);
+        for (const member of members) {
+          if (!practicalAssemblyPlanByLoadId.has(member.id)) practicalAssemblyPlanByLoadId.set(member.id,{selectedKeys:new Set()});
+          practicalAssemblyPlanByLoadId.get(member.id).selectedKeys.add(key);
+        }
+      }
+    } else {
+      const plan = {
+        primary, bucket, requested: selectedKeys.size, selectedKeys,
+        shortfall: delivery === "auto" && remotePercent > 0 ? 0 : Math.max(0, requested - selectedKeys.size),
+        streamId: bucket.length > 1 ? `remote_stream:${bucket.map((l)=>String(l.id||"")).sort().join("+")}` : "",
+        streamGroupIds: [...new Set(bucket.slice(1).map((l)=>l.groupId).filter(Boolean))],
+        streamParticipants: bucket.slice(1).map((l) => ({ groupId: l.groupId, subgroup: Number(l.subgroup) || 0, loadId: l.id })),
+      };
+      practicalAssemblyPlans.push(plan);
+      for (const load of bucket) practicalAssemblyPlanByLoadId.set(load.id, plan);
+    }
   }
 
   // Лекционные и очные практические потоки строим ПО КОНКРЕТНОМУ СЛОЮ
@@ -1398,36 +1567,28 @@ function generateSchedule(data, prior, perfScope = null) {
     const bucket = loads.filter((row)=>wantedGroups.has(row.groupId) && isLectureLessonTypeName(lessonTypeById[row.typeId]?.name) && row.subjectId===anchor.subjectId && row.teacherId===anchor.teacherId && row.typeId===anchor.typeId && Number(row.subgroup||0)===Number(anchor.subgroup||0));
     if (bucket.length < 2) continue;
 
-    // На каждом week:layer состав участников определяется отдельно.
-    // Это принципиально для графиков 2/1, 2/2/1 и т.п.
-    const membersByKey = new Map();
-    for (const row of bucket) {
-      for (const key of occurrenceKeysForLoad(row)) {
-        if (!membersByKey.has(key)) membersByKey.set(key, []);
-        membersByKey.get(key).push(row);
-      }
-    }
-    const orderedKeys = [...membersByKey.keys()].sort((a,b)=>{
+    // v1724: состав лекционного потока определяется отдельно для каждого
+    // week:layer. Группа участвует только пока не исчерпан ЕЁ собственный объём.
+    const membership=lectureStreamMembership(bucket);
+    const orderedKeys=[...new Set([...membership.values()].flatMap((set)=>[...set]))].sort((a,b)=>{
       const aw=Number(String(a).split(":")[0])||0, bw=Number(String(b).split(":")[0])||0;
       return aw-bw || occurrenceLayerOrder(a)-occurrenceLayerOrder(b);
     });
     for (const key of orderedKeys) {
-      // Если конкретный слой этой строки уже ушёл в ДО-сборку, очно он в поток
-      // второй раз не попадает.
-      const members = (membersByKey.get(key) || []).filter((row)=>{
-        const remotePlan = practicalAssemblyPlanByLoadId.get(row.id);
-        return !remotePlan?.selectedKeys?.has(key);
-      });
-      if (members.length < 2) continue;
-      const primary = members[0];
+      const members=bucket.filter((row)=>membership.get(String(row.id||""))?.has(key));
+      if (!members.length) continue;
+      const inPersonMembers=members.filter((row)=>!practicalAssemblyPlanByLoadId.get(row.id)?.selectedKeys?.has(key));
+      // ДО-план уже закрыл этот слой для своих участников.
+      if (inPersonMembers.length < 2) continue;
+      const primary = inPersonMembers[0];
       const plan = {
-        streamId, bucket: members, primary,
+        streamId, bucket:inPersonMembers, primary,
         selectedKeys: new Set([key]), remoteKeys: new Set(), inPersonKeys: new Set([key]), allRemote:false,
-        streamGroupIds: members.slice(1).map((l)=>l.groupId),
-        streamParticipants: members.slice(1).map((l)=>({groupId:l.groupId,subgroup:Number(l.subgroup)||0,loadId:l.id}))
+        streamGroupIds: inPersonMembers.slice(1).map((l)=>l.groupId),
+        streamParticipants: inPersonMembers.slice(1).map((l)=>({groupId:l.groupId,subgroup:Number(l.subgroup)||0,loadId:l.id}))
       };
       lectureStreamPlans.push(plan);
-      members.forEach((l)=>addSelectedStreamKey(lectureStreamPlanByLoadId,l.id,key));
+      inPersonMembers.forEach((l)=>addSelectedStreamKey(lectureStreamPlanByLoadId,l.id,key));
     }
   }
 
@@ -1512,6 +1673,7 @@ function generateSchedule(data, prior, perfScope = null) {
       roomType: load.roomType,
       subgroup: load.subgroup || 0,
       format: "remote",
+      streamId: plan.streamId || "",
       streamGroupIds: plan.streamGroupIds,
       streamParticipants: plan.streamParticipants,
       isVacancyTeacher: !!teacherById[load.teacherId]?.isVacancy,
@@ -1958,28 +2120,25 @@ function generateSchedule(data, prior, perfScope = null) {
     return !!oa && !!other && weeksOverlap(other, inst, config) && halfConflicts(oa.half ?? null, half);
   };
 
-  // v1717: ОЧНО/ДО в один день — ЖЁСТКОЕ ограничение, но только для
-  // реально пересекающихся недель. Старый вариант смотрел на первый инстанс
-  // этого weekday без проверки week overlap и поэтому мог запрещать, например,
-  // очную пару на 8-й неделе из-за ДО-пары, существующей только на 7-й.
+  function groupDayFormat(groupId, day) {
+    const set = groupDayInstances.get(dpKey(groupId, day));
+    if (!set || set.size === 0) return null;
+    const firstId = set.values().next().value;
+    return byInst[firstId]?.format || "inperson";
+  }
+  function teacherDayFormatOf(teacherId, day) {
+    const set = teacherDayInstances.get(dpKey(teacherId, day));
+    if (!set || set.size === 0) return null;
+    const firstId = set.values().next().value;
+    return byInst[firstId]?.format || "inperson";
+  }
   function dayFormatOk(inst, day) {
     for (const gid of streamGroups(inst)) {
-      const set = groupDayInstances.get(dpKey(gid, day));
-      if (!set) continue;
-      for (const otherId of set) {
-        const other = byInst[otherId];
-        if (!other || other.instId === inst.instId || !weeksOverlap(other, inst, config)) continue;
-        if (other.format !== inst.format) return false;
-      }
+      const gf = groupDayFormat(gid, day);
+      if (gf && gf !== inst.format) return false;
     }
-    if (!inst.isVacancyTeacher && inst.teacherId) {
-      const set = teacherDayInstances.get(dpKey(inst.teacherId, day));
-      if (set) for (const otherId of set) {
-        const other = byInst[otherId];
-        if (!other || other.instId === inst.instId || other.isVacancyTeacher || !weeksOverlap(other, inst, config)) continue;
-        if (other.format !== inst.format) return false;
-      }
-    }
+    const tf = teacherDayFormatOf(inst.teacherId, day);
+    if (tf && tf !== inst.format) return false;
     return true;
   }
 
@@ -2110,16 +2269,9 @@ function generateSchedule(data, prior, perfScope = null) {
       return false;
     };
     const isFree = (r) => !roomOccupied(r.id) && !additionallyReserved.has(r.id) && !roomBlockedByPractice(inst, day, period, r.id);
-    // v1619: если в этом слоте уже стоит вторая подгруппа той же группы у того
-    // же преподавателя, это одно объединённое занятие — автоматически используем
-    // ту же аудиторию, а не отправляем преподавателя в два кабинета одновременно.
-    const teacherPartners = !inst.isVacancyTeacher ? [...(busyTeacherOccupants.get(`${sk}|${inst.teacherId}`) || [])]
-      .filter((oid) => assignmentConflictsHalf(oid, inst, half) && sameTeacherSiblingSubgroupsCompatible(inst, byInst[oid])) : [];
-    if (teacherPartners.length === 1) {
-      const partnerRoomId = assignment?.[teacherPartners[0]]?.roomId;
-      const sharedRoom = partnerRoomId ? candidates.find((r) => roomIdsEquivalent(rooms, r.id, partnerRoomId)) : null;
-      if (sharedRoom && isFree(sharedRoom) && !inst.twoRooms) return { ...sharedRoom, extraRoomId: null };
-    }
+    // v1631: не привязываем вторую подгруппу к кабинету первой.
+    // Один преподаватель может вести две подгруппы одной группы одновременно
+    // в разных аудиториях; обычный подбор кабинета выбирает любой подходящий.
     for (const r of candidates) {
       if (!isFree(r)) continue;
       if (!inst.twoRooms) return { ...r, extraRoomId: null };
@@ -4678,8 +4830,8 @@ function diagnosticFastCanPlace(data, assignment, index, inst, day, period, room
   for (const gid of streamGroups(inst)) for (const id of (index.groupDay.get(`${day}|${gid}`)||[])) dayCandidates.add(id);
   if (!inst.isVacancyTeacher && inst.teacherId) for (const id of (index.teacherDay.get(`${day}|${inst.teacherId}`)||[])) dayCandidates.add(id);
   for (const id of dayCandidates) { const other=index.byInst.get(id); if (!other || !overlaps(other) || other.format===inst.format) continue;
-    if (sameParticipantGroup(other)) return {ok:false,reason:`Смешение ДО и очного формата в один день запрещено: у группы уже есть ${other.format==='remote'?'ДО':'очное'} занятие на пересекающихся неделях`};
-    if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId===inst.teacherId) return {ok:false,reason:`Смешение ДО и очного формата в один день запрещено: у преподавателя уже есть ${other.format==='remote'?'ДО':'очное'} занятие на пересекающихся неделях`};
+    if (sameParticipantGroup(other)) return {ok:false,reason:`В этот день у группы уже стоят занятия ${other.format==='remote'?'дистанционно':'очно'} на пересекающихся неделях — весь день недели должен быть в одном формате`};
+    if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId===inst.teacherId) return {ok:false,reason:`В этот день у преподавателя уже стоят занятия ${other.format==='remote'?'дистанционно':'очно'} на пересекающихся неделях — весь день недели должен быть в одном формате`};
   }
   const sk=`${day}_${period}`, candidates=new Set();
   for (const gid of streamGroups(inst)) for (const id of (index.groupSlot.get(`${sk}|${gid}`)||[])) candidates.add(id);
@@ -4715,9 +4867,23 @@ function diagnosePlacementOptions(data, prior, payload = {}) {
   const diagId = `__DIAG__${firstId}`;
   const diagInst = { ...base, instId:diagId, weekPattern:'custom', customWeeks:weeks, manualSplit:false, userManualSplit:false, splitFromInstId:'' };
   const excluded = new Set(requestedIds);
-  const instances = sourceInstances.filter((i)=>!excluded.has(i.instId)).concat(diagInst);
+  // v1844 PERF: placement diagnostics for one/few requested weeks must not build
+  // occupancy for the entire semester. Keep only instances whose occurrence
+  // intersects a requested week. This turns the common weekly picker from an
+  // O(semester) scan into an O(current-week) scan while preserving weeksOverlap.
+  const requestedWeekSet = new Set(weeks.map(Number));
+  const relevantSourceInstances = requestedWeekSet.size
+    ? sourceInstances.filter((inst) => {
+        if (requestedIds.includes(String(inst?.instId || ''))) return true;
+        return weekNumbersForInstance(data.config, inst).some((w) => requestedWeekSet.has(Number(w)));
+      })
+    : sourceInstances;
+  const instances = relevantSourceInstances.filter((i)=>!excluded.has(String(i.instId))).concat(diagInst);
+  const relevantIds = new Set(instances.map((i)=>String(i?.instId || '')).filter(Boolean));
   const assignment = {};
-  for (const [id,a] of Object.entries(schedule.assignment || {})) if (!excluded.has(id) && a) assignment[id] = a;
+  for (const [id,a] of Object.entries(schedule.assignment || {})) {
+    if (!excluded.has(String(id)) && relevantIds.has(String(id)) && a) assignment[id] = a;
+  }
   const occupancyIndex = buildDiagnosticOccupancyIndex(instances, assignment);
   const groupDayBlockIndex = new Set((data.groupDayBlocks || []).map((b)=>`${b.groupId}|${b.date}`));
   const teacherById = new Map((data.teachers || []).map((t)=>[t.id,t]));

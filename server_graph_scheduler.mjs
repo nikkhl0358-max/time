@@ -85,7 +85,9 @@ const teacherSlots = (l,w) => {
     for(let p=0;p<Number(config.periodsPerDay||6);p++) if(!teacherUnavailableAt(t,day,p,w)) n++;
   } return n;
 };
-const linkedRows = l => l.streamId ? loads.filter(x=>String(x.streamId)===String(l.streamId)) : [l];
+const sameStreamSemantic = (a,b) => !!a && !!b && !!a.streamId && String(a.streamId)===String(b.streamId) && String(a.subjectId||'')===String(b.subjectId||'') && String(a.teacherId||'')===String(b.teacherId||'') && String(a.typeId||'')===String(b.typeId||'') && Number(a.subgroup||0)===Number(b.subgroup||0);
+const streamSemanticKey = l => l?.streamId ? [String(l.streamId),String(l.subjectId||''),String(l.teacherId||''),String(l.typeId||''),Number(l.subgroup||0)].join('|') : '';
+const linkedRows = l => l.streamId ? loads.filter(x=>sameStreamSemantic(x,l)) : [l];
 const linkedIds = l => new Set(linkedRows(l).map(x=>String(x.id)));
 const planPairs = (gid,l) => {
   const g=byId(groups,gid); if(!g?.specialtyId) return null;
@@ -94,7 +96,16 @@ const planPairs = (gid,l) => {
 };
 const sameBucket=(a,b)=>Number(a?.subgroup||0)===Number(b?.subgroup||0);
 const rowTotal=l=>Array.from({length:totalWeeks},(_,i)=>effective(l,i+1)).reduce((a,b)=>a+b,0);
+const ownAutoLimit = l => {
+  const gid=String(l?.groupId||''); if(!gid)return null;
+  const ids=linkedIds(l); const plan=planPairs(gid,l); if(plan==null)return null; const seen=new Set();
+  const other=loads.filter(x=>!ids.has(String(x.id)) && groupIdsForLoad(x).includes(gid) && String(x.subjectId)===String(l.subjectId) && String(x.typeId)===String(l.typeId) && sameBucket(x,l)).filter(x=>{ if(!x.streamId)return true; if(seen.has(x.streamId))return false; seen.add(x.streamId); return true; }).reduce((s,x)=>s+rowTotal(x),0);
+  return Math.max(0,plan-other);
+};
 const autoLimit = l => {
+  // v1724: лекционный поток имеет индивидуальный лимит у каждой группы.
+  // Общий слой синхронизируется, но дополнительные часы не выдаются всем подряд.
+  if(l?.streamId && kind(l)==='lecture') return ownAutoLimit(l);
   const ids=linkedIds(l); const vals=groupIdsForLoad(l).map(gid=>{
     const plan=planPairs(gid,l); if(plan==null)return null; const seen=new Set();
     const other=loads.filter(x=>!ids.has(String(x.id)) && groupIdsForLoad(x).includes(String(gid)) && String(x.subjectId)===String(l.subjectId) && String(x.typeId)===String(l.typeId) && sameBucket(x,l)).filter(x=>{ if(!x.streamId)return true; if(seen.has(x.streamId))return false; seen.add(x.streamId); return true; }).reduce((s,x)=>s+rowTotal(x),0);
@@ -105,7 +116,17 @@ const autoLimit = l => {
 if(!groupId || !totalWeeks){ console.log(JSON.stringify({ok:false,error:'Не выбрана группа или не задан семестр'})); process.exit(0); }
 const targetLoads=loads.filter(l=>groupIdsForLoad(l).includes(groupId));
 const seenStreams=new Set();
-const anchors=targetLoads.filter(l=>{ if(!l.streamId)return true; if(seenStreams.has(l.streamId))return false; seenStreams.add(l.streamId); return true; });
+const anchors=[];
+for(const l of targetLoads){
+  if(!l.streamId){ anchors.push(l); continue; }
+  const key=streamSemanticKey(l); if(seenStreams.has(key))continue; seenStreams.add(key);
+  const peers=targetLoads.filter(x=>sameStreamSemantic(x,l));
+  // v1724: якорем лекционного потока становится участник с максимальным
+  // собственным объёмом. Тогда общий рисунок строится до максимума, а каждый
+  // peer ниже обрезается по своему учебному плану.
+  const chosen=kind(l)==='lecture' ? [...peers].sort((a,b)=>(ownAutoLimit(b)||0)-(ownAutoLimit(a)||0))[0] : l;
+  anchors.push(chosen||l);
+}
 const editable=anchors.filter(l=>!linkedRows(l).some(x=>x.graphLocked));
 const editableIds=new Set(editable.flatMap(l=>linkedRows(l).map(x=>String(x.id))));
 const next=loads.map(l=>editableIds.has(String(l.id))?{...l,weekPattern:'perWeek',customWeeks:[],weeklyPairs:{},graphMode:'smart'}:{...l,weeklyPairs:{...(l.weeklyPairs||{})}});
@@ -187,10 +208,10 @@ for(const anchor of ordered){
     // Раньше каждый шаг anchor безусловно прибавлялся всем peers потока, поэтому
     // строка с меньшим объёмом могла получить лишние пары. Ограничиваем каждый
     // peer его собственным допустимым объёмом.
-    const peers=l.streamId?next.filter(x=>String(x.streamId)===String(l.streamId)): [l];
+    const peers=l.streamId?next.filter(x=>sameStreamSemantic(x,l)): [l];
     for(const p of peers){
       const originalPeer=loads.find(x=>String(x.id)===String(p.id))||p;
-      const peerCap=autoLimit(originalPeer);
+      const peerCap=(p.streamId && kind(p)==='lecture') ? ownAutoLimit(originalPeer) : autoLimit(originalPeer);
       const currentTotal=rowTotal(p);
       const add=peerCap==null?0:Math.max(0,Math.min(step,peerCap-currentTotal));
       if(add<=1e-9)continue;

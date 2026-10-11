@@ -1,0 +1,15 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const app = fs.readFileSync(new URL('../frontend/src/App.jsx', import.meta.url), 'utf8');
+assert.match(app, /transferNeedsReschedule:true/);
+assert.match(app, /Переданную нагрузку нельзя ставить с наложением/);
+assert.match(app, /Перенести переданную пару на другую неделю/);
+assert.match(app, /practiceStreamDetached:true/);
+assert.match(app, /Система отделит на этой неделе только группы, которые перекрыты практикой/);
+assert.doesNotMatch(app, /disabled=\{!!practiceConflictReview\.applyingKey \|\| multiGroup\}/);
+assert.match(app, /transferEffectiveFrom: scope === "notConducted" \? transferStartDate : ""/);
+console.log('v1881: transfer conflict and practice stream recovery assertions passed');
+const storage = fs.readFileSync(new URL('../frontend/src/storage.js', import.meta.url), 'utf8');
+const server = fs.readFileSync(new URL('../app.py', import.meta.url), 'utf8');
+assert.match(storage, /CLIENT_BUILD_ID = "1881"/);
+assert.match(server, /CURRENT_SCHEDULE_CLIENT_BUILD = 1881/);

@@ -1,0 +1,10 @@
+import fs from 'node:fs';
+const app=fs.readFileSync(new URL('../frontend/src/App.jsx',import.meta.url),'utf8');
+const storage=fs.readFileSync(new URL('../frontend/src/storage.js',import.meta.url),'utf8');
+const server=fs.readFileSync(new URL('../app.py',import.meta.url),'utf8');
+if(app.includes('graphOccurrenceDedupe')) throw new Error('v1868 graphOccurrence helper must remain rolled back');
+if(app.includes('currentWeekFactualDuplicateIds')) throw new Error('v1868 duplicate graph status hook must remain rolled back');
+for (const needle of ['modal.group-graph-quick-modal','exportTeachersCompactExcel','сборка {CLIENT_BUILD_ID}']) if(!app.includes(needle)) throw new Error(`missing invariant: ${needle}`);
+if(!storage.includes('CLIENT_BUILD_ID = "1870"')) throw new Error('wrong client build id');
+for (const needle of ['PUBLIC_SHARD_SCHEMA_VERSION = 1870','_public_instance_teacher_ids','_upgrade_public_shard_manifest_schema','entity_id in _public_instance_teacher_ids']) if(!server.includes(needle)) throw new Error(`missing public shard fix: ${needle}`);
+console.log('v1870: rollback + public shard invariants passed');

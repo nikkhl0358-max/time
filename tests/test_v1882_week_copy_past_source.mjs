@@ -1,0 +1,14 @@
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+const app = fs.readFileSync(new URL('../frontend/src/App.jsx', import.meta.url), 'utf8');
+const server = fs.readFileSync(new URL('../app.py', import.meta.url), 'utf8');
+const storage = fs.readFileSync(new URL('../frontend/src/storage.js', import.meta.url), 'utf8');
+assert.match(app, /const sourceSchedule = rawSchedLocalRef\.current \|\| rawSched \|\| sched/);
+assert.match(app, /reason:"week-copy-exact-snapshot-v1882"/);
+assert.match(app, /pastTrimIds:\[\.\.\.copyPastTrimIds\]/);
+assert.match(app, /const remain=\{[\s\S]*?\.\.\.rawInst,[\s\S]*?weekPattern:"custom",customWeeks:\[\.\.\.otherWeeks\]/);
+assert.match(server, /future_only_trim = \(/);
+assert.match(server, /all\(int\(w\) > int\(current_sem_week\) for w in removed_weeks\)/);
+assert.match(storage, /CLIENT_BUILD_ID = "1882"/);
+assert.match(server, /CURRENT_SCHEDULE_CLIENT_BUILD = 1882/);
+console.log('v1882: past-source week copy assertions passed');

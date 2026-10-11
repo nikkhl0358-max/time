@@ -1,0 +1,62 @@
+  const buildScheduleCellIndex = (schedule, onlyWeek = null) => {
+    const bySlot = new Map();
+    const byDayPeriod = new Map();
+    const weeksByObject = new Map();
+    const weeksByInstId = new Map();
+    const instanceIndex = new Map();
+    const instanceIndexById = new Map();
+    const seenSemanticOccurrence = new Set();
+    if (!schedule || !data.config.semesterStart) return { bySlot, byDayPeriod, weeksByObject, weeksByInstId, instanceIndex, instanceIndexById };
+    const wantedWeek = onlyWeek == null ? null : Number(onlyWeek);
+    const sourceInstances = wantedWeek == null
+      ? (schedule.instances || [])
+      : (scheduleInstIdsByWeek.get(wantedWeek) || []).map((id)=>scheduleInstById.get(String(id))).filter(Boolean);
+    sourceInstances.forEach((inst, idx)=>{
+      instanceIndex.set(inst, idx);
+      if (inst?.instId != null) instanceIndexById.set(String(inst.instId), idx);
+    });
+    for (const inst of sourceInstances) {
+      const instIdText = String(inst?.instId || "");
+      if (offGraphPurgePendingIds.has(instIdText)) continue;
+      const a = schedule.assignment?.[inst.instId];
+      if (!a || a.day == null || a.period == null) continue;
+      // v1825 PERF: week membership depends on instance/config, not on assignment.
+      // Reuse the memoized map so a drag does not recalculate semester weeks for
+      // every single card while rebuilding the current-week slot index.
+      const sourceWeeks = (scheduleWeeksByInstId.get(inst.instId) || weekNumbersForInstance(data.config, inst)).map(Number).filter(Number.isFinite);
+      const weeks = wantedWeek == null ? sourceWeeks : (sourceWeeks.includes(wantedWeek) ? [wantedWeek] : []);
+      if (!weeks.length) { weeksByObject.set(inst, []); weeksByInstId.set(String(inst.instId||''), []); continue; }
+      const actual = [];
+      for (const week of weeks) {
+        if (offGraphOccurrencePurgePendingKeys.has(`${instIdText}::${Number(week)}`)) continue;
+        const date = addDays(addDays(mondayOf(data.config.semesterStart), (week - 1) * 7), a.day);
+        if (date < data.config.semesterStart || date > data.config.semesterEnd) continue;
+        if (isNoClassDate(data, date)) continue;
+        if (!instanceAppliesToDate(data.config, inst, date)) continue;
+        if (streamGroups(inst).some((gid) => isGroupOnPractice(data, gid, date))) continue;
+        const participantSig = (inst.streamParticipants || []).map((p)=>`${String(p?.groupId||"")}:${Number(p?.subgroup||0)}:${String(p?.loadId||"")}`).sort().join(",");
+        const groupSig = [...new Set(streamGroups(inst).map(String))].sort().join(",");
+        const teacherSig = instanceTeacherIds(inst).sort().join(",");
+        const semanticKey = [String(inst.loadId||inst.eventSeriesId||inst.instId||""),Number(week),canonicalRequirementLayer(inst),inst.format||"inperson",String(inst.groupId||""),Number(inst.subgroup||0),groupSig,participantSig,teacherSig,String(inst.subjectId||inst.eventTitle||""),String(inst.typeId||""),Number(a.day),Number(a.period),a.half==null?"F":Number(a.half)].join("|");
+        if (seenSemanticOccurrence.has(semanticKey)) continue;
+        seenSemanticOccurrence.add(semanticKey);
+        actual.push(Number(week));
+        const key = `${Number(week)}:${Number(a.day)}:${Number(a.period)}`;
+        const arr = bySlot.get(key) || [];
+        arr.push({ inst, a });
+        bySlot.set(key, arr);
+      }
+      weeksByObject.set(inst, actual);
+      weeksByInstId.set(String(inst.instId||''), actual);
+      if (actual.length) {
+        const dp = `${Number(a.day)}:${Number(a.period)}`;
+        const arr = byDayPeriod.get(dp) || [];
+        arr.push({ inst, a });
+        byDayPeriod.set(dp, arr);
+      }
+    }
+    return { bySlot, byDayPeriod, weeksByObject, weeksByInstId, instanceIndex, instanceIndexById };
+  };
+
+
+  const emptyCellIndex = useMemo(

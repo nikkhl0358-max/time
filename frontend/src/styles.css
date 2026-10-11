@@ -546,3 +546,155 @@
   background: #fff0f0;
   border-color: #efc1c1;
 }
+
+/* v1716: explicit public refresh + cache-safe public contour */
+.public-status-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:7px; }
+.public-status-row .public-publication-status { margin-top:0; }
+.public-refresh-btn {
+  appearance:none; border:1px solid rgba(255,255,255,.45); background:rgba(255,255,255,.10); color:#fff;
+  border-radius:8px; padding:6px 10px; font:inherit; font-size:12px; font-weight:700; cursor:pointer;
+  transition:background .15s ease,border-color .15s ease;
+}
+.public-refresh-btn:hover { background:rgba(255,255,255,.20); border-color:rgba(255,255,255,.7); }
+.public-refresh-btn:active { transform:translateY(1px); }
+@media (max-width:640px) { .public-refresh-btn { width:100%; text-align:center; } }
+
+/* v1596: ручное ДО сверх базовых 50% */
+.candidate-action-stack{display:flex;flex-direction:column;gap:6px;align-items:stretch}
+.remote-over-quota-btn{border-color:#7aaecf;background:#eef8ff;color:#24536f}
+.remote-over-quota-btn:hover{background:#dff2ff}
+
+/* v1709: ручная корректировка формата конкретной пары без перерасчёта */
+.manual-format-editor{
+  flex:1 1 100%;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-wrap:wrap;
+  padding:9px 10px;
+  border:1px solid #d8e0e8;
+  border-radius:10px;
+  background:#f8fafc;
+}
+.manual-format-editor-label{font-size:12px;font-weight:800;color:#344054}
+.manual-format-editor-buttons{display:flex;gap:5px}
+.manual-format-choice{
+  appearance:none;border:1px solid #c8d2dd;background:#fff;color:#344054;
+  border-radius:8px;padding:6px 10px;font:inherit;font-size:12px;font-weight:800;cursor:pointer;
+}
+.manual-format-choice:hover:not(:disabled){background:#f0f4f8;border-color:#9fb0c3}
+.manual-format-choice.active{background:#244e7e;border-color:#244e7e;color:#fff}
+.manual-format-choice.remote.active{background:#4f7895;border-color:#4f7895;color:#fff}
+.manual-format-choice:disabled{cursor:default;opacity:1}
+.manual-format-editor small{flex:1 1 240px;color:#667085;font-size:11px}
+
+/* v1763+ loads/substitutions UI helpers */
+.sub-publish-actions{display:flex;flex-direction:column;align-items:flex-end;gap:5px;min-width:230px}
+.sub-publish-actions small{font-size:10px;color:var(--ink-soft);text-align:right}
+.remote-base9-hint{margin-top:5px;color:#166534;font-weight:700}
+
+/* v1767: replacements workspace */
+.substitution-filters{gap:8px;align-items:center;flex-wrap:wrap}
+.substitution-filters .searchable-select{min-width:220px;max-width:320px}
+.inline-check{display:inline-flex;align-items:center;gap:6px;font-size:13px;white-space:nowrap}
+.sub-badge.stream{background:#5d6f88;color:#fff;margin-top:4px}
+.public-event.cancelled .ev-subject{margin-top:2px}
+.public-event.cancelled .ev-cancel-text{font-weight:700}
+
+/* v1775: замена преподавателя для отдельной подгруппы в публичном контуре. */
+.public-teacher-replacement{
+  color:#178443!important;
+  font-weight:800!important;
+}
+.public-teacher-link.public-teacher-replacement{
+  color:#178443!important;
+  text-decoration-color:#75bd8d!important;
+}
+.public-teacher-replacement-row{
+  color:#178443!important;
+  font-weight:700!important;
+}
+.public-event.subgroup-teacher-substitution{
+  /* Не перекрашиваем всю карточку: подгруппа остаётся отдельной в своём кабинете. */
+}
+.sub-badge.teacher-replacement-badge{
+  background:#e6f7eb!important;
+  color:#176b37!important;
+  border:1px solid #97d4aa!important;
+}
+.semester-public-item-meta .public-teacher-replacement{
+  color:#178443!important;
+  font-weight:800!important;
+}
+
+/* v1778: explicit pair-order editor inside substitutions. */
+.sub-period-edit-label{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;white-space:nowrap}
+.sub-period-edit-label select{min-width:92px}
+
+/* v1802 — compact first-course remote workflow */
+.first-course-remote-box{margin-top:7px;padding:7px 8px;border:1px solid var(--line);border-radius:8px;background:var(--panel-soft,#f8fafc)}
+.first-course-remote-title{font-size:11px;font-weight:800;margin-bottom:5px}
+.first-course-remote-actions{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:4px}
+.first-course-remote-box small{display:block;line-height:1.35;color:var(--ink-soft)}
+
+/* v1831: visible warning for a placed lesson that is not present in the
+   current weekly graph. It is intentionally distinct from collision warnings. */
+.lesson-chip.off-graph-warn{
+  outline:2px solid #b66a00!important;
+  outline-offset:-2px;
+  background:#fff0cf!important;
+}
+.off-graph-note{
+  display:flex;
+  align-items:flex-start;
+  gap:4px;
+  margin-top:5px;
+  padding:5px 6px;
+  border:1px solid #d89a35;
+  border-radius:6px;
+  background:#fff6df;
+  color:#7a4700;
+  font-size:10px;
+  line-height:1.25;
+}
+
+/* v1840: быстрый график группы прямо поверх недельного расписания */
+/* v1859: .modal is declared later in App.jsx with width:420px/max-width:90vw.
+   Use a more specific selector + !important so the quick graph really uses the
+   available desktop width instead of inheriting the narrow generic dialog. */
+.modal.group-graph-quick-modal{width:min(96vw,1900px)!important;max-width:96vw!important;height:min(92vh,980px);max-height:92vh!important;overflow:hidden;}
+.group-graph-quick-modal .modal-body{padding:14px;overflow:hidden;}
+.group-graph-quick-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:12px;}
+.group-graph-quick-head>div{display:flex;flex-direction:column;gap:3px;min-width:0;}
+.group-graph-quick-head span:not(.week-mode-badge){font-size:12px;color:var(--muted,#667085);}
+.group-graph-quick-scroll{overflow:auto;max-height:min(72vh,820px);border:1px solid #dfe5ea;border-radius:10px;background:#fff;}
+.group-graph-quick-table{min-width:max-content;margin:0;}
+.group-graph-quick-table .time-col{position:sticky;left:0;z-index:3;min-width:260px;max-width:320px;background:#fff;}
+.group-graph-quick-table thead .time-col{z-index:5;}
+.group-graph-quick-table th.graph-current-week{box-shadow:inset 0 -4px 0 #2563eb;background:#eaf2ff!important;}
+.group-graph-quick-table td.graph-current-week{box-shadow:inset 0 0 0 2px rgba(37,99,235,.28);background:#f3f7ff!important;}
+.group-graph-quick-table .graphs-input{min-width:58px;width:58px;}
+.group-graph-quick-table .graphs-total{min-width:86px;white-space:nowrap;}
+.group-graph-quick-actions{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line);background:#fff;}
+.group-graph-quick-buttons{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap;}
+.group-graph-save-status{font-size:12px;color:var(--muted,#667085);min-height:18px;}
+.group-graph-save-status.dirty{color:#9a5b00;font-weight:700;}
+@media (max-width:900px){.modal.group-graph-quick-modal{width:98vw!important;max-width:98vw!important;height:auto}.group-graph-quick-table .time-col{min-width:220px}}
+
+/* v1864: public room timetable */
+.public-room-search { margin-bottom: 16px; }
+.public-room-search > div:first-child { align-items: center; }
+.public-room-hint { margin-top: 8px; color: var(--ink-soft); font-size: 13px; line-height: 1.45; }
+.public-room-free { margin: 8px 0 10px; padding: 8px 10px; border: 1px solid #b7ddc8; border-radius: 9px; background: #f0faf4; color: #276749; font-size: 13px; font-weight: 700; }
+@media (max-width: 720px) {
+  .public-room-search > div:first-child { display: grid !important; grid-template-columns: 1fr; }
+  .public-room-search select, .public-room-search input { width: 100% !important; min-width: 0 !important; }
+}
+/* v1865: public contour must not silently choose a room when residual copies
+   of one lesson disagree. */
+.public-room-conflict{margin-top:4px;padding:6px 8px;border-radius:8px;background:#fff4d8;color:#7a4b00;font-weight:700;}
+
+/* v1885: structural surplus/out-of-graph rows must be obvious even after they
+   have already fallen into the diagnostic unplaced list. */
+.unplaced-item.unplaced-offgraph { border-color: rgba(220,38,38,.42); background: rgba(254,242,242,.58); }
+.unplaced-offgraph-badge { display:inline-flex; align-items:center; border:1px solid rgba(220,38,38,.45); border-radius:999px; padding:1px 6px; font-size:10px; font-weight:850; line-height:1.35; color:#991b1b; background:#fee2e2; white-space:nowrap; }

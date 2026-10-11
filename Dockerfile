@@ -21,6 +21,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MALLOC_ARENA_MAX=2 \
     MALLOC_TRIM_THRESHOLD_=131072 \
     DATA_DIR=/data \
+    SQLITE_PATH=/data/raspisanie.db \
     SCHEDULE_OPTIONS_CACHE_MAX=24 \
     SCHEDULE_OPTIONS_CACHE_MAX_BYTES=8388608 \
     PUBLIC_SHARD_CACHE_MAX=16 \
@@ -38,4 +39,4 @@ COPY server_graph_scheduler.mjs ./
 COPY --from=frontend-build /frontend/dist ./static
 RUN mkdir -p /data
 EXPOSE 5000
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "2", "--timeout", "120", "--graceful-timeout", "20", "--keep-alive", "3", "--max-requests", "700", "--max-requests-jitter", "100", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "120", "--graceful-timeout", "20", "--keep-alive", "5", "--max-requests", "3000", "--max-requests-jitter", "300", "app:app"]

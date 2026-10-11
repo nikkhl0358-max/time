@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import { dedupePublicLessonRows } from '../frontend/src/publicLessonDedupe.js';
+const inst=(id)=>({instId:id,groupId:'g1',subgroup:0,subjectId:'comp',typeId:'pr',teacherId:'t1',format:'inperson',streamParticipants:[{groupId:'g1',subgroup:0}]});
+const gsub=()=>[0]; const tokens=c=>c.inst.streamParticipants.map(p=>`${p.groupId}:${p.subgroup}`);
+const a={inst:inst('a'),a:{day:1,period:2,roomId:'r101'}};
+const b={inst:inst('b'),a:{day:1,period:2,roomId:'r202'}};
+const group=dedupePublicLessonRows([a,b],'group','g1',gsub,tokens);
+assert.equal(group.length,1,'group sees one real lesson, not two room-residual copies');
+assert.equal(group[0]._publicDuplicateRoomConflict,true,'room disagreement is surfaced');
+assert.deepEqual(group[0]._publicDuplicateRoomIds,['r101','r202']);
+assert.deepEqual(group[0]._publicDuplicateInstIds,['a','b']);
+const room=dedupePublicLessonRows([a,b],'room','r101',gsub,tokens);
+assert.equal(room.length,2,'room view remains raw until admin resolves storage conflict');
+console.log('v1865: residual public duplicate assertions passed');

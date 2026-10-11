@@ -1,0 +1,31 @@
+import { performance } from 'node:perf_hooks';
+import { calendarExceptionForFast, isHolidayFast, groupPracticeForDateFast, findSubstitutionFast, indexMovedSubstitutionsByDate, indexAssignedInstancesByDay, findMovedSourceInstanceFast } from '../frontend/src/fastScheduleLookups.js';
+const iso=(n)=>{const d=new Date('2026-09-01T00:00:00Z');d.setUTCDate(d.getUTCDate()+n);return d.toISOString().slice(0,10);};
+const dates=Array.from({length:120},(_,i)=>iso(i));
+const data={config:{holidays:dates.filter((_,i)=>i%21===0),calendarExceptions:dates.filter((_,i)=>i%14===0).map(d=>({date:d,noClasses:true}))},calendarExceptions:dates.filter((_,i)=>i%15===0).map(d=>({date:d,noClasses:false})),practices:Array.from({length:500},(_,i)=>({groupId:`G${i%90}`,dateStart:iso(i%80),dateEnd:iso(i%80+5)}))};
+const subs=Array.from({length:1100},(_,i)=>({instId:`I${i%500}`,date:dates[i%120],type:i%5===0?'moved':'sub',targetDate:dates[(i+3)%120]}));
+const insts=Array.from({length:15000},(_,i)=>({instId:`I${i}`,_publishedSourceInstId:i%8===0?`SOURCE${i}`:''}));
+const assignment=Object.fromEntries(insts.map((inst,i)=>[inst.instId,{day:i%6,period:i%5}]));
+const time=(f)=>{const t=performance.now();const n=f();return {ms:performance.now()-t,n};};
+const old=time(()=>{let count=0;for(let k=0;k<12;k++)for(const d of dates)for(let g=0;g<30;g++){
+ const gid=`G${g}`;const p=data.practices.find(x=>x.groupId===gid && x.dateStart<=d && d<=x.dateEnd);
+ const c=[...data.calendarExceptions,...data.config.calendarExceptions].find(x=>x.date===d);
+ if(p || c?.noClasses || data.config.holidays.includes(d))count++;
+ }return count;});
+const fast=time(()=>{let count=0;for(let k=0;k<12;k++)for(const d of dates)for(let g=0;g<30;g++){
+ const gid=`G${g}`;const p=groupPracticeForDateFast(data,gid,d);
+ const c=calendarExceptionForFast(data,d);
+ if(p || c?.noClasses || isHolidayFast(data.config,d))count++;
+ }return count;});
+if(old.n!==fast.n)throw new Error('date/practice mismatch');
+const oldPublic=time(()=>{let count=0;for(const d of dates){const day=new Date(d+'T00:00:00Z').getUTCDay();const candidates=insts.map(inst=>({inst,a:assignment[inst.instId]})).filter(r=>r.a && r.a.day===day);
+ count+=candidates.length;count+=subs.filter(s=>s.type==='moved'&&s.targetDate===d).length;
+ for(let j=0;j<50;j++) if(subs.find(s=>s.date===d && s.instId===`I${j}`))count++;
+ }return count;});
+const fastPublic=time(()=>{let count=0;const byDay=indexAssignedInstancesByDay(insts,assignment);const moved=indexMovedSubstitutionsByDate(subs);
+ for(const d of dates){const day=new Date(d+'T00:00:00Z').getUTCDay();count+=(byDay.get(day)||[]).length;count+=(moved.get(d)||[]).length;
+ for(let j=0;j<50;j++) if(findSubstitutionFast(subs,d,`I${j}`))count++;
+ }return count;});
+if(oldPublic.n!==fastPublic.n)throw new Error('public selection mismatch');
+console.log(`Synthetic date/practice queries (43,200): old ${old.ms.toFixed(1)} ms -> indexed ${fast.ms.toFixed(1)} ms (${(old.ms/fast.ms).toFixed(1)}x)`);
+console.log(`Synthetic public day/changes selection (15k instances, 120 dates, 1.1k changes): old ${oldPublic.ms.toFixed(1)} ms -> indexed ${fastPublic.ms.toFixed(1)} ms (${(oldPublic.ms/fastPublic.ms).toFixed(1)}x)`);
