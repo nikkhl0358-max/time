@@ -11,6 +11,7 @@ import hashlib
 import tempfile
 import select
 import sqlite3
+from pg_compat import pg_connect, pg_storage_exists
 import re
 from collections import OrderedDict
 from datetime import datetime
@@ -21,6 +22,7 @@ from flask import Flask, request, jsonify, send_from_directory, Response
 DATA_DIR = os.environ.get("DATA_DIR") or ("/data" if "AMVERA" in os.environ else os.path.join(os.path.dirname(__file__), "data"))
 LEGACY_DATA_FILE = os.path.join(DATA_DIR, "storage.json")
 SQLITE_PATH = os.environ.get("SQLITE_PATH") or os.path.join(DATA_DIR, "raspisanie.db")
+USE_POSTGRES = bool(os.environ.get("DATABASE_URL", "").strip())
 # Compatibility alias for old diagnostics/comments. SQLite is canonical from v1711.
 DATA_FILE = LEGACY_DATA_FILE
 BACKUP_DIR = os.path.join(DATA_DIR, "backups")
@@ -1932,7 +1934,9 @@ def _schedule_options_cache_put(key, value):
 
 
 def _sqlite_connect():
-    """Open the canonical SQLite store with safe settings for one-container deployment."""
+    """Open persistent store; PostgreSQL when DATABASE_URL is configured."""
+    if USE_POSTGRES:
+        return pg_connect(os.environ["DATABASE_URL"])
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(SQLITE_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(SQLITE_PATH, timeout=30)
@@ -2152,7 +2156,7 @@ def _project_without_embedded_snapshots(store_key, value, conn=None):
 
 
 def _load_publication_snapshot(store_key, version_id):
-    if not os.path.exists(SQLITE_PATH):
+    if not (USE_POSTGRES or os.path.exists(SQLITE_PATH)):
         return None
     conn = _sqlite_connect()
     try:
@@ -2171,7 +2175,7 @@ def _load_publication_snapshot(store_key, version_id):
 
 
 def _storage_exists():
-    return os.path.exists(SQLITE_PATH) or os.path.exists(LEGACY_DATA_FILE)
+    return (pg_storage_exists(os.environ["DATABASE_URL"]) if USE_POSTGRES else (os.path.exists(SQLITE_PATH) or os.path.exists(LEGACY_DATA_FILE)))
 
 
 def _migrate_legacy_json_to_sqlite_if_needed():
@@ -2182,7 +2186,7 @@ def _migrate_legacy_json_to_sqlite_if_needed():
     overwrite newer SQLite data after a restart.
     """
     with _sqlite_init_lock:
-        if os.path.exists(SQLITE_PATH):
+        if USE_POSTGRES or os.path.exists(SQLITE_PATH):
             return False
         if not os.path.exists(LEGACY_DATA_FILE):
             return False
@@ -2227,7 +2231,7 @@ def _migrate_legacy_json_to_sqlite_if_needed():
 
 def load_store():
     _migrate_legacy_json_to_sqlite_if_needed()
-    if not os.path.exists(SQLITE_PATH):
+    if not (USE_POSTGRES or os.path.exists(SQLITE_PATH)):
         _invalidate_store_cache()
         return {}
     # All application writes go through save_store(), which refreshes this cache.
@@ -2298,7 +2302,7 @@ def _store_with_snapshots_for_backup(store):
     """Hydrate external publication snapshots into a portable JSON backup."""
     out = copy.deepcopy(store)
     value = out.get("schedule-data-v2")
-    if not isinstance(value, dict) or not isinstance(value.get("scheduleVersions"), list) or not os.path.exists(SQLITE_PATH):
+    if not isinstance(value, dict) or not isinstance(value.get("scheduleVersions"), list) or not (USE_POSTGRES or os.path.exists(SQLITE_PATH)):
         return out
     conn = _sqlite_connect()
     try:
@@ -7825,7 +7829,7 @@ def healthz():
     SQLite read here. Those diagnostics were useful interactively but can make
     the monitor itself time out exactly when the server is busy publishing.
     """
-    ready = bool(os.path.isdir(DATA_DIR) and (os.path.exists(SQLITE_PATH) or os.path.exists(LEGACY_DATA_FILE)))
+    ready = bool(os.path.isdir(DATA_DIR) and (pg_storage_exists(os.environ["DATABASE_URL"]) if USE_POSTGRES else (os.path.exists(SQLITE_PATH) or os.path.exists(LEGACY_DATA_FILE))))
     response = jsonify({
         "ok": ready,
         "storageReady": ready,
@@ -7846,7 +7850,7 @@ def storage_diagnostics():
     snapshot_count = 0
     error = ""
     try:
-        if os.path.exists(SQLITE_PATH):
+        if (USE_POSTGRES or os.path.exists(SQLITE_PATH)):
             conn = _sqlite_connect()
             try:
                 conn.execute("SELECT 1").fetchone()
@@ -7854,7 +7858,7 @@ def storage_diagnostics():
                 sqlite_ok = True
             finally:
                 conn.close()
-            sqlite_bytes = os.path.getsize(SQLITE_PATH)
+            sqlite_bytes = 0 if USE_POSTGRES else os.path.getsize(SQLITE_PATH)
     except Exception as exc:
         error = str(exc)
     backup_count = 0
@@ -7873,9 +7877,10 @@ def storage_diagnostics():
         disk_free = None
     return jsonify({
         "ok": bool(ready and (sqlite_ok or os.path.exists(LEGACY_DATA_FILE))),
-        "storage": "sqlite", "sqlitePath": SQLITE_PATH, "storageReady": ready,
+        "storage": "postgresql" if USE_POSTGRES else "sqlite", "sqlitePath": None if USE_POSTGRES else SQLITE_PATH, "storageReady": ready,
         "sqliteOk": sqlite_ok, "sqliteBytes": sqlite_bytes,
         "publicationSnapshots": snapshot_count,
+        "databaseUrlConfigured": USE_POSTGRES,
         "backupCount": backup_count, "backupBytes": backup_bytes,
         "dataDir": DATA_DIR, "dataDirWritable": os.access(DATA_DIR, os.W_OK),
         "diskFreeBytes": disk_free, "error": error,

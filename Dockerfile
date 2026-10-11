@@ -31,6 +31,7 @@ COPY requirements.txt ./
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py ./
+COPY pg_compat.py ./
 COPY server_scheduler.mjs ./
 COPY server_graph_scheduler.mjs ./
 # Production image contains only runtime files. Source-level smoke tests are
