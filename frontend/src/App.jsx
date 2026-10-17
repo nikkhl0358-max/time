@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useDeferredValue, Fragment, startTransition } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx-js-style";
+import { planExactBulkWeekCopy } from "./bulkWeekSnapshot.mjs";
 import { storageGet, storageGetStrict, publicBootstrapGet, publicIndexGet, publicScheduleGet, publicStatusGet, publicControlGet, publicControlSet, storageSet, storageGraphMerge, storageGraphPatch, storageScheduleMerge, storageScheduleGroupMerge, storageSchedulePatch, storagePublishWeeks, storagePublicationCommit, storageSectionMerge, storageMeta, storageBackups, storageCreateBackup, storageDownloadBackup, storageRestoreBackup, storageRestorePublishedGroup, storageUndoPublishedGroupRestore, storageVersionGet, CLIENT_BUILD_ID, scheduleArchiveList, scheduleFinalizeWeek, scheduleArchiveGet, scheduleArchiveDownload, presenceHeartbeat, presenceLeave, serverGenerateStart, serverGenerateStatus, serverGenerateCancel, serverAutoGraphStart, serverAutoGraphStatus } from "./storage.js";
 import { MANUAL_POLICY, isGymRoomByPolicy, manualPolicyFlags } from "./manualPolicy.js";
 import { dedupePublicLessonRows } from "./publicLessonDedupe.js";
@@ -15613,6 +15614,309 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     }
   };
 
+  // Bulk week tools: one transaction for the entire timetable, not one save per group.
+  const bulkWeekFileRef = useRef(null);
+  const [bulkTargetWeek, setBulkTargetWeek] = useState(0);
+  const [bulkSourceWeek, setBulkSourceWeek] = useState(0);
+  const [bulkExportWeek, setBulkExportWeek] = useState(0);
+  const weekToolTotal = Math.max(1, Number(totalWeeksInSchedule || 1));
+  const weekToolTarget = Number(bulkTargetWeek || scheduleWeek || currentWeekGuess || 1);
+  const weekToolSource = Number(bulkSourceWeek || scheduleWeek || currentWeekGuess || 1);
+  const weekToolExport = Number(bulkExportWeek || scheduleWeek || currentWeekGuess || 1);
+
+  // Copy ALL groups as an exact snapshot of the source week. Graph-only
+  // requirements become unplaced; existing in-person -> ДО changes survive.
+  const copyBulkWeekExact = async (source, target) => {
+    if (bulkWeekOperationRef.current) return;
+    const original = rawSchedLocalRef.current || rawSched || sched;
+    if (!original) return;
+    const plan = planExactBulkWeekCopy({
+      sourceWeek: source, targetWeek: target,
+      currentWeek: Number(currentWeekGuess || 1),
+      instances: original.instances || [],
+      assignment: original.assignment || {},
+      locked: original.locked || [],
+      unplaced: original.unplaced || [],
+      targetGraphInstances: canonicalGraphInstancesByWeek.get(target) || [],
+      weeksFor: inst => weekNumbersForInstance(data.config, inst),
+      requirementIds: inst => scheduleRequirementLoadIds(inst),
+      requirementLayer: inst => scheduleRequirementLayer(inst),
+      participantsFor: inst => streamParticipants(enrichScheduleInstance(inst)),
+    });
+    const c = plan.counts;
+    if (!c.placed && !c.copiedUnplaced) {
+      setManualError(`На исходной неделе ${source} нет занятий для копирования.`);
+      return;
+    }
+    const confirmation = `Скопировать ${source}-ю неделю на ${target}-ю для ВСЕХ групп?\n\n` +
+      `Расстановка целевой недели будет заменена точным снимком исходной.\n` +
+      `Скопировано размещённых пар: ${c.placed} (ДО: ${c.remote}).\n` +
+      `Скопировано неразмещённых: ${c.copiedUnplaced}.\n` +
+      `Только по графику целевой недели (останутся неразмещёнными): ${c.graphOnly}.\n` +
+      (c.offGraph ? `Ручные занятия вне графика: ${c.offGraph} — сохраняются как в исходной неделе.\n` : '') +
+      `Другие недели и мероприятия сохраняются; изменения для целевой недели нужно опубликовать отдельно. Продолжить?`;
+    if (!window.confirm(confirmation)) return;
+    const next = {...original, instances:plan.instances, assignment:plan.assignment,
+      unplaced:plan.unplaced, locked:plan.locked,
+      stats:{...(original.stats || {}),
+        placed:plan.instances.reduce((sum,i)=>sum+(plan.assignment[i.instId]?(i.halfPair?0.5:1):0),0),
+        conflicts:plan.unplaced.length, ...scheduleManualGapMetrics(plan.assignment)},
+    };
+    const diff = buildAtomicScheduleDiff(original, next, {
+      reason:'bulk-week-exact-snapshot-v2',
+      ...(plan.pastTrimIds.length?{pastTrimIds:plan.pastTrimIds}:{})
+    });
+    if (!diff) {setManualError('Изменений нет.');return;}
+    bulkWeekOperationRef.current = true;
+    try {
+      setManualError(`Копирование ${source} → ${target} для всех групп: сохраняю изменения…`);
+      const result = await updateSchedule(next,diff);
+      if (!result?.ok) {setManualError('Сервер не подтвердил массовое копирование.');return;}
+      setManualError(`✓ Неделя ${target} заменена снимком недели ${source}. Сохранено ${c.placed} размещённых пар (ДО: ${c.remote}), ${c.copiedUnplaced+c.graphOnly} неразмещённых.`);
+      changeScheduleWeek(target);
+    } catch(e) {setManualError(`Ошибка копирования: ${e?.message || e}`);}
+    finally {bulkWeekOperationRef.current = false;}
+  };
+
+  const bulkReplaceWeek = async ({sourceWeek=null, targetWeek, importedRows=null}) => {
+    const target = Number(targetWeek);
+    const source = sourceWeek == null ? null : Number(sourceWeek);
+    if (!sched || !Number.isInteger(target) || target < 1 || target > weekToolTotal ||
+        (source !== null && (!Number.isInteger(source) || source < 1 || source > weekToolTotal || source === target))) {
+      setManualError('Выберите разные корректные недели источника и назначения.'); return;
+    }
+    if (target < Number(currentWeekGuess || 1)) {
+      setManualError('Массовая замена прошедшей недели запрещена. Выберите текущую или будущую неделю.'); return;
+    }
+    if (bulkWeekOperationRef.current) return;
+    if (source !== null && !importedRows) {
+      return copyBulkWeekExact(source, target);
+    }
+    const original = rawSchedLocalRef.current || rawSched || sched;
+    const beforeInstances = original.instances || [];
+    const beforeAssignments = original.assignment || {};
+    const planned = (canonicalGraphInstancesByWeek.get(target) || []).filter(x=>!x.isScheduleEvent);
+    const keyFor = (x,week) => scheduleRequirementKeys(x).filter(k=>Number(k.split('|')[1])===week).sort().join(';;');
+    const sourcePositions = new Map();
+    if (source !== null) {
+      for (const inst of beforeInstances) {
+        const a=beforeAssignments[inst.instId];
+        if (!a || inst.isScheduleEvent || !weekNumbersForInstance(data.config,inst).includes(source)) continue;
+        const keys=scheduleRequirementKeys(inst).filter(k=>Number(k.split('|')[1])===source);
+        for (const key of keys) {
+          const parts=key.split('|');
+          sourcePositions.set(`${parts[0]}|${parts[2]}|${parts[3]}`, {...a, sourceInst:inst});
+        }
+      }
+    }
+    let matches=[], unresolved=[];
+    if (importedRows) {
+      // The supplied export has one sheet per group and five columns:
+      // day/date, bell time, subject + lesson type + subgroup, room, teacher.
+      // Require an unambiguous match against this week's canonical graph.
+      const norm=v=>String(v??'').toLocaleLowerCase('ru').replace(/ё/g,'е').replace(/\s+/g,' ').trim();
+      const candidateRows=[];
+      for (const inst of planned) {
+        const {subj,type}=lessonLabel(inst,data);
+        const participants=streamParticipants(enrichScheduleInstance(inst));
+        for (const part of participants) {
+          candidateRows.push({inst,group:norm(byId(data.groups,part.groupId)?.name),subj:norm(subj),type:norm(type),
+            subgroup:Number(part.subgroup||inst.subgroup||0),teacher:norm(byId(data.teachers,inst.teacherId)?.name),part});
+        }
+      }
+      const used=new Set();
+      const times=(data.config.periodTimes||[]).map(v=>norm(v).replace(/\s/g,'').replace(/-/g,'–'));
+      const fallbackTimes=['8:30–10:00','10:10–11:40','11:50–13:20','14:00–15:30','15:40–17:10','17:20–18:50','19:00–20:30'];
+      for (const row of importedRows) {
+        const group=norm(row.group), label=norm(row.label), teacher=norm(row.teacher);
+        const subj=norm(label.split(',')[0].split('\n')[0]);
+        const type=norm((label.split(',')[1]||'').split('\n')[0]);
+        const subgroup=Number((label.match(/подгруппа\s*(\d+)/i)||[])[1]||0);
+        const dayText=norm(row.day);
+        const days=['понедельник','вторник','среда','четверг','пятница','суббота','воскресенье'];
+        const day=days.findIndex(d=>dayText.includes(d));
+        const tim=norm(row.time).replace(/\s/g,'').replace(/-/g,'–');
+        const explicitPair=Number(row.pair);
+        let period=Number.isInteger(explicitPair) && explicitPair >= 1 && explicitPair <= Number(data.config.periodsPerDay) ? explicitPair-1 : times.indexOf(tim);
+        if(period<0)period=fallbackTimes.indexOf(tim);
+        const roomLabel=norm(row.room).replace(/^ауд\.?\s*/,'');
+        const room=data.rooms.find(r=>norm(r.name)===roomLabel);
+        const eligible=candidateRows.filter(c=>c.group===group && c.subj===subj &&
+          (!subgroup || c.subgroup===subgroup) && (!teacher || c.teacher===teacher) &&
+          (!type || c.type.startsWith(type) || type.startsWith(c.type.slice(0,2))));
+        // Multiple periods of the same discipline use successive graph layers.
+        const c=eligible.find(c=>!used.has(`${c.inst.instId}|${group}`));
+        if(day<0 || period<0 || !c || (roomLabel && !room && roomLabel!=='до' && roomLabel!=='дистанционно')) {
+          unresolved.push(`${row.group}: ${row.label} (${row.day}, ${row.time})${!c?' — нет соответствия графику/нагрузке':roomLabel&&!room?' — неизвестная аудитория':' — неизвестное время'}`);
+          continue;
+        }
+        used.add(`${c.inst.instId}|${group}`);
+        matches.push({inst:c.inst,day,period,roomId:room?.id||null,remote:/^(до|дистанционно)$/.test(roomLabel)});
+      }
+      if(unresolved.length) {
+        setManualError(`Импорт отменён без изменений: не сопоставлено ${unresolved.length} из ${importedRows.length} строк. Первые ошибки: ${unresolved.slice(0,8).join(' | ')}`);
+        return;
+      }
+      if(!matches.length){setManualError('В файле не обнаружены пары, соответствующие графику. Расписание не изменено.');return;}
+    }
+    const pastTrimIds=[];
+    const usedIds=new Set(beforeInstances.map(i=>String(i.instId)));
+    const unique=base=>{let id=base,n=2;while(usedIds.has(id))id=`${base}_${n++}`;usedIds.add(id);return id;};
+    const nextInstances=[];
+    const nextAssignment={...beforeAssignments};
+    const nextLocked=new Set((original.locked||[]).map(String));
+    const nextUnplaced=new Set((original.unplaced||[]).map(String));
+    let removed=0;
+    for (const inst of beforeInstances) {
+      const weeks=weekNumbersForInstance(data.config,inst);
+      if(!weeks.includes(target)){nextInstances.push(inst);continue;}
+      const others=weeks.filter(w=>w!==target);
+      removed++;
+      if(!others.length){delete nextAssignment[inst.instId];nextLocked.delete(String(inst.instId));nextUnplaced.delete(String(inst.instId));continue;}
+      const hasPast=others.some(w=>w<Number(currentWeekGuess||1) && w!==1);
+      if(hasPast && target>Number(currentWeekGuess||1))pastTrimIds.push(String(inst.instId));
+      nextInstances.push({...inst,weekPattern:'custom',customWeeks:others,
+        blockId:'',blockIndex:0,blockSize:1,blockMode:'',manualSplit:true,userManualSplit:true});
+    }
+    let placed=0,unplaced=0;
+    const placementFor=new Map();
+    for (const row of matches) {
+      const prev=placementFor.get(row.inst.instId);
+      if(prev && (prev.day!==row.day || prev.period!==row.period || String(prev.roomId||'')!==String(row.roomId||''))) {
+        setManualError(`Импорт отменён: разные позиции одного потокового занятия (${row.inst.instId}).`); return;
+      }
+      placementFor.set(row.inst.instId,row);
+    }
+    for(const canonical of planned){
+      const instId=unique(`${canonical.instId}__BULK_W${target}`);
+      const row={...canonical,instId,weekPattern:'custom',customWeeks:[target],blockId:'',blockIndex:0,blockSize:1,blockMode:'',
+        manualSplit:true,userManualSplit:true,bulkWeekReplace:true};
+      const placement=placementFor.get(canonical.instId);
+      // Imported manually assigned ДО is authoritative: do not silently turn
+      // that lesson into an in-person graph template when building target week.
+      if (placement) row.format = placement.remote ? 'remote' : 'inperson';
+      const oldKey=keyFor(canonical,target).split(';;')[0]||'';
+      const [loadId,,layer,format]=oldKey.split('|');
+      const copied=source!==null?sourcePositions.get(`${loadId}|${layer}|${format}`):null;
+      nextInstances.push(row);
+      if(placement){nextAssignment[instId]={day:placement.day,period:placement.period,roomId:placement.remote?null:placement.roomId};nextLocked.add(instId);placed++;}
+      else if(copied){nextAssignment[instId]={day:copied.day,period:copied.period,roomId:row.format==='remote'?null:copied.roomId||null,
+        extraRoomId:copied.extraRoomId||null,half:copied.half??null};nextLocked.add(instId);placed++;}
+      else {nextUnplaced.add(instId);unplaced++;}
+    }
+    const action=importedRows?'Импорт Excel':'Копирование недели';
+    if(!window.confirm(`${action}: заменить расписание ВСЕХ групп на неделе ${target}?\nУдаляется расстановка: ${removed}; по графику будет размещено: ${placed}; без позиции: ${unplaced}.\nДругие недели сохраняются. Продолжить?`))return;
+    const next={...original,instances:nextInstances,assignment:nextAssignment,locked:[...nextLocked],unplaced:[...nextUnplaced]};
+    const diff=buildAtomicScheduleDiff(original,next,{reason:importedRows?'bulk-week-xlsx-replace':'bulk-week-copy-by-graph',...(pastTrimIds.length?{pastTrimIds}: {})});
+    if(!diff){setManualError('Изменений нет.');return;}
+    bulkWeekOperationRef.current=true;
+    try{
+      setManualError(`Сохраняется неделя ${target} для всех групп…`);
+      const result=await updateSchedule(next,diff);
+      if(!result?.ok){setManualError('Сервер не подтвердил массовое изменение.');return;}
+      setManualError(`✓ ${action} выполнено. Неделя ${target}: ${placed} размещённых, ${unplaced} неразмещённых пар.`);
+      changeScheduleWeek(target);
+    }catch(e){setManualError(`Не удалось сохранить: ${e.message||e}`);}
+    finally{bulkWeekOperationRef.current=false;}
+  };
+  const importBulkWeekExcel = async file => {
+    if(!file)return;
+    try{
+      const workbook=XLSX.read(await file.arrayBuffer(),{type:'array'});
+      const rows=[];
+      for(const name of workbook.SheetNames){
+        const sheet=workbook.Sheets[name];
+        const cells=XLSX.utils.sheet_to_json(sheet,{header:1,defval:''});
+        const group=String(cells[0]?.[0]||name).trim();
+        for(const r of cells.slice(4)){
+          if(!String(r[2]||'').trim() || !String(r[1]||'').trim())continue;
+          rows.push({group,day:String(r[0]||''),time:String(r[1]||''),label:String(r[2]||''),room:String(r[3]||''),teacher:String(r[4]||''),pair:r[5]});
+        }
+      }
+      if(!rows.length){setManualError('В Excel не найдены занятия. Требуется экспорт «Все группы» с листами по группам.');return;}
+      await bulkReplaceWeek({targetWeek:weekToolTarget,importedRows:rows});
+    }catch(e){setManualError(`Ошибка чтения Excel: ${e.message||e}`);}
+  };
+
+  // Self-contained snapshot export: any semester week, all groups, with
+  // separate named sheets. Columns 1-5 match the existing import template;
+  // column 6 stores the pair number (important for custom bell schedules).
+  const exportOneWeekAllGroupsExcel = (weekNumber) => {
+    const week = Number(weekNumber);
+    if (!sched || !Number.isInteger(week) || week < 1 || week > weekToolTotal) {
+      setManualError('Выберите корректную неделю для выгрузки Excel.'); return;
+    }
+    if (!data.config.semesterStart) {
+      setManualError('Для выгрузки по неделям требуется дата начала семестра.'); return;
+    }
+    const monday = addDays(mondayOf(data.config.semesterStart), (week - 1) * 7);
+    const sheets = new Map();
+    const allGroups = [...(data.groups || [])].sort((a,b)=>String(a.name||'').localeCompare(String(b.name||''),'ru',{numeric:true}));
+    for (const group of allGroups) sheets.set(String(group.id), []);
+    const actual = rawSchedLocalRef.current || rawSched || sched;
+    const placements = actual.assignment || {};
+    for (const inst of actual.instances || []) {
+      const a = placements[inst.instId];
+      if (!a || !weekNumbersForInstance(data.config,inst).includes(week)) continue;
+      if (inst.isScheduleEvent) continue;
+      const day=Number(a.day), period=Number(a.period);
+      if (!Number.isInteger(day) || day<0 || day>6 || !Number.isInteger(period) || period<0) continue;
+      const dt=addDays(monday,day);
+      if (isNoClassDate(data,dt)) continue;
+      const {subj,type} = lessonLabel(inst,data);
+      const members=streamParticipants(enrichScheduleInstance(inst));
+      for (const part of members) {
+        const gid=String(part.groupId||'');
+        if (!sheets.has(gid)) continue;
+        if (isGroupOnPractice(data,gid,dt)) continue;
+        const subgroup=Number(part.subgroup || 0);
+        const title=`${subj}, ${type}${subgroup?`\nПодгруппа ${subgroup}`:''}`;
+        const time=periodTimeForGroupDay(data,gid,day,period,dt) || data.config.periodTimes?.[period] || '';
+        sheets.get(gid).push({day,period,date:dt,time,title,
+          room:inst.format==='remote'?'ДО':(assignmentRoomLabel(data,a)||''),
+          teacher:byId(data.teachers,inst.teacherId)?.name||'',
+        });
+      }
+    }
+    const wb=XLSX.utils.book_new();
+    const used=new Set();
+    let count=0;
+    for (const group of allGroups) {
+      const rows=sheets.get(String(group.id)) || [];
+      rows.sort((a,b)=>a.day-b.day || a.period-b.period || a.title.localeCompare(b.title,'ru'));
+      count+=rows.length;
+      const aoa=[
+        [group.name],
+        [`Неделя ${week}: ${formatDateDM(monday)} — ${formatDateDM(addDays(monday,6))}`],
+        ['Рабочая расстановка без разовых календарных замен. Можно импортировать через «Импорт Excel в целевую неделю».'],
+        ['День / дата','Время','Дисциплина, вид занятия','Аудитория','Преподаватель','№ пары'],
+        ...rows.map(row=>[
+          `${DAY_LABELS_FULL[row.day].toLowerCase()}\n${formatDateDM(row.date)}`,
+          row.time,row.title,row.room,row.teacher,row.period+1,
+        ]),
+      ];
+      const sheet=XLSX.utils.aoa_to_sheet(aoa);
+      sheet['!cols']=[{wch:24},{wch:20},{wch:56},{wch:25},{wch:35},{wch:10}];
+      sheet['!rows']=[{hpt:26},{hpt:22},{hpt:30},{hpt:27},...rows.map(()=>({hpt:33}))];
+      sheet['!autofilter']={ref:`A4:F${Math.max(4,aoa.length)}`};
+      const head={font:{name:'Arial',bold:true,color:{rgb:'FFFFFF'}},fill:{fgColor:{rgb:'24476A'}},alignment:{horizontal:'center',vertical:'center',wrapText:true}};
+      const main={font:{name:'Arial',bold:true,sz:14,color:{rgb:'24476A'}}};
+      const body={font:{name:'Arial',sz:10},alignment:{vertical:'center',wrapText:true}};
+      for(let r=0;r<aoa.length;r++) for(let c=0;c<aoa[r].length;c++) {
+        const at=XLSX.utils.encode_cell({r,c});
+        if(sheet[at])sheet[at].s=r===0?main:r===3?head:body;
+      }
+      let name=excelSafeSheetName(group.name || `Группа_${group.id}`).slice(0,31);
+      const base=name; let idx=2;
+      while(used.has(name)) name=`${base.slice(0,27)}_${idx++}`;
+      used.add(name);
+      XLSX.utils.book_append_sheet(wb,sheet,name);
+    }
+    if (!wb.SheetNames.length) {setManualError('Группы для выгрузки не найдены.');return;}
+    XLSX.writeFile(wb,`raspisanie_Vse_gruppy_nedelya_${week}.xlsx`,{cellStyles:true});
+    setManualError(`✓ Excel за неделю ${week}: выгружено ${count} записей на ${wb.SheetNames.length} листах. Изменений в расписании нет.`);
+  };
+
   const clearSchedule = () => {
     if (!sched) return;
 
@@ -20575,7 +20879,7 @@ th{background:#1E3A5F;color:#ffffff;}
         <p>Ручное редактирование расписания. Функции автоматического расчёта временно скрыты из интерфейса.</p>
       </header>
 
-      <div className="schedule-toolbar">
+      <div className="schedule-toolbar schedule-dashboard">
         {SHOW_AUTO_CALC_CONTROLS && <>
           <button className="btn primary" onClick={() => onGenerate()} disabled={generating}>
             {generating ? <Loader2 className="spin" size={16} /> : <Wand2 size={16} />}
@@ -20587,6 +20891,9 @@ th{background:#1E3A5F;color:#ffffff;}
 
         {sched && (
           <>
+            <div className="schedule-toolbox schedule-toolbox-group-tools">
+              <div className="schedule-toolbox-title">Действия с группой <small>Дополнительные инструменты</small></div>
+              <details className="schedule-actions-details"><summary>Другие действия с группой и неделями</summary><div className="schedule-details-content">
             {SHOW_AUTO_CALC_CONTROLS && viewKind === "group" && viewId && <button className="btn ghost" onClick={() => onGenerate(viewId)} disabled={generating} title="Пересчитать только выбранную группу, сохранив расписание остальных групп">
               <Wand2 size={15}/> Пересчитать группу
             </button>}
@@ -20607,6 +20914,10 @@ th{background:#1E3A5F;color:#ffffff;}
             {!generating && weekScope === "week" && !["allGroups","allTeachers","allRooms","semesterAll"].includes(viewKind) && <button className={"btn ghost"+(splitScheduleOpen?" on":"")} onClick={()=>setSplitScheduleOpen((v)=>!v)} title="Открыть рядом второе расписание другой группы или преподавателя">▥ Split</button>}
             {viewKind === "group" && viewId && weekScope === "week" && !generating && <button className="btn ghost" onClick={()=>repeatSelectedGroupWeek(scheduleWeek,"next")} title="Скопировать конкретные пары открытой недели на выбранную будущую неделю. Копируются только пары, которые предусмотрены графиком.">↻ Неделю → неделю…</button>}
             {viewKind === "group" && viewId && weekScope === "week" && !generating && <button className="btn ghost" onClick={()=>repeatSelectedGroupWeek(scheduleWeek,"sameParity")} title="Повторить расстановку этой недели на все следующие недели той же чётности. Уже стоящие пары целевой недели заменяются по образцу исходной.">↻ Неделю → {defaultParityForWeek(scheduleWeek)==="odd"?"нечётные":"чётные"}</button>}
+</div></details>
+            </div>
+            <div className="schedule-toolbar-block schedule-toolbar-navigation">
+            <div className="schedule-toolbox-title">Просмотр расписания <small>Выберите вид, группу и неделю</small></div>
             <div className="view-switch">
               {[{ k: "group", label: "По группам" }, { k: "allGroups", label: "Все группы" }, { k: "semesterAll", label: "Весь семестр" }, { k: "teacher", label: "По преподавателям" }, { k: "allTeachers", label: "Все преподаватели" }, { k: "room", label: "По аудиториям" }, { k: "allRooms", label: "Все аудитории" }].map((o) => (
                 <button key={o.k} className={"pill" + (viewKind === o.k ? " on" : "")} onClick={() => { setViewKind(o.k); if (o.k === "allRooms") setAllRoomsFilter(""); if (o.k === "allTeachers") { setAllTeachersDepartment(""); setAllTeachersLetter(""); setAllTeachersQuery(""); setAllTeachersPage(0); } if (o.k === "allGroups") { setAllGroupsStreamFilter(""); setFilterSpec(""); } if (o.k !== "group" && typeof onRouteGroupChange === "function") onRouteGroupChange(""); if (["allGroups","allTeachers","allRooms"].includes(o.k)) setWeekScope("week"); }}>{o.label}</button>
@@ -20672,16 +20983,10 @@ th{background:#1E3A5F;color:#ffffff;}
               <input type="checkbox" checked={manualMode} onChange={(e) => setManualMode(e.target.checked)} />
               Ручное редактирование
             </label>
-            <button className="btn ghost" onClick={repairResidualDuplicates} title="Найти остаточные технические копии одной фактической пары, в том числе с разными loadId и кабинетами. Безопасные дубли можно удалить; неоднозначные кабинеты система не выбирает сама.">🧹 Остаточные дубли</button>
-            <button className="btn ghost" onClick={repairStreamDuplicates} title="Узкая проверка старых технических копий потоковых карточек">🔎 Дубли потоков</button>
-            <button className="btn ghost" onClick={inspectPublicLessonOverlaps} title="Без удаления: найти совпадающие занятия в публичном расписании каждой группы на выбранной неделе, включая потоки с разным составом участников">🔎 Совпадения публичных пар</button>
-            <input type="date" className="date-input" value={subDate} onChange={(e) => setSubDate(e.target.value)} title="Показать замены на дату" />
-            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей. Без выбранного ЦК выгружаются все преподаватели; с фильтром — только найденные." : "Скачать открытое расписание в Excel"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Excel — преподаватели" : "Excel (.xlsx)"}</button>}
-            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportWord} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей в Word" : "Скачать открытое расписание в Word"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Word — преподаватели" : "Word (.doc)"}</button>}
-            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
-            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportSemesterAllWord}><Download size={15} /> Word (.doc)</button>}
-            <button className="btn ghost" onClick={() => window.print()}>Печать / HTML</button>
-            <div className="publish-controls">
+            </div>
+            <div className="schedule-toolbox schedule-toolbox-publishing">
+              <div className="schedule-toolbox-title">Публикация <small>Что увидят студенты и преподаватели</small></div>
+              <div className="schedule-primary-row">            <div className="publish-controls">
               <select
                 className="publish-scope-select"
                 value={publishScope === "week" && weeklyPlanningMode ? "week" : (publishScope === "group" && viewKind === "group" && viewId ? "group" : "all")}
@@ -20697,7 +21002,8 @@ th{background:#1E3A5F;color:#ffffff;}
               </button>
             </div>
             <button className="btn ghost" onClick={openPublishWeeks}>📣 Опубликовать недели выборочно</button>
-            <button
+</div>
+              <details className="schedule-actions-details"><summary>Управление публичным доступом</summary><div className="schedule-details-content">            <button
               className={`btn ${publicContourPaused ? "primary" : "danger"}`}
               onClick={togglePublicContour}
               disabled={publicContourBusy}
@@ -20705,7 +21011,22 @@ th{background:#1E3A5F;color:#ffffff;}
             >
               {publicContourBusy ? "Подождите…" : (publicContourPaused ? "▶ Возобновить публичный контур" : "⏸ Остановить публичный контур на время")}
             </button>
-            <button
+</div></details>
+            </div>
+            <div className="schedule-secondary-utilities">
+              <details className="schedule-actions-details"><summary>Скачать и распечатать</summary><div className="schedule-details-content">            <input type="date" className="date-input" value={subDate} onChange={(e) => setSubDate(e.target.value)} title="Показать замены на дату" />
+            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей. Без выбранного ЦК выгружаются все преподаватели; с фильтром — только найденные." : "Скачать открытое расписание в Excel"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Excel — преподаватели" : "Excel (.xlsx)"}</button>}
+            {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportWord} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей в Word" : "Скачать открытое расписание в Word"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Word — преподаватели" : "Word (.doc)"}</button>}
+            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
+            {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportSemesterAllWord}><Download size={15} /> Word (.doc)</button>}
+            <button className="btn ghost" onClick={() => window.print()}>Печать / HTML</button>
+</div></details>
+              <details className="schedule-actions-details"><summary>Проверка дублей и конфликтов</summary><div className="schedule-details-content">
+            <button className="btn ghost" onClick={repairResidualDuplicates} title="Найти остаточные технические копии одной фактической пары, в том числе с разными loadId и кабинетами. Безопасные дубли можно удалить; неоднозначные кабинеты система не выбирает сама.">🧹 Остаточные дубли</button>
+            <button className="btn ghost" onClick={repairStreamDuplicates} title="Узкая проверка старых технических копий потоковых карточек">🔎 Дубли потоков</button>
+            <button className="btn ghost" onClick={inspectPublicLessonOverlaps} title="Без удаления: найти совпадающие занятия в публичном расписании каждой группы на выбранной неделе, включая потоки с разным составом участников">🔎 Совпадения публичных пар</button>
+</div></details>
+              <details className="schedule-actions-details"><summary>Восстановление и обслуживание</summary><div className="schedule-details-content">            <button
               className="btn primary"
               onClick={repairMissingGraphRequirements}
               title="Сверить график с расписанием и только добавить пары, которые есть по графику, но пропали и из сетки, и из «Не размещено». Уже существующие пары не двигаются и не удаляются."
@@ -20716,13 +21037,36 @@ th{background:#1E3A5F;color:#ffffff;}
             <button className="btn ghost" onClick={syncScheduleMetadataFromLoads} title="Сверить преподавателя, дисциплину и вид занятия существующих карточек с актуальной «Нагрузкой». День, пара, аудитория, недели и формат не меняются.">↻ Данные из нагрузки</button>
             <button className="btn ghost" onClick={openGarbageReview} title="Найти технические копии и хвосты ОЧНО/ДО после смены формата. Ничего не удаляется без просмотра и подтверждения.">🧹 Найти мусорные пары</button>
             <button className="btn ghost" onClick={openPracticeConflictReview} title="Найти обычные занятия, которые по сохранённому расписанию попали на даты практики выбранной группы. Только просмотр — ничего не удаляется и не переносится.">🔎 Найти пары под практикой</button>
-            <span className="publish-status" style={{fontWeight:700}}>сборка {CLIENT_BUILD_ID}</span>
+</div></details>
+              <details className="schedule-actions-details schedule-danger-details"><summary>Опасные действия и состояние системы</summary><div className="schedule-details-content">            <span className="publish-status" style={{fontWeight:700}}>сборка {CLIENT_BUILD_ID}</span>
             {publicContourPaused && <span className="publish-status" style={{color:"#b45309",fontWeight:800}}>Публичный контур приостановлен{publicContourMeta?.by ? ` · ${publicContourMeta.by}` : ""}</span>}
             <button className="btn danger" onClick={clearSchedule} disabled={viewKind !== "group" || !viewId} title={viewKind === "group" && viewId ? "Удалить расписание только выбранной группы" : "Сначала выберите конкретную группу"}><Trash2 size={15} /> {viewKind === "group" && viewId ? "Очистить группу" : "Очистить расписание"}</button>
-            {data.publishedAt ? <span className="publish-status">Публичная версия: {new Date(data.publishedAt).toLocaleString("ru-RU")} · {data.publishedBy || ""}. Текущие правки — черновик до следующей публикации.</span> : <span className="publish-status">Публичная версия ещё не зафиксирована.</span>}
+            {data.publishedAt ? <span className="publish-status schedule-toolbar-meta">Публичная версия: {new Date(data.publishedAt).toLocaleString("ru-RU")} · {data.publishedBy || ""}. Текущие правки — черновик до следующей публикации.</span> : <span className="publish-status schedule-toolbar-meta">Публичная версия ещё не зафиксирована.</span>}
+</div></details>
+            </div>
           </>
         )}
       </div>
+      {sched && !generating && <details className="schedule-week-operations">
+        <summary><span>Массовые операции с неделями</span><small>Копирование всех групп и полная замена недели из Excel</small></summary>
+        <div className="schedule-week-operations-body">
+          <p>Изменения затронут выбранную целевую неделю. Перед выполнением сохраните резервную копию расписания.</p>
+          <div className="bulk-week-tools">
+            <label className="bulk-week-field">Исходная неделя<select value={bulkSourceWeek||scheduleWeek} onChange={e=>setBulkSourceWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
+            <label className="bulk-week-field">Целевая неделя<select value={bulkTargetWeek||scheduleWeek} onChange={e=>setBulkTargetWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
+            <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Заменить расписание всех групп по графику целевой недели, сохраняя позиции пар из исходной" onClick={()=>bulkReplaceWeek({sourceWeek:weekToolSource,targetWeek:weekToolTarget})}>↻ Копировать все группы</button>
+            <input type="file" accept=".xlsx,.xls" ref={bulkWeekFileRef} style={{display:'none'}} onChange={e=>{void importBulkWeekExcel(e.target.files?.[0]);e.target.value='';}}/>
+            <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Загрузить Excel со всеми группами и полностью заменить выбранную неделю" onClick={()=>bulkWeekFileRef.current?.click()}>↑ Импорт Excel в целевую неделю</button>
+          </div>
+          <div className="bulk-week-export-row">
+            <label className="bulk-week-field">Выгрузить неделю
+              <select value={bulkExportWeek||scheduleWeek} onChange={e=>setBulkExportWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select>
+            </label>
+            <button className="btn ghost" onClick={()=>exportOneWeekAllGroupsExcel(weekToolExport)}><Download size={15}/> Экспорт недели в Excel — все группы</button>
+            <small>Скачивает выбранную неделю на отдельных листах групп, включая вручную поставленные ДО. Расписание не изменяет.</small>
+          </div>
+        </div>
+      </details>}
       {remoteChanged && (
         <div className="notice" style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap",margin:"8px 0",background:"#fff7d6",border:"1px solid #e2c15f"}}>
           <span><b>Есть новые изменения от другого администратора.</b> Текущая сетка не перезагружена автоматически, чтобы карточки не «прыгали» во время работы.</span>
@@ -22808,6 +23152,9 @@ function SubstitutionsPanel({ data, set, onPublish }) {
   const [publishing, setPublishing] = useState(false);
   const [publishMsg, setPublishMsg] = useState("");
   const [exportMsg, setExportMsg] = useState("");
+  const [importMsg, setImportMsg] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const importSubFileRef = useRef(null);
   const [filterGroupId, setFilterGroupId] = useState("");
   const [filterTeacherId, setFilterTeacherId] = useState("");
   const [onlyChanged, setOnlyChanged] = useState(false);
@@ -22817,10 +23164,103 @@ function SubstitutionsPanel({ data, set, onPublish }) {
     return <div className="section"><header className="section-head"><h1>Замены</h1></header><div className="notice">Сначала сгенерируйте расписание на вкладке «Расписание».</div></div>;
   }
 
+  const importSubstitutionsFile = async (file) => {
+    if (!file || importBusy) return;
+    setImportBusy(true); setImportMsg("");
+    try {
+      const book = XLSX.read(await file.arrayBuffer(), {type:"array", cellDates:false});
+      const required = ["Дата","Группа","Предмет","Тип изменения","ID записи"];
+      const normalize = (v) => String(v ?? "").trim().toLocaleLowerCase("ru-RU").replace(/ё/g,"е").replace(/\s+/g," ");
+      const parsed = new Map();
+      for (const sheetName of book.SheetNames) {
+        const rows = XLSX.utils.sheet_to_json(book.Sheets[sheetName], {defval:"",raw:false});
+        if (!rows.length || !required.every(k=>Object.prototype.hasOwnProperty.call(rows[0],k))) continue;
+        for (const r of rows) {
+          const id = String(r["ID записи"]||"").trim();
+          if (!id) continue;
+          if (!parsed.has(id)) parsed.set(id,r);
+        }
+      }
+      if (!parsed.size) throw new Error("Нет таблиц с колонками 'Дата', 'Группа', 'Предмет', 'Тип изменения', 'ID записи'.");
+      const current = data.substitutions || [];
+      const currentIds = new Set(current.map(s=>String(s.id)));
+      const scheduleInsts = data.schedule?.instances || [];
+      const instById = new Map(scheduleInsts.map(i=>[String(i.instId),i]));
+      const assignments = data.schedule?.assignment || {};
+      const groupByName = new Map((data.groups||[]).map(g=>[normalize(g.name),String(g.id)]));
+      const teacherByName = new Map((data.teachers||[]).map(t=>[normalize(t.name),String(t.id)]));
+      const roomByName = new Map((data.rooms||[]).map(r=>[normalize(r.name),String(r.id)]));
+      const subjectsById = new Map((data.subjects||[]).map(x=>[String(x.id),normalize(x.name)]));
+      const dateISO = (v) => {
+        const str=String(v||"").trim();
+        if (/^\d{4}-\d{2}-\d{2}/.test(str))return str.slice(0,10);
+        const m=str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+        return m?`${m[3]}-${m[2]}-${m[1]}`:"";
+      };
+      let skipped=0, unresolved=0;
+      const additions=[];
+      const sampleUnresolved=[];
+      for (const [id,r] of parsed) {
+        if (currentIds.has(id)){skipped++;continue;}
+        const date=dateISO(r["Дата"]);
+        if(!date)throw new Error(`Неправильная дата в записи ${id}`);
+        const groupName=normalize(r["Группа"]), subjectName=normalize(r["Предмет"]);
+        const groupId=groupByName.get(groupName)||"";
+        const sourceInstId=String(r["ID занятия"]||"").trim();
+        let inst=instById.get(sourceInstId);
+        if(!inst) {
+          const options=scheduleInsts.filter(i=>{
+            const groups=streamGroups(i).map(String);
+            if (!groupId || (!groups.includes(groupId) && String(i.groupId)!==groupId))return false;
+            const subj=subjectsById.get(String(i.subjectId)) || subjectsById.get(String((data.loads||[]).find(l=>String(l.id)===String(i.loadId))?.subjectId||""));
+            return subj===subjectName && assignments[i.instId]?.day===weekdayOf(date) && instanceAppliesToDate(data.config,i,date);
+          });
+          const pair=Number(r["Пара до"]);
+          const narrowed=Number.isFinite(pair)&&pair>0?options.filter(i=>assignments[i.instId]?.period===pair-1):options;
+          if(narrowed.length===1)inst=narrowed[0];
+          else if(options.length===1)inst=options[0];
+        }
+        if(!inst) {unresolved++;if(sampleUnresolved.length<6)sampleUnresolved.push(`${r["Дата"]} ${r["Группа"]} — ${r["Предмет"]}`);}
+        const rawType=normalize(r["Тип изменения"]);
+        const type=rawType.includes("задани")?"cancel_assignment":rawType.includes("отмен")?"cancel":rawType.includes("перенос")?"moved":rawType.includes("ожида")?"pending_move":"sub";
+        const oldTeacher=normalize(r["Был преподаватель"]),newTeacher=normalize(r["Стал преподаватель"]);
+        const oldRoom=normalize(r["Аудитория до"]),newRoom=normalize(r["Аудитория после"]);
+        const teacherId=teacherByName.get(newTeacher)||"";
+        const roomId=roomByName.get(newRoom)||"";
+        const row={id,date,instId:inst?.instId||sourceInstId,type,newTeacherId:teacherId,newRoomId:roomId,note:String(r["Примечание"]||""),importSource:String(r["Источник"]||""),importOriginalInstId:sourceInstId,importGroup:String(r["Группа"]||""),importSubject:String(r["Предмет"]||""),importOldTeacher:String(r["Был преподаватель"]||""),importNewTeacher:String(r["Стал преподаватель"]||""),importOldRoom:String(r["Аудитория до"]||""),importNewRoom:String(r["Аудитория после"]||""),importOldPeriod:String(r["Пара до"]||""),importNewPeriod:String(r["Пара после"]||""),importUnresolved:!inst};
+        if(type==="moved"){
+          row.targetDate=dateISO(r["Дата переноса"]);
+          const targetPeriod=Number(r["Пара после"]);
+          if(Number.isFinite(targetPeriod)&&targetPeriod>0)row.targetPeriod=targetPeriod-1;
+        } else {
+          const afterPeriod=Number(r["Пара после"]);
+          if(Number.isFinite(afterPeriod)&&afterPeriod>0)row.newPeriod=afterPeriod-1;
+        }
+        additions.push(row);
+      }
+      if(!additions.length){setImportMsg(`Новых записей нет. Уже имеются: ${skipped}.`);return;}
+      const warning=unresolved?`\n\nНе привязаны к текущим занятиям: ${unresolved}. Они будут сохранены в журнале с исходным ID, но не появятся поверх расписания, пока связь не восстановлена.\n${sampleUnresolved.join("\n")}`:"";
+      if(!window.confirm(`Импорт замен из ${file.name}\nНовых записей: ${additions.length}\nУже существующих ID: ${skipped}\nТекущее расписание и записи замен не удаляются.${warning}\n\nДобавить записи?`))return;
+      set("substitutions")([...current,...additions]);
+      setImportMsg(`Импортировано ${additions.length}, пропущено существующих ${skipped}, без привязки ${unresolved}. Изменения необходимо сохранить в системе.`);
+    } catch(e){setImportMsg(`Ошибка импорта: ${e.message||e}`);} finally {setImportBusy(false);}
+  };
+
   const day = weekdayOf(date);
   const byId = (arr, id) => arr.find((x) => x.id === id);
+  const scheduleInstances = sched.instances || [];
+  const scheduleAssignments = sched.assignment || {};
+  const instanceById = new Map(scheduleInstances.map((inst) => [String(inst.instId), inst]));
   const subs = (data.substitutions || []).filter((s) => s.date === date);
   const subFor = (instId) => subs.find((s) => s.instId === instId);
+  const resolveSourceRow = (instId, sourceDate = date) => {
+    const inst = instanceById.get(String(instId));
+    const a = scheduleAssignments?.[instId] || scheduleAssignments?.[String(instId)];
+    if (!inst || !a) return null;
+    if (typeof a.day === "number" && a.day !== weekdayOf(sourceDate)) return null;
+    if (!instanceAppliesToDate(data.config, inst, sourceDate)) return null;
+    return { inst, a };
+  };
   // v1685: календарное исключение noClasses имеет абсолютный приоритет над
   // обычной недельной сеткой. Раньше страница «Замены» брала все занятия по
   // weekday + week applicability и лишь рисовала предупреждение сверху, поэтому
@@ -22837,11 +23277,11 @@ function SubstitutionsPanel({ data, set, onPublish }) {
     .slice()
     .sort((x, y) => ((subFor(x.inst.instId)?.newPeriod ?? x.a.period) - (subFor(y.inst.instId)?.newPeriod ?? y.a.period)) || ((publicParticipantGroupLabels(data,x.inst).join(", ")||"").localeCompare(publicParticipantGroupLabels(data,y.inst).join(", ")||"")));
 
-  const writeSub = (instId, patch) => {
-    const existing = (data.substitutions || []).find((s) => s.date === date && s.instId === instId);
+  const writeSub = (instId, patch, subDate = date) => {
+    const existing = (data.substitutions || []).find((s) => String(s.date) === String(subDate) && String(s.instId) === String(instId));
     let list;
     if (existing) list = data.substitutions.map((s) => (s.id === existing.id ? { ...s, ...patch } : s));
-    else list = [...(data.substitutions || []), { id: uid(), date, instId, type: "sub", newTeacherId: "", newRoomId: "", note: "", ...patch }];
+    else list = [...(data.substitutions || []), { id: uid(), date: subDate, instId, type: "sub", newTeacherId: "", newRoomId: "", note: "", ...patch }];
     set("substitutions")(list);
   };
   const writeMany = (changes) => {
@@ -22853,10 +23293,11 @@ function SubstitutionsPanel({ data, set, onPublish }) {
     }
     set("substitutions")(list);
   };
-  const removeSub = (instId) => set("substitutions")((data.substitutions || []).filter((s) => !(s.date === date && s.instId === instId)));
+  const removeSub = (instId, subDate = date) => set("substitutions")((data.substitutions || []).filter((s) => !(String(s.date) === String(subDate) && String(s.instId) === String(instId))));
   const markPendingMove = (instId) => writeSub(instId,{type:"pending_move",targetDate:"",targetPeriod:null,note:"Занятие отменено; требуется назначить перенос"});
-  const scheduleMove = (instId, targetDate, targetPeriod, newFormat = "", newRoomId = "") => {
-    const row=baseRows.find((r)=>r.inst.instId===instId); if(!row||!targetDate)return false;
+  const scheduleMove = (instId, targetDate, targetPeriod, newFormat = "", newRoomId = "", sourceDate = date) => {
+    const row = resolveSourceRow(instId, sourceDate) || baseRows.find((r)=>String(r.inst.instId)===String(instId));
+    if(!row||!targetDate)return false;
     const period=Number(targetPeriod);
     const effectiveFormat=newFormat||row.inst.format||"inperson";
     const effectiveRoomId=effectiveFormat==="remote"?"":(newRoomId||row.a.roomId||"");
@@ -22865,7 +23306,7 @@ function SubstitutionsPanel({ data, set, onPublish }) {
 ${warnings.join("\n")}
 
 Всё равно назначить перенос?`))return false;
-    writeSub(instId,{type:"moved",targetDate,targetPeriod:period,newFormat:effectiveFormat||undefined,newRoomId:effectiveFormat==="remote"?"":effectiveRoomId||undefined,note:`Перенос с ${formatDateDM(date)}`});
+    writeSub(instId,{type:"moved",targetDate,targetPeriod:period,newFormat:effectiveFormat||undefined,newRoomId:effectiveFormat==="remote"?"":effectiveRoomId||undefined,note:`Перенос с ${formatDateDM(sourceDate)}`}, sourceDate);
     return true;
   };
 
@@ -22941,6 +23382,36 @@ ${warnings.join("\n")}
     if(target) writeMany([{instId:source.inst.instId,patch:{type:"sub",newPeriod:targetPeriod}},{instId:target.inst.instId,patch:{type:"sub",newPeriod:sourcePeriod}}]);
     else writeSub(source.inst.instId,{type:"sub",newPeriod:targetPeriod});
   };
+
+  const pendingItems = (data.substitutions || [])
+    .filter((x) => x.type === "pending_move")
+    .map((x) => {
+      const source = resolveSourceRow(x.instId, x.date);
+      const inst = source?.inst || instanceById.get(String(x.instId));
+      const assignment = source?.a || scheduleAssignments?.[x.instId] || scheduleAssignments?.[String(x.instId)] || null;
+      const groupLabel = inst
+        ? (publicParticipantGroupLabels(data, inst).join(", ") || byId(data.groups, inst.groupId)?.name || x.importGroup || "—")
+        : (x.importGroup || "—");
+      const subjectLabel = inst
+        ? (byId(data.subjects, inst.subjectId)?.name || x.importSubject || "—")
+        : (x.importSubject || "—");
+      const teacherLabel = inst
+        ? (instanceTeacherNames(data, inst).join(", ") || byId(data.teachers, inst.teacherId)?.name || x.importOldTeacher || x.importNewTeacher || "—")
+        : (x.importOldTeacher || x.importNewTeacher || "—");
+      const periodValue = Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) + 1 : null;
+      return {
+        sub: x,
+        inst,
+        assignment,
+        source,
+        groupLabel,
+        subjectLabel,
+        teacherLabel,
+        periodLabel: periodValue ? `${periodValue} пара` : (x.importOldPeriod ? `${x.importOldPeriod} пара` : "Пара не указана"),
+        canAssign: Boolean(source && assignment),
+      };
+    })
+    .sort((a, b) => String(a.sub?.date || "").localeCompare(String(b.sub?.date || "")) || String(a.groupLabel || "").localeCompare(String(b.groupLabel || ""), "ru"));
 
   const excelDateFull = (value) => {
     const m = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -23125,30 +23596,33 @@ ${warnings.join("\n")}
         <SearchableSelect value={filterTeacherId} onChange={setFilterTeacherId} options={[{value:"",label:"Все преподаватели"},...(data.teachers||[]).map((t)=>({value:t.id,label:t.name}))]} placeholder="Все преподаватели"/>
         <label className="inline-check"><input type="checkbox" checked={onlyChanged} onChange={(e)=>setOnlyChanged(e.target.checked)}/> только изменённые</label>
         {(filterGroupId||filterTeacherId||onlyChanged)&&<button className="btn ghost sm" onClick={()=>{setFilterGroupId("");setFilterTeacherId("");setOnlyChanged(false);}}>Сбросить фильтры</button>}
+        <input ref={importSubFileRef} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>{void importSubstitutionsFile(e.target.files?.[0]);e.target.value="";}} />
+        <button className="btn ghost sm" disabled={importBusy} onClick={()=>importSubFileRef.current?.click()} title="Добавить записи замен из Excel без удаления существующих">{importBusy?"Импортирую…":"↑ Импорт записей замен"}</button>
         <button className="btn ghost sm" onClick={()=>exportSubstitutionsExcel("week")} title="Выгрузить все замены, отмены и переносы за неделю выбранной даты"><Download size={14}/> Excel за неделю</button>
         <button className="btn ghost sm" onClick={()=>exportSubstitutionsExcel("month")} title="Выгрузить все замены, отмены и переносы за календарный месяц выбранной даты"><Download size={14}/> Excel за месяц</button>
         {noOrdinaryClassesToday&&<span className="holiday-warn">⛔ день без обычных занятий</span>}
       </div>
+      {importMsg&&<div className="notice">{importMsg}</div>}
       {exportMsg&&<div className="notice">{exportMsg}</div>}
       {noOrdinaryClassesToday && subs.length>0 && <div className="notice">На этой дате отключено обычное расписание. Сохранённые ранее операции замены для регулярных пар не применяются к закрытому дню и не выводятся в список.</div>}
       {error&&<div className="notice conflict-notice"><AlertTriangle size={15}/>{error}</div>}
-      <div className="table-wrap"><table><thead><tr><th></th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Преподаватель</th><th>Ауд.</th><th>Замена</th></tr></thead><tbody>
+      <div className="table-wrap substitutions-table-wrap"><table className="substitutions-table"><thead><tr><th className="drag-col"></th><th className="pair-col">Пара</th><th className="group-col">Группа</th><th className="subject-col">Дисциплина</th><th className="teacher-col">Преподаватель</th><th className="room-col">Ауд.</th><th className="change-col">Замена</th></tr></thead><tbody>
         {rows.map((row)=>{
           const {inst,a}=row; const {subj}=lessonLabel(inst,data); const groupLabels=publicParticipantGroupLabels(data,inst); const group=groupLabels.join(", ")||byId(data.groups,inst.groupId)?.name||""; const teacherNames=instanceTeacherNames(data,inst); const teacher=teacherNames.join(", ")||byId(data.teachers,inst.teacherId)?.name||""; const room=assignmentRoomLabel(data,a)||""; const sub=subFor(inst.instId); const editing=editingKey===inst.instId; const effPeriod=sub?.newPeriod??a.period; const effFormat=sub?.newFormat||inst.format; const effRoomId=sub?.newRoomId||a.roomId||""; const effRoom=effFormat==="remote"?"ДО":(byId(data.rooms,effRoomId)?.name||room||"—"); const roomChanged=effFormat==="remote"?inst.format!=="remote":(!!sub?.newRoomId&&String(sub.newRoomId)!==String(a.roomId||"")); const isStream=(streamGroups(inst)||[]).length>1;
           return <tr key={inst.instId} draggable onDragStart={()=>setDraggingId(inst.instId)} onDragEnd={()=>{setDraggingId(null);setDropId(null)}} onDragOver={(e)=>{e.preventDefault();setDropId(inst.instId)}} onDrop={(e)=>{e.preventDefault(); if(draggingId&&draggingId!==inst.instId)moveOrSwap(draggingId,effPeriod);setDraggingId(null);setDropId(null)}} className={`sub-row${draggingId===inst.instId?" dragging":""}${dropId===inst.instId?" drop-target":""}${sub?.type==="cancel"||sub?.type==="cancel_assignment"||sub?.type==="pending_move"||sub?.type==="moved"?" change-old-row":""}${sub&&!["cancel","cancel_assignment","pending_move","moved"].includes(sub.type)?" change-new-row":""}`}>
-            <td><span className="drag-handle" title="Перетащить">⋮⋮</span></td><td><b>{effPeriod+1}</b>{effPeriod!==a.period&&<div className="computer-hint">было: {a.period+1}</div>}</td><td>{group}{authoritativeSubgroupForInstance(data, inst)?` (п/г ${authoritativeSubgroupForInstance(data, inst)})`:""}{isStream&&<div><span className="sub-badge stream">🔗 поток</span></div>}</td><td>{subj}</td><td>{teacher}</td><td>{effRoom}{roomChanged&&room&&<div className="computer-hint">было: {room}</div>}</td><td>
+            <td className="drag-col"><span className="drag-handle" title="Перетащить">⋮⋮</span></td><td className="pair-col"><div className="sub-cell-pair"><b>{effPeriod+1}</b>{effPeriod!==a.period&&<div className="computer-hint">было: {a.period+1}</div>}</div></td><td className="group-col"><div className="sub-cell-main">{group}{authoritativeSubgroupForInstance(data, inst)?` (п/г ${authoritativeSubgroupForInstance(data, inst)})`:""}{isStream&&<div><span className="sub-badge stream">🔗 поток</span></div>}</div></td><td className="subject-col"><div className="sub-cell-main">{subj}</div></td><td className="teacher-col"><div className="sub-cell-main">{teacher}</div></td><td className="room-col"><div className="sub-cell-main">{effRoom}{roomChanged&&room&&<div className="computer-hint">было: {room}</div>}</div></td><td className="change-col">
             {sub ? <div className="sub-edit" style={{flexWrap:"wrap"}}>{sub.type==="cancel"?<span className="sub-badge cancel">отмена</span>:sub.type==="cancel_assignment"?<><span className="sub-badge cancel">отмена</span><span className="sub-badge assignment">выдача задания</span></>:sub.type==="pending_move"?<><span className="sub-badge pending">перенос не назначен</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Назначить перенос</button></>:sub.type==="moved"?<><span className="sub-badge moved">перенос → {formatDateDM(sub.targetDate)} · {Number(sub.targetPeriod)+1} пара</span>{sub.newFormat==="remote"&&<span className="sub-badge remote-change">ДО</span>}<button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:sub.targetDate,targetPeriod:sub.targetPeriod,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>Изменить</button></>:sub.type==="join_subgroup"?<><span className="sub-badge teacher-replacement-badge">👤 преподаватель другой подгруппы</span>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>Изменить</button></>:<>
               <label className="sub-period-edit-label">№ пары <select value={effPeriod} onChange={(e)=>moveOrSwap(inst.instId,Number(e.target.value))} title="Изменить порядок / номер пары на выбранную дату">{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label>
               <SearchableSelect value={sub.newTeacherId||inst.teacherId} onChange={(v)=>changeResource(row,{newTeacherId:v})} options={data.teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Преподаватель…"/>
               <select value={sub.newFormat||inst.format} onChange={(e)=>changeResource(row,{newFormat:e.target.value})} title="Формат занятия"><option value="inperson">Очно</option><option value="remote">ДО</option></select><SearchableSelect value={sub.newRoomId||a.roomId||""} onChange={(v)=>changeResource(row,{newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Аудитория…"/><span className="sub-badge replacement">замена</span>
-            </>}<button className="icon-btn" onClick={()=>removeSub(inst.instId)} title="Удалить изменение"><X size={14}/></button></div>
+            </>}<button className="icon-btn" onClick={()=>removeSub(inst.instId, date)} title="Удалить изменение"><X size={14}/></button></div>
             : editing ? <div className="sub-edit" style={{flexWrap:"wrap"}}><label className="sub-period-edit-label">№ пары <select defaultValue={a.period} onChange={(e)=>moveOrSwap(inst.instId,Number(e.target.value))} title="Изменить порядок / номер пары на выбранную дату">{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label><SearchableSelect value="" onChange={(v)=>changeResource(row,{newTeacherId:v})} options={data.teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Новый преподаватель…"/><select defaultValue={inst.format} onChange={(e)=>changeResource(row,{newFormat:e.target.value})}><option value="inperson">Очно</option><option value="remote">ДО</option></select><SearchableSelect value={a.roomId||""} onChange={(v)=>changeResource(row,{newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Новый кабинет…"/>{Number(authoritativeSubgroupForInstance(data,inst)||inst.subgroup||0)>0&&<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>↔ К другой подгруппе…</button>}<button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"cancel",note:"Занятие отменено"})}>Отменить</button><button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"cancel_assignment",note:"Занятие отменено · выдача задания"})}>Отменить · выдача задания</button><button className="btn ghost sm" onClick={()=>markPendingMove(inst.instId)}>Отменить · перенос позже</button><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Перенести на дату…</button><button className="icon-btn" onClick={()=>setEditingKey(null)}><X size={14}/></button></div>
             : <button className="btn ghost sm" onClick={()=>setEditingKey(inst.instId)}><Repeat size={13}/> Заменить</button>}
           </td></tr>;
         })}
         {rows.length===0&&<tr><td colSpan={7} className="empty-row">По выбранным фильтрам занятий нет</td></tr>}
       </tbody></table></div>
-      {(() => { const pending=(data.substitutions||[]).filter((x)=>x.type==="pending_move"); if(!pending.length)return null; return <div className="pending-transfers"><h2 className="sub-heading">Нужно назначить перенос</h2><p className="avail-hint">Отменены конкретные занятия, для которых дата переноса ещё не выбрана.</p>{pending.map((x)=>{const inst=sched.instances.find((i)=>i.instId===x.instId); if(!inst)return null; return <div key={x.id} className="pending-transfer-row"><span><b>{formatDateDM(x.date)}</b> · {byId(data.groups,inst.groupId)?.name||""} · {byId(data.subjects,inst.subjectId)?.name||""} · {byId(data.teachers,inst.teacherId)?.name||""}</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:x.instId,targetDate:x.date,targetPeriod:sched.assignment?.[x.instId]?.period||0,newFormat:inst.format,newRoomId:sched.assignment?.[x.instId]?.roomId||""})}>Назначить перенос</button></div>})}</div>; })()}
+      {pendingItems.length > 0 && <div className="pending-transfers"><div className="pending-transfers-head"><div><h2 className="sub-heading">Нужно назначить перенос</h2><p className="avail-hint">Отменены конкретные занятия, для которых дата переноса ещё не выбрана. Здесь показываются и импортированные записи, даже если они пока не привязаны к текущему расписанию.</p></div><div className="pending-count">{pendingItems.length}</div></div><div className="pending-transfers-list">{pendingItems.map(({ sub, inst, assignment, groupLabel, subjectLabel, teacherLabel, periodLabel, canAssign }) => <div key={sub.id} className={`pending-transfer-row${canAssign ? "" : " unresolved"}`}><div className="pending-transfer-main"><div className="pending-transfer-title"><b>{formatDateDM(sub.date)}</b><span>{groupLabel}</span><span>{subjectLabel}</span></div><div className="pending-transfer-meta"><span>{teacherLabel || "Преподаватель не указан"}</span><span>{periodLabel}</span>{sub.note && <span>{sub.note}</span>}{!canAssign && <span className="pending-warning">Не привязано к текущему расписанию</span>}</div></div><div className="pending-transfer-actions">{canAssign ? <button className="btn ghost sm" onClick={()=>setMoveLater({instId:sub.instId,sourceDate:sub.date,targetDate:"",targetPeriod:Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) : 0,newFormat:inst?.format||"inperson",newRoomId:assignment?.roomId||""})}>Назначить перенос</button> : <button className="btn ghost sm" disabled title="Сначала нужно привязать запись к занятию текущего расписания">Нет связи с занятием</button>}</div></div>)}</div></div>}
       {joinSubgroup && (()=>{
         const source=baseRows.find((r)=>String(r.inst.instId)===String(joinSubgroup.sourceInstId));
         if(!source) return <Modal title="Объединить подгруппы" onClose={()=>setJoinSubgroup(null)}><div className="notice">Исходная подгруппа не найдена на выбранную дату.</div></Modal>;
@@ -23169,7 +23643,7 @@ ${warnings.join("\n")}
           </tbody></table></div>
         </Modal>;
       })()}
-      {moveLater && <Modal title="Назначить перенос конкретной пары" onClose={()=>setMoveLater(null)}><div className="retake-form-grid"><label>Дата переноса<input type="date" value={moveLater.targetDate||""} onChange={(e)=>setMoveLater({...moveLater,targetDate:e.target.value})}/></label><label>Пара<select value={moveLater.targetPeriod??0} onChange={(e)=>setMoveLater({...moveLater,targetPeriod:Number(e.target.value)})}>{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label><label>Формат<select value={moveLater.newFormat||"inperson"} onChange={(e)=>setMoveLater({...moveLater,newFormat:e.target.value,newRoomId:e.target.value==="remote"?"":(moveLater.newRoomId||"")})}><option value="inperson">Очно</option><option value="remote">ДО</option></select></label>{(moveLater.newFormat||"inperson")!=="remote"&&<label>Аудитория<SearchableSelect value={moveLater.newRoomId||""} onChange={(v)=>setMoveLater({...moveLater,newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Выберите аудиторию…"/></label>}</div><div className="inspect-actions"><button className="btn ghost" onClick={()=>setMoveLater(null)}>Отмена</button><button className="btn primary" disabled={!moveLater.targetDate} onClick={()=>{if(scheduleMove(moveLater.instId,moveLater.targetDate,moveLater.targetPeriod,moveLater.newFormat,moveLater.newRoomId))setMoveLater(null)}}>Назначить перенос</button></div></Modal>}
+      {moveLater && <Modal title="Назначить перенос конкретной пары" onClose={()=>setMoveLater(null)}><div className="retake-form-grid"><label>Исходная дата<input type="date" value={moveLater.sourceDate||date} disabled /></label><label>Дата переноса<input type="date" value={moveLater.targetDate||""} onChange={(e)=>setMoveLater({...moveLater,targetDate:e.target.value})}/></label><label>Пара<select value={moveLater.targetPeriod??0} onChange={(e)=>setMoveLater({...moveLater,targetPeriod:Number(e.target.value)})}>{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label><label>Формат<select value={moveLater.newFormat||"inperson"} onChange={(e)=>setMoveLater({...moveLater,newFormat:e.target.value,newRoomId:e.target.value==="remote"?"":(moveLater.newRoomId||"")})}><option value="inperson">Очно</option><option value="remote">ДО</option></select></label>{(moveLater.newFormat||"inperson")!=="remote"&&<label>Аудитория<SearchableSelect value={moveLater.newRoomId||""} onChange={(v)=>setMoveLater({...moveLater,newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Выберите аудиторию…"/></label>}</div><div className="inspect-actions"><button className="btn ghost" onClick={()=>setMoveLater(null)}>Отмена</button><button className="btn primary" disabled={!moveLater.targetDate} onClick={()=>{if(scheduleMove(moveLater.instId,moveLater.targetDate,moveLater.targetPeriod,moveLater.newFormat,moveLater.newRoomId,moveLater.sourceDate||date))setMoveLater(null)}}>Назначить перенос</button></div></Modal>}
     </div>
   );
 }
@@ -29828,7 +30302,12 @@ input[type="text"], select { width: 100%; }
 .bell-schedule-modal{max-width:980px;background:#fff}.bell-preset-modal{width:min(960px,calc(100vw - 32px));height:min(760px,calc(100dvh - 28px));max-height:calc(100dvh - 28px);overflow:hidden;padding:18px;display:flex;flex-direction:column;min-height:0}.bell-preset-modal>.modal-title-row{flex:0 0 auto}.bell-multi-grid{display:grid;grid-template-columns:minmax(250px,.72fr) minmax(500px,1.5fr);gap:14px;margin-top:14px;min-height:0;flex:1 1 auto;overflow-y:auto;overflow-x:hidden;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:4px}.bell-group-picker-panel,.bell-day-preset-panel{background:#fff;border:1px solid #d7dde5;border-radius:12px;padding:14px;min-width:0}.bell-group-picker-panel{display:flex;flex-direction:column;min-height:0}.bell-group-picker{max-height:min(420px,calc(100vh - 260px));overflow:auto;display:flex;flex-direction:column;gap:6px;margin-top:8px;padding-right:4px}.bell-group-choice{display:flex;align-items:center;gap:9px;padding:9px 10px;border:1px solid #d7dde5;border-radius:9px;background:#fff;cursor:pointer;transition:.12s ease}.bell-group-choice:hover{border-color:#9eb5d0;background:#f8fbff}.bell-group-choice.active{border-color:#285786;background:#e9f2ff;box-shadow:inset 3px 0 #285786}.bell-selected-hint{margin-top:9px;padding-top:8px;border-top:1px solid #edf0f4}.bell-day-heading{display:flex;align-items:center;justify-content:space-between;gap:12px}.bell-day-count{font-size:12px;color:#687383}.bell-day-picker{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:12px 0 8px}.bell-day-btn{min-height:42px;border:1px solid #cfd6df;background:#fff;border-radius:9px;padding:8px 10px;cursor:pointer;display:flex;align-items:center;justify-content:flex-start;gap:7px;font-weight:600;color:#273646;transition:.12s ease}.bell-day-btn:hover{border-color:#7999bc;background:#f5f9fd}.bell-day-btn.active{background:#21466f!important;color:#fff!important;border-color:#21466f!important;box-shadow:0 0 0 2px rgba(33,70,111,.16)}.bell-day-check{width:18px;height:18px;border:1px solid #b8c2cf;border-radius:5px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;flex:0 0 18px;background:#fff;color:#21466f}.bell-day-btn.active .bell-day-check{background:#fff;border-color:#fff;color:#21466f;font-weight:900}.bell-selected-days{margin:8px 0 10px;padding:8px 10px;background:#eef5ff;border:1px solid #c8daee;border-radius:8px;font-size:12px;color:#294b70;line-height:1.35}.bell-existing-summary{font-size:12px;color:var(--ink-soft);background:#f7f8fa;border:1px solid #e8ebef;border-radius:10px;padding:10px;margin-top:10px;display:flex;flex-direction:column;gap:8px}.bell-existing-title{font-weight:700;color:#4a5563}.bell-existing-note{font-size:11px;line-height:1.45;color:#5f6d7d;background:#fff;border:1px solid #e6eaf0;border-radius:8px;padding:8px 10px}.bell-existing-row{display:grid;grid-template-columns:minmax(160px,220px) minmax(0,1fr);gap:10px;align-items:flex-start;background:#fff;border:1px solid #e1e6ed;border-radius:9px;padding:8px 10px}.bell-existing-row.active{border-color:#8cb0d5;box-shadow:0 0 0 2px rgba(33,70,111,.08)}.bell-existing-scope{display:flex;flex-direction:column;gap:3px;line-height:1.25;color:#243447}.bell-existing-scope b{font-size:12px}.bell-existing-scope small{font-size:10px;color:#758395}.bell-existing-chips{display:flex;flex-wrap:wrap;gap:5px;align-items:center}.bell-preset-chip{border:1px solid var(--line);background:white;border-radius:999px;padding:4px 7px;font-size:10px;line-height:1.3}.bell-preset-chip.voz{background:#edf7fb;border-color:#b9d9e9;color:#315a70}.bell-preset-chip.mixed{background:#fff8e9;border-color:#e7c272;color:#735522}.bell-preset-chip.custom{background:#f4f0ff;border-color:#d3c7f5;color:#5f4aa0}.bell-preset-chip.inherited{border-style:dashed}.bell-preset-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}.bell-preset-card{min-height:92px;border:1px solid #cfd6df;border-radius:10px;background:#fff;padding:12px 13px;text-align:left;cursor:pointer;display:flex;flex-direction:column;gap:7px;justify-content:flex-start}.bell-preset-card:hover:not(:disabled){border-color:#7897b8;box-shadow:0 2px 8px rgba(30,58,95,.08)}.bell-preset-card b{font-size:13px}.bell-preset-card span{font-size:10px;color:var(--ink-soft);line-height:1.5}.bell-preset-card.voz{background:#f2f9fd;border-color:#b9d9e9}.bell-preset-card:disabled{opacity:.42;cursor:not-allowed}.group-custom-bell-time{font-size:10px;font-weight:700;color:#315a70;background:#edf7fb;border:1px solid #c7e5f1;border-radius:6px;padding:2px 5px;margin:2px 0 5px;display:inline-block}.modal-title-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.modal-title-row h3{margin:0}.modal-title-row p{margin:5px 0 0;max-width:720px}@media(max-width:900px){.bell-existing-row{grid-template-columns:1fr}}@media(max-width:820px){.bell-preset-modal{overflow:auto}.bell-multi-grid,.bell-preset-actions{grid-template-columns:1fr}.bell-group-picker{max-height:220px}.bell-day-picker{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .period-num { width: 20px; text-align: center; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: var(--ink-soft); }
 
-.schedule-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
+.schedule-toolbar.schedule-dashboard { display: grid; gap: 12px; margin-bottom: 18px; align-items: stretch; }
+.schedule-toolbar-block{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#f8fafc}
+.schedule-toolbar-tools{background:#fbfcff}
+.schedule-toolbar-navigation{background:#fff}
+.schedule-toolbar-actions{background:#fcfcfa}
+.schedule-toolbar-block > .btn,.schedule-toolbar-block > select,.schedule-toolbar-block > .publish-controls,.schedule-toolbar-block > .admin-week-nav,.schedule-toolbar-block > .weekly-mode-controls,.schedule-toolbar-block > .all-teachers-filters,.schedule-toolbar-block > .view-switch{margin:0}
 .view-switch { display: flex; gap: 4px; background: var(--paper-2); padding: 3px; border-radius: 9px; }
 .pill { border: none; background: transparent; padding: 7px 12px; border-radius: 7px; font-size: 12.5px; font-weight: 600; color: var(--ink-soft); cursor: pointer; }
 .pill.on { background: #fff; color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,0.08); }
@@ -29847,7 +30326,7 @@ input[type="text"], select { width: 100%; }
 .semester-manual-row:hover td { background: #eef5ff; }
 .semester-manual-hint { margin-top: 6px; font-size: 12px; color: var(--primary); font-weight: 600; }
 
-.publish-controls{display:flex;align-items:stretch;gap:6px}.publish-scope-select{min-width:150px;max-width:220px;border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:0 9px;font-size:12px;color:var(--ink)}.publish-status{font-size:11px;color:var(--ink-soft);max-width:260px}.conflict-notice{display:flex;gap:8px;align-items:center;margin:10px 0}.semester-print-head{display:none}.drag-handle{cursor:grab;color:var(--ink-soft);font-size:16px}.sub-row.dragging{opacity:.45}.sub-row.drop-target{outline:2px dashed #64748b;outline-offset:-2px}.sub-conflict{color:#9b2c2c;font-size:11px;margin-top:5px}
+.publish-controls{display:flex;align-items:stretch;gap:6px;flex-wrap:wrap}.publish-scope-select{min-width:170px;max-width:240px;border:1px solid var(--line);border-radius:8px;background:var(--panel);padding:0 9px;font-size:12px;color:var(--ink)}.publish-status{font-size:11px;color:var(--ink-soft);max-width:380px}.schedule-toolbar-meta{flex:1 1 320px}.conflict-notice{display:flex;gap:8px;align-items:center;margin:10px 0}.semester-print-head{display:none}.drag-handle{cursor:grab;color:var(--ink-soft);font-size:16px}.sub-row.dragging{opacity:.45}.sub-row.drop-target{outline:2px dashed #64748b;outline-offset:-2px}.sub-conflict{color:#9b2c2c;font-size:11px;margin-top:5px}
 @media print{.sidebar,.schedule-toolbar,.stats-row,.role-bar,.public-footer,.section-head p,.unplaced-block,.all-good{display:none!important}.semester-print-head{display:block!important;margin-bottom:14px}.semester-all-admin{overflow:visible}.semester-public-table{min-width:0;font-size:9pt}.content{padding:0!important}}
 .weekday-label { font-weight: 700; font-size: 13px; color: var(--board); }
 .holiday-warn { font-size: 12px; font-weight: 600; color: #9A6A0E; background: #FBF3E3; padding: 3px 9px; border-radius: 10px; }
@@ -29959,7 +30438,7 @@ input[type="text"], select { width: 100%; }
 .special-place-badge,.special-time-badge{display:inline-flex;align-items:center;width:max-content;margin-top:2px;padding:1px 5px;border-radius:999px;font-size:9.5px;font-weight:700;font-style:normal}.special-place-badge{background:#D9E7FB;color:#294F86}.special-time-badge{background:#E7DAF7;color:#65418D}
 
 .lesson-chip.substituted { background: #E1F3EF; border-left-color: var(--blue); }
-.lesson-chip.pending-move-chip{background:#fff4c7!important;color:#775a00!important;border-left:4px solid #e0ad20!important}.public-event.moved{background:#eeeafd!important;border-left:4px solid #6f5cc2!important}.public-event.cancelled.cancelled-gap-highlight{background:#fff4c7!important;border-left:4px solid #e0ad20!important;color:#775a00!important}.lesson-chip.moved-away-chip{background:#e9eefc!important;color:#344b87!important;border-left:4px solid #6f83c9!important}.lesson-chip .sub-badge.moved,.sub-badge.moved{background:#6f5cc2}.sub-badge.pending{background:#d49b13}.pending-transfers{margin-top:18px;padding:14px;border:1px solid #ead38b;background:#fff9df;border-radius:12px}.pending-transfer-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid rgba(180,145,40,.18)}.pending-transfer-row:first-of-type{border-top:none}.cancelled-gap-highlight{background:#fff4c7!important;box-shadow:inset 0 0 0 2px rgba(224,173,32,.28)}
+.lesson-chip.pending-move-chip{background:#fff4c7!important;color:#775a00!important;border-left:4px solid #e0ad20!important}.public-event.moved{background:#eeeafd!important;border-left:4px solid #6f5cc2!important}.public-event.cancelled.cancelled-gap-highlight{background:#fff4c7!important;border-left:4px solid #e0ad20!important;color:#775a00!important}.lesson-chip.moved-away-chip{background:#e9eefc!important;color:#344b87!important;border-left:4px solid #6f83c9!important}.lesson-chip .sub-badge.moved,.sub-badge.moved{background:#6f5cc2}.sub-badge.pending{background:#d49b13}.pending-transfers{margin-top:18px;padding:16px;border:1px solid #ead38b;background:#fff9df;border-radius:12px;display:grid;gap:12px}.pending-transfers-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}.pending-count{display:inline-flex;align-items:center;justify-content:center;min-width:38px;height:38px;padding:0 12px;border-radius:999px;background:#fff3bf;border:1px solid #e0c166;font-size:16px;font-weight:800;color:#7a5b07}.pending-transfers-list{display:grid;gap:10px}.pending-transfer-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;padding:12px 14px;border:1px solid rgba(180,145,40,.2);border-radius:10px;background:rgba(255,255,255,.72)}.pending-transfer-row.unresolved{background:#fff6ea;border-color:#edcf9f}.pending-transfer-main{display:grid;gap:6px;min-width:0}.pending-transfer-title{display:flex;align-items:center;flex-wrap:wrap;gap:8px;font-size:13px;color:var(--ink)}.pending-transfer-title b{font-size:13.5px}.pending-transfer-title span{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:999px;background:#fff;border:1px solid rgba(180,145,40,.18);font-size:12px}.pending-transfer-meta{display:flex;flex-wrap:wrap;gap:8px;color:var(--ink-soft);font-size:11.5px}.pending-transfer-meta span{display:inline-flex;align-items:center;gap:5px}.pending-transfer-actions{display:flex;justify-content:flex-end;align-items:center}.pending-warning{font-weight:700;color:#9a5d12}.cancelled-gap-highlight{background:#fff4c7!important;box-shadow:inset 0 0 0 2px rgba(224,173,32,.28)}
 .lesson-subject { font-weight: 700; font-size: 12.5px; line-height: 1.25; }
 .lesson-meta { display: flex; flex-direction: column; font-size: 11px; color: #5B4A22; margin-top: 3px; gap: 1px; }
 .lesson-chip.substituted .lesson-meta { color: #2C4570; }
@@ -29999,9 +30478,7 @@ input[type="text"], select { width: 100%; }
 .unplaced-block ul { margin: 8px 0 0 24px; font-size: 12.5px; color: #6B3B3B; }
 .all-good { margin-top: 18px; display: flex; align-items: center; gap: 8px; color: var(--green); font-weight: 600; font-size: 13.5px; }
 
-.sub-row { display: flex; align-items: center; gap: 6px; }
-.sub-edit { display: flex; align-items: center; gap: 6px; }
-.sub-edit select { width: auto; min-width: 160px; }
+.substitutions-table-wrap{border:1px solid var(--line);border-radius:12px;background:#fff;overflow:auto}.substitutions-table{width:100%;min-width:1220px;table-layout:fixed;border-collapse:separate;border-spacing:0}.substitutions-table thead th{position:sticky;top:0;z-index:2;background:#f5f7fa;color:var(--ink);font-size:12px;font-weight:800;padding:11px 10px;border-bottom:1px solid var(--line)}.substitutions-table tbody td{padding:10px;border-bottom:1px solid #ece8df;vertical-align:top;background:#fff}.substitutions-table tbody tr:hover td{background:#fcfbf7}.substitutions-table .drag-col{width:34px;text-align:center}.substitutions-table .pair-col{width:72px}.substitutions-table .group-col{width:220px}.substitutions-table .subject-col{width:250px}.substitutions-table .teacher-col{width:190px}.substitutions-table .room-col{width:120px}.substitutions-table .change-col{width:340px}.sub-cell-main{display:grid;gap:4px;line-height:1.35}.sub-cell-pair{display:grid;gap:2px}.sub-row{display:table-row}.sub-edit{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.sub-edit select{width:auto;min-width:120px}.sub-edit .searchable-select{min-width:180px;max-width:240px;flex:1 1 180px}.substitutions-table .btn.ghost.sm{white-space:nowrap}.sub-row.change-old-row td{background:#fff7f7!important}.sub-row.change-new-row td{background:#fffbee!important}@media(max-width:1100px){.pending-transfer-row{grid-template-columns:1fr}.pending-transfer-actions{justify-content:flex-start}}@media(max-width:900px){.substitutions-table{min-width:980px}.substitutions-table .group-col{width:180px}.substitutions-table .subject-col{width:210px}.substitutions-table .teacher-col{width:170px}.substitutions-table .change-col{width:320px}}
 
 .modal-backdrop { position: fixed; inset: 0; background: rgba(27,36,48,0.55); display: flex; align-items: center; justify-content: center; z-index: 50; }
 .modal-backdrop.slot-picker-backdrop { background: rgba(27,36,48,0.26); }
@@ -30375,7 +30852,79 @@ input[type="text"], select { width: 100%; }
 .schedule-grid:not(.graphs-table) thead .time-col,.schedule-grid:not(.graphs-table) thead .group-col{z-index:31}
 .semester-public-table{width:100%;table-layout:auto}.semester-table-wrap,.grid-wrap{max-width:100%;overflow-x:auto}
 @media(max-width:1100px){.schedule-grid{min-width:860px}.schedule-grid .lesson-chip{padding:6px}.lesson-meta{font-size:10.5px}.graphs-table{min-width:max-content}.all-groups-grid{min-width:1050px}}
-@media(max-width:720px){.section{padding-left:12px!important;padding-right:12px!important}.schedule-grid{min-width:760px}.schedule-grid th:not(.time-col),.schedule-grid td.cell{min-width:105px}.period-time{font-size:9px}.lesson-subject{font-size:11px}.schedule-toolbar,.lists-toolbar{flex-wrap:wrap}.semester-public-table{min-width:820px}}
+
+.bulk-week-tools{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:8px 10px;border:1px solid #cdd6e0;border-radius:10px;background:#fff}
+.bulk-week-field{display:flex;flex-direction:column;gap:4px;font-size:12px;font-weight:700;color:var(--ink-soft)}
+.bulk-week-field select{min-width:120px}
+.view-switch{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:1 1 100%}
+.all-teachers-filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.admin-week-nav,.weekly-mode-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.schedule-toolbar .date-input{min-width:160px}
+.schedule-toolbar .btn{white-space:nowrap}
+.schedule-toolbar .pill{white-space:nowrap}
+.schedule-toolbar-tools .btn,.schedule-toolbar-actions .btn,.schedule-toolbar-navigation .btn{max-width:100%}
+@media(max-width:1200px){.schedule-toolbar-block{padding:10px 12px}.publish-controls{width:100%}.publish-controls .btn.primary{flex:0 0 auto}.schedule-toolbar-actions .btn.primary[style]{order:-1}}
+@media(max-width:900px){.schedule-toolbar-block{gap:8px}.schedule-toolbar .btn,.schedule-toolbar .pill{font-size:12px}.schedule-toolbar .date-input{min-width:140px}.publish-status{max-width:100%}}
+@media(max-width:720px){.section{padding-left:12px!important;padding-right:12px!important}.schedule-grid{min-width:760px}.schedule-grid th:not(.time-col),.schedule-grid td.cell{min-width:105px}.period-time{font-size:9px}.lesson-subject{font-size:11px}.schedule-toolbar,.lists-toolbar{flex-wrap:wrap}.semester-public-table{min-width:820px}.schedule-toolbar-block{padding:10px}.view-switch{gap:6px}.bulk-week-tools{padding:8px}.publish-controls{flex-direction:column;align-items:stretch}.publish-controls .btn.primary,.publish-controls select{width:100%}}
+
+
+/* Dashboard redesign: common tasks visible, utilities collapsed. */
+.schedule-dashboard{width:100%;max-width:100%;box-sizing:border-box}
+.schedule-dashboard .schedule-toolbox{background:#fff;border:1px solid #dce1e7;border-radius:12px;padding:16px 18px;min-width:0}
+.schedule-dashboard .schedule-toolbox-bulk{display:flex;flex-wrap:wrap;align-items:center;gap:14px;background:#f8fbff}
+.schedule-dashboard .schedule-toolbox-title{display:flex;flex-direction:column;gap:3px;font-size:13px;font-weight:800;color:#253950;flex:0 0 190px}
+.schedule-dashboard .schedule-toolbox-title small{font-size:11px;font-weight:400;color:#65768b;line-height:1.35}
+.schedule-dashboard .bulk-week-tools{flex:1 1 630px;border:0;padding:0;background:transparent;gap:10px}
+.schedule-dashboard .bulk-week-field select{min-width:100px;height:37px;background:#fff}
+.schedule-dashboard .bulk-week-tools .btn{min-height:38px}
+.schedule-dashboard .schedule-toolbar-navigation{align-items:center;padding:16px 18px;gap:12px;background:#fff}
+.schedule-dashboard .schedule-toolbar-navigation .schedule-toolbox-title{flex-basis:100%}
+.schedule-dashboard .schedule-toolbar-navigation .view-switch{flex:1 1 100%;background:#f1f2f4;width:100%;padding:4px;border-radius:9px}
+.schedule-dashboard .schedule-toolbar-navigation .view-switch .pill{flex:1 1 auto;text-align:center}
+.schedule-dashboard .schedule-toolbar-navigation > select{flex:1 1 210px;max-width:360px}
+.schedule-dashboard .schedule-entity-nav{flex:1 1 280px;min-width:240px}
+.schedule-dashboard .schedule-entity-nav .searchable-select{min-width:200px}
+.schedule-dashboard .schedule-toolbar-tools,.schedule-dashboard .schedule-toolbar-actions{display:none}
+.schedule-dashboard .schedule-toolbox-publishing{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+.schedule-dashboard .schedule-toolbox-publishing .schedule-toolbox-title{flex:0 0 180px}
+.schedule-dashboard .schedule-primary-row{display:flex;align-items:center;flex-wrap:wrap;gap:10px;flex:1 1 500px}
+.schedule-dashboard .schedule-primary-row .publish-controls{width:auto;display:flex;align-items:center;flex-wrap:wrap}
+.schedule-dashboard .schedule-primary-row .publish-controls select{min-height:39px}
+.schedule-dashboard .schedule-primary-row .publish-controls button{min-height:39px}
+.schedule-dashboard .schedule-secondary-utilities{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.schedule-dashboard .schedule-actions-details{border:1px solid #dce1e7;border-radius:10px;background:#fff;min-width:0}
+.schedule-dashboard .schedule-actions-details summary{cursor:pointer;list-style:none;padding:12px 14px;font-size:12px;font-weight:700;color:#32455b;display:flex;align-items:center;justify-content:space-between;gap:8px;user-select:none}
+.schedule-dashboard .schedule-actions-details summary::-webkit-details-marker{display:none}
+.schedule-dashboard .schedule-actions-details summary:after{content:'⌄';font-size:17px;color:#708094}
+.schedule-dashboard .schedule-actions-details[open] summary:after{transform:rotate(180deg)}
+.schedule-dashboard .schedule-actions-details[open]{grid-column:span 2;border-color:#b7c9df}
+.schedule-dashboard .schedule-details-content{padding:12px;border-top:1px solid #e8edf2;display:flex;align-items:center;flex-wrap:wrap;gap:8px}
+.schedule-dashboard .schedule-details-content .btn{max-width:100%;white-space:normal;text-align:center}
+.schedule-dashboard .schedule-toolbox-bulk > .schedule-actions-details{flex:0 0 100%}
+.schedule-dashboard .schedule-toolbox-publishing > .schedule-actions-details{flex:0 0 100%}
+.schedule-dashboard .schedule-danger-details summary{color:#9a4b45}
+.schedule-dashboard .publish-status{max-width:100%;line-height:1.45}
+@media(max-width:1100px){.schedule-dashboard .schedule-secondary-utilities{grid-template-columns:repeat(2,minmax(0,1fr))}.schedule-dashboard .schedule-toolbox-title{flex-basis:100%}}
+@media(max-width:650px){.schedule-dashboard .schedule-secondary-utilities{grid-template-columns:1fr}.schedule-dashboard .schedule-actions-details[open]{grid-column:span 1}.schedule-dashboard .schedule-toolbox{padding:12px}.schedule-dashboard .schedule-toolbox-navigation{padding:12px}.schedule-dashboard .schedule-primary-row .publish-controls{width:100%}}
+
+
+/* Bulk week operations live outside the main schedule navigation toolbar. */
+.schedule-week-operations{margin:0 0 18px;border:1px solid #d7dfe8;border-radius:11px;background:#fff;overflow:hidden}
+.schedule-week-operations>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:13px 16px;font-size:13px;font-weight:750;color:#253950}
+.schedule-week-operations>summary::-webkit-details-marker{display:none}
+.schedule-week-operations>summary:before{content:'▸';color:#627b97}
+.schedule-week-operations[open]>summary:before{content:'▾'}
+.schedule-week-operations>summary small{font-size:11.5px;color:#748395;font-weight:400}
+.schedule-week-operations-body{padding:15px 16px;border-top:1px solid #e4e9ee}
+.schedule-week-operations-body p{margin:0 0 12px;color:#667486;font-size:12px}
+.schedule-week-operations .bulk-week-tools{display:flex;flex-wrap:wrap;gap:10px;align-items:end;padding:0;border:none;background:transparent}
+.schedule-week-operations .bulk-week-tools .btn{min-height:38px}
+.schedule-week-operations .bulk-week-field select{min-width:130px;height:38px}
+.bulk-week-export-row{display:flex;align-items:end;flex-wrap:wrap;gap:10px;margin-top:14px;padding-top:14px;border-top:1px solid #e4e9ee}
+.bulk-week-export-row .btn{min-height:38px}
+.bulk-week-export-row small{color:#667486;font-size:11.5px;line-height:1.4;flex:1 1 290px;max-width:560px}
+.schedule-dashboard .schedule-toolbox-group-tools{display:flex;align-items:center;flex-wrap:wrap;gap:10px}
+.schedule-dashboard .schedule-toolbox-group-tools>.schedule-actions-details{flex:1 1 250px}
 
 /* v30: cleaner graphs and loads filters */
 .graphs-scroll{max-width:100%;overflow-x:auto;overflow-y:visible;scrollbar-gutter:stable;padding-bottom:4px}
