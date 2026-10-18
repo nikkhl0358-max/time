@@ -698,3 +698,17 @@
    have already fallen into the diagnostic unplaced list. */
 .unplaced-item.unplaced-offgraph { border-color: rgba(220,38,38,.42); background: rgba(254,242,242,.58); }
 .unplaced-offgraph-badge { display:inline-flex; align-items:center; border:1px solid rgba(220,38,38,.45); border-radius:999px; padding:1px 6px; font-size:10px; font-weight:850; line-height:1.35; color:#991b1b; background:#fee2e2; white-space:nowrap; }
+
+/* Public UI refinements */
+.public-refresh-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:34px;padding:7px 13px;border-radius:999px;border:1px solid rgba(255,255,255,.36);background:rgba(255,255,255,.13);box-shadow:0 1px 2px rgba(0,0,0,.08);font-weight:600;letter-spacing:.01em}
+.public-refresh-btn:hover{background:rgba(255,255,255,.24)}
+.public-hero{border-radius:0 0 14px 14px}
+.public-search input,.public-search select{min-height:42px}
+.public-teacher-link{cursor:pointer;text-align:left}
+.timetable-extra-panel{margin:12px 0;padding:15px 18px;border-radius:12px}
+.timetable-extra-panel h3{margin:0 0 10px;font-size:15px}
+.timetable-extra-fields{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:12px}
+.timetable-extra-fields label{display:flex;flex:1 1 180px;flex-direction:column;gap:5px;font-size:12px;font-weight:600}
+.timetable-extra-fields input,.timetable-extra-fields select{min-width:0;width:100%;height:37px}
+.timetable-orphan-list{max-height:260px;overflow:auto}
+.timetable-orphan-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #dce3eb}

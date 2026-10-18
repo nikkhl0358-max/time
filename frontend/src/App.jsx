@@ -11,7 +11,7 @@ import { expandTransferLoadIds, resolveTransferParticipantLoadId, splitRemaining
 import {
   Plus, Trash2, Wand2, Download, Settings, Users, MapPin, BookOpen,
   GraduationCap, AlertTriangle, CheckCircle2, Loader2, ClipboardList,
-  Layers, Building2, ListTree, Repeat, Lock, Unlock, X, School, UserSquare2, CalendarDays, Megaphone,
+  Layers, Building2, ListTree, Repeat, Lock, Unlock, X, School, UserSquare2, CalendarDays, Megaphone, RefreshCw,
 } from "lucide-react";
 
 /* ============================== helpers ============================== */
@@ -20579,42 +20579,38 @@ ${check.reason || "Конфликт расписания"}
       alert("Нет преподавателей для выгрузки. Проверьте выбранные ЦК, букву или строку поиска.");
       return;
     }
-    const aoa = [[
-      "Преподаватель","ЦК","День","Время",...(semester ? ["Даты"] : []),
-      "Дисциплина / вид занятия","Аудитория","Учебные группы"
-    ]];
+    const wb = XLSX.utils.book_new();
+    const used = new Set();
     for (const teacher of teachers) {
       const rows = semester ? excelSemesterRowsForEntity("teacher",teacher.id) : excelWeekRowsForEntity("teacher",teacher.id);
-      const department = depName.get(String(teacher.departmentId)) || "Без ЦК";
-      if (!rows.length) {
-        aoa.push([teacher.name || "",department,"","",...(semester ? [""] : []),"Нет занятий","",""]);
-        continue;
-      }
+      const monday = data.config.semesterStart ? addDays(mondayOf(data.config.semesterStart),(scheduleWeek-1)*7) : "";
+      const aoa = [
+        [teacher.name || ""],
+        [semester ? "Расписание на весь семестр" : `${monday ? formatDateDM(monday) : ""} — ${monday ? formatDateDM(addDays(monday,6)) : ""}`],
+        ["День", "Время", "Название", "Места проведения", "Учебные группы"]
+      ];
       for (const row of rows) {
-        const dayDate = !semester && data.config.semesterStart
-          ? addDays(mondayOf(data.config.semesterStart),(scheduleWeek - 1) * 7 + Number(row.day || 0))
-          : "";
-        const dayLabel = `${DAY_LABELS_FULL[row.day] || ""}${dayDate ? ` ${formatDateDM(dayDate)}` : ""}`.trim();
-        aoa.push([
-          teacher.name || "", department, dayLabel, row.time || "",
-          ...(semester ? [excelSemesterDatesCaption(row.dates || [])] : []),
-          row.title || "", row.room || "", row.groups || ""
-        ]);
+        const date = !semester && monday ? addDays(monday,Number(row.day||0)) : "";
+        const day = `${DAY_LABELS_FULL[row.day] || ""}${date ? `, ${formatDateDM(date)}` : ""}`;
+        aoa.push([day, row.time || "", `${row.title||""}${semester && row.dates?.length ? `\n${excelSemesterDatesCaption(row.dates)}` : ""}`,row.room||"",row.groups||""]);
       }
+      if (!rows.length) aoa.push(["Занятий нет"]);
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws["!cols"] = [{wch:24},{wch:19},{wch:62},{wch:27},{wch:35}];
+      ws["!rows"] = [{hpt:26},{hpt:23},{hpt:28},...rows.map(()=>({hpt:38}))];
+      ws["!merges"] = [{s:{r:0,c:0},e:{r:0,c:4}},{s:{r:1,c:0},e:{r:1,c:4}}];
+      for(let r=0;r<aoa.length;r++)for(let c=0;c<aoa[r].length;c++){
+        const addr=XLSX.utils.encode_cell({r,c});if(!ws[addr])continue;
+        ws[addr].s={font:{bold:r<3,sz:r===0?15:11,color:{rgb:r===2?"FFFFFF":"25354A"}},
+          fill:r===2?{fgColor:{rgb:"254E7A"}}:(r>2&&r%2===0?{fgColor:{rgb:"F1F6FB"}}:undefined),
+          alignment:{vertical:"center",wrapText:true},border:r>=2?{bottom:{style:"hair",color:{rgb:"D9E2EC"}}}:undefined};
+      }
+      const base=String(teacher.name||"Преподаватель").replace(/[\\\/:*?\[\]]/g,"").slice(0,31)||"Преподаватель";
+      let title=base, n=2;while(used.has(title)){title=base.slice(0,27)+`_${n++}`;}used.add(title);
+      XLSX.utils.book_append_sheet(wb,ws,title);
     }
-    const ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws["!cols"] = semester
-      ? [{wch:32},{wch:28},{wch:22},{wch:18},{wch:28},{wch:52},{wch:28},{wch:34}]
-      : [{wch:32},{wch:28},{wch:22},{wch:18},{wch:52},{wch:28},{wch:34}];
-    ws["!autofilter"] = { ref: XLSX.utils.encode_range({s:{r:0,c:0},e:{r:Math.max(0,aoa.length-1),c:aoa[0].length-1}}) };
-    const headerStyle = {font:{bold:true},alignment:{horizontal:"center",vertical:"center",wrapText:true}};
-    const bodyStyle = {alignment:{vertical:"top",wrapText:true}};
-    for (let c=0;c<aoa[0].length;c++) { const addr=XLSX.utils.encode_cell({r:0,c}); if (ws[addr]) ws[addr].s=headerStyle; }
-    for (let r=1;r<aoa.length;r++) for (let c=0;c<aoa[0].length;c++) { const addr=XLSX.utils.encode_cell({r,c}); if (ws[addr]) ws[addr].s=bodyStyle; }
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb,ws,"Преподаватели");
     const scope = semester ? "ves_semester" : `nedelya_${scheduleWeek}`;
-    XLSX.writeFile(wb,`raspisanie_po_prepodavatelyam_${scope}.xlsx`,{cellStyles:true});
+    XLSX.writeFile(wb,`raspisanie_Vse_prepodavateli_${scope}.xlsx`,{cellStyles:true});
   };
 
   const exportScheduleExcel = () => {
@@ -21525,6 +21521,15 @@ th{background:#1E3A5F;color:#ffffff;}
             <Stat label="Закреплено вручную" value={overallSemesterStats.locked || 0} />
           </div>
         </div>
+      )}
+
+      {sched && (data.substitutions||[]).some(x=>x.importUnresolved||x.manualCancellation) && (
+        <section className="unplaced-block diagnostic-block" style={{background:"#fff8ed",borderColor:"#e5d5b9"}}>
+          <div className="unplaced-head"><AlertTriangle size={17}/><div><strong>Неназначенные отмены / пары для будущей замены — {(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).length}</strong><div className="unplaced-subtitle">Импортированные из Excel записи без однозначной связи с текущей сеткой. Они не удалены и не считаются проведёнными занятиями. Чтобы оформить замену, используйте раздел «Замены / отмены / переносы».</div></div></div>
+          <div className="unplaced-diagnostics" style={{maxHeight:420,overflowY:"auto"}}>
+            {(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).sort((a,b)=>String(a.date).localeCompare(String(b.date))).map(x=><div className="unplaced-item" key={x.id} style={{padding:"9px 12px"}}><strong>{x.importGroup||"Группа не определена"} · {x.importSubject||"Без названия"}</strong><div className="unplaced-subtitle">{x.date||"Без даты"} · {x.importOldPeriod?`${x.importOldPeriod} пара`:"номер пары неизвестен"} · {x.importOldTeacher||"Преподаватель не определён"} · {x.type==="cancel_assignment"?"Отмена с заданием":x.type==="cancel"?"Отмена":x.type==="pending_move"?"Ожидает переноса":"Изменение / замена"}</div></div>)}
+          </div>
+        </section>
       )}
 
       {sched && baseVisibleUnplacedIds.length > 0 && (
@@ -23158,6 +23163,12 @@ function SubstitutionsPanel({ data, set, onPublish }) {
   const [filterGroupId, setFilterGroupId] = useState("");
   const [filterTeacherId, setFilterTeacherId] = useState("");
   const [onlyChanged, setOnlyChanged] = useState(false);
+  const [manualCancelled, setManualCancelled] = useState({date:todayISO(),period:0,groupId:"",subject:"",teacherId:"",note:""});
+  const [showManualCancelled, setShowManualCancelled] = useState(false);
+  const [reportStart, setReportStart] = useState(() => mondayOf(todayISO()));
+  const [reportEnd, setReportEnd] = useState(todayISO());
+  const [showActualReport, setShowActualReport] = useState(false);
+  const [extraEntry, setExtraEntry] = useState({date:todayISO(),period:0,groupId:"",subject:"",teacherId:"",hours:2,note:""});
   const sched = data.schedule;
 
   if (!sched) {
@@ -23169,19 +23180,19 @@ function SubstitutionsPanel({ data, set, onPublish }) {
     setImportBusy(true); setImportMsg("");
     try {
       const book = XLSX.read(await file.arrayBuffer(), {type:"array", cellDates:false});
-      const required = ["Дата","Группа","Предмет","Тип изменения","ID записи"];
+      const required = ["Дата","Группа","Предмет","Тип изменения"];
       const normalize = (v) => String(v ?? "").trim().toLocaleLowerCase("ru-RU").replace(/ё/g,"е").replace(/\s+/g," ");
       const parsed = new Map();
       for (const sheetName of book.SheetNames) {
+        if (book.SheetNames.some(n=>n==="Все изменения") && sheetName!=="Все изменения") continue;
         const rows = XLSX.utils.sheet_to_json(book.Sheets[sheetName], {defval:"",raw:false});
         if (!rows.length || !required.every(k=>Object.prototype.hasOwnProperty.call(rows[0],k))) continue;
         for (const r of rows) {
-          const id = String(r["ID записи"]||"").trim();
-          if (!id) continue;
+          const id = String(r["ID записи"]||"").trim() || `xlsx-${["Дата","Группа","Предмет","Тип изменения","Был преподаватель","Стал преподаватель","Аудитория до","Аудитория после","Пара до","Пара после","Дата переноса","Примечание"].map(k=>normalize(r[k])).join("|")}`;
           if (!parsed.has(id)) parsed.set(id,r);
         }
       }
-      if (!parsed.size) throw new Error("Нет таблиц с колонками 'Дата', 'Группа', 'Предмет', 'Тип изменения', 'ID записи'.");
+      if (!parsed.size) throw new Error("Не найдены строки с колонками 'Дата', 'Группа', 'Предмет', 'Тип изменения'.");
       const current = data.substitutions || [];
       const currentIds = new Set(current.map(s=>String(s.id)));
       const scheduleInsts = data.schedule?.instances || [];
@@ -23227,7 +23238,7 @@ function SubstitutionsPanel({ data, set, onPublish }) {
         const oldRoom=normalize(r["Аудитория до"]),newRoom=normalize(r["Аудитория после"]);
         const teacherId=teacherByName.get(newTeacher)||"";
         const roomId=roomByName.get(newRoom)||"";
-        const row={id,date,instId:inst?.instId||sourceInstId,type,newTeacherId:teacherId,newRoomId:roomId,note:String(r["Примечание"]||""),importSource:String(r["Источник"]||""),importOriginalInstId:sourceInstId,importGroup:String(r["Группа"]||""),importSubject:String(r["Предмет"]||""),importOldTeacher:String(r["Был преподаватель"]||""),importNewTeacher:String(r["Стал преподаватель"]||""),importOldRoom:String(r["Аудитория до"]||""),importNewRoom:String(r["Аудитория после"]||""),importOldPeriod:String(r["Пара до"]||""),importNewPeriod:String(r["Пара после"]||""),importUnresolved:!inst};
+        const row={id,date,instId:inst?.instId||sourceInstId,type,newTeacherId:teacherId,newRoomId:roomId,note:String(r["Примечание"]||""),importSource:String(r["Источник"]||""),importOriginalInstId:sourceInstId,importGroup:String(r["Группа"]||""),importSubject:String(r["Предмет"]||""),importOldTeacher:String(r["Был преподаватель"]||""),importNewTeacher:String(r["Стал преподаватель"]||""),importOldRoom:String(r["Аудитория до"]||""),importNewRoom:String(r["Аудитория после"]||""),importOldPeriod:String(r["Пара до"]||""),importNewPeriod:String(r["Пара после"]||""),importUnresolved:!inst, pendingForReplacement:!inst, importGroupId:groupId, importOldTeacherId:teacherByName.get(oldTeacher)||""};
         if(type==="moved"){
           row.targetDate=dateISO(r["Дата переноса"]);
           const targetPeriod=Number(r["Пара после"]);
@@ -23239,13 +23250,124 @@ function SubstitutionsPanel({ data, set, onPublish }) {
         additions.push(row);
       }
       if(!additions.length){setImportMsg(`Новых записей нет. Уже имеются: ${skipped}.`);return;}
-      const warning=unresolved?`\n\nНе привязаны к текущим занятиям: ${unresolved}. Они будут сохранены в журнале с исходным ID, но не появятся поверх расписания, пока связь не восстановлена.\n${sampleUnresolved.join("\n")}`:"";
+      const warning=unresolved?`\n\nНе привязаны к текущим занятиям: ${unresolved}. Они появятся в разделе «Неназначенные / ожидают замены» с исходными названиями. Размещённое расписание не изменится.\n${sampleUnresolved.join("\n")}`:"";
       if(!window.confirm(`Импорт замен из ${file.name}\nНовых записей: ${additions.length}\nУже существующих ID: ${skipped}\nТекущее расписание и записи замен не удаляются.${warning}\n\nДобавить записи?`))return;
       set("substitutions")([...current,...additions]);
-      setImportMsg(`Импортировано ${additions.length}, пропущено существующих ${skipped}, без привязки ${unresolved}. Изменения необходимо сохранить в системе.`);
+      setImportMsg(`Импортировано ${additions.length}; уже существовали ${skipped}; в «Неназначенные / ожидают замены» отправлено ${unresolved}. Сохраните изменения в системе.`);
     } catch(e){setImportMsg(`Ошибка импорта: ${e.message||e}`);} finally {setImportBusy(false);}
   };
 
+  const saveManualCancelled = () => {
+    if (!manualCancelled.date || !manualCancelled.groupId || !manualCancelled.subject.trim()) {
+      setImportMsg("Укажите дату, группу и название дисциплины.");return;
+    }
+    const row={id:uid(),date:manualCancelled.date,instId:`manual-${uid()}`,type:"pending_move",
+      importUnresolved:true,manualCancellation:true,pendingForReplacement:true,importGroupId:manualCancelled.groupId,importOldTeacherId:manualCancelled.teacherId,importGroup:(data.groups||[]).find(g=>g.id===manualCancelled.groupId)?.name||"",
+      importSubject:manualCancelled.subject.trim(),importOldTeacher:(data.teachers||[]).find(t=>t.id===manualCancelled.teacherId)?.name||"",
+      importOldPeriod:String(Number(manualCancelled.period)+1),note:manualCancelled.note||"Ожидает переноса"};
+    set("substitutions")([...(data.substitutions||[]),row]);
+    setShowManualCancelled(false);setImportMsg("Отменённая пара сохранена в реестре. Для включения в сетку свяжите её с действующим занятием.");
+  };
+  const saveExtraEntry = () => {
+    if (!extraEntry.date || !extraEntry.teacherId || !extraEntry.groupId || !extraEntry.subject.trim() || ![1,2].includes(Number(extraEntry.hours))) {
+      setExportMsg("Для дополнительного занятия укажите дату, преподавателя, группу, дисциплину и 1 или 2 академических часа.");return;
+    }
+    const teacher=(data.teachers||[]).find(t=>String(t.id)===String(extraEntry.teacherId));
+    const group=(data.groups||[]).find(g=>String(g.id)===String(extraEntry.groupId));
+    set("substitutions")([...(data.substitutions||[]),{id:uid(),date:extraEntry.date,type:"extra",instId:`extra-${uid()}`,
+      newTeacherId:extraEntry.teacherId,importGroupId:extraEntry.groupId,importGroup:group?.name||"",importSubject:extraEntry.subject.trim(),
+      importNewTeacher:teacher?.name||"",importNewPeriod:String(Number(extraEntry.period)+1),actualHours:Number(extraEntry.hours),note:extraEntry.note||"Дополнительное занятие",manualExtra:true}]);
+    setExportMsg("Дополнительное занятие добавлено. Сохраните изменения; оно появится в отчёте по факту.");
+  };
+  const exportActualHours = () => {
+    if(!reportStart||!reportEnd||reportStart>reportEnd){setExportMsg("Проверьте даты отчёта.");return;}
+    const days=datesBetween(reportStart,reportEnd);
+    if(days.length>190){setExportMsg("Максимальный период одного отчёта — 190 дней.");return;}
+    const substitutions=data.substitutions||[];
+    const instances=sched.instances||[];
+    const assignment=sched.assignment||{};
+    const teacherNames=new Map((data.teachers||[]).map(t=>[String(t.id),t.name]));
+    const groupNames=new Map((data.groups||[]).map(g=>[String(g.id),g.name]));
+    const instById=new Map(instances.map(inst=>[String(inst.instId),inst]));
+    const changesBySource=new Map();
+    for(const sub of substitutions){
+      if(!sub.date||!sub.instId)continue;
+      changesBySource.set(`${sub.date}|${sub.instId}`,sub);
+    }
+    const detail=[];const review=[];const dedup=new Set();
+    const nameForTeacher=(id,override="")=>teacherNames.get(String(id))||override||String(id||"");
+    const labelForInst=(inst)=>lessonLabel(inst,data)?.subj||"";
+    const record=(entry)=>{
+      const ids=[...new Set((entry.teacherIds||[]).filter(Boolean).map(String))];
+      if(!ids.length){review.push([entry.date,entry.group,entry.subject,entry.kind,"Не определён преподаватель"]);return;}
+      for(const id of ids){
+        const key=[entry.key,id].join("|");if(dedup.has(key))continue;dedup.add(key);
+        detail.push({date:entry.date,period:entry.period,group:entry.group,subject:entry.subject,teacher:nameForTeacher(id,entry.teacherFallback),teacherId:id,
+          hours:entry.hours,kind:entry.kind,source:entry.source||"",note:entry.note||""});
+      }
+    };
+    for(const dateValue of days){
+      if(isNoClassDate(data,dateValue))continue;
+      for(const inst of instances){
+        if(inst.isScheduleEvent)continue;
+        const a=assignment[inst.instId];
+        if(!a||Number(a.day)!==weekdayOf(dateValue)||!instanceAppliesToDate(data.config,inst,dateValue))continue;
+        const sub=changesBySource.get(`${dateValue}|${inst.instId}`);
+        if(sub&&["cancel","cancel_assignment","pending_move","moved"].includes(sub.type))continue;
+        const teacherIds=sub?.newTeacherId?[sub.newTeacherId]:instanceTeacherIds(inst);
+        record({key:`base|${dateValue}|${inst.instId}`,date:dateValue,period:Number(sub?.newPeriod??a.period)+1,
+          group:instanceGroupNames(data,inst).join(", ")||groupNames.get(String(inst.groupId))||"",
+          subject:labelForInst(inst),teacherIds,hours:(inst.halfPair||a.half!=null&&a.half!=="")?1:2,
+          kind:sub?"Замена / изменение":"По расписанию",note:sub?.note||""});
+      }
+    }
+    // Перенос — отдельное фактическое проведение в целевую дату. Исходная пара уже исключена выше.
+    for(const sub of substitutions){
+      if(sub.type!=="moved"||!sub.targetDate||sub.targetDate<reportStart||sub.targetDate>reportEnd)continue;
+      const cell=movedCellForSubstitution(data,sub);
+      if(!cell){review.push([sub.targetDate,sub.importGroup||"",sub.importSubject||"","Перенос","Не удалось связать с исходной парой; часы не начислены"]);continue;}
+      const inst=cell.inst;
+      record({key:`moved|${sub.id||`${sub.date}|${sub.instId}`}`,date:sub.targetDate,period:Number(cell.a.period)+1,
+        group:instanceGroupNames(data,inst).join(", ")||sub.importGroup||"",subject:labelForInst(inst)||sub.importSubject||"",
+        teacherIds:sub.newTeacherId?[sub.newTeacherId]:instanceTeacherIds(inst),hours:(inst.halfPair||assignment[inst.instId]?.half!=null&&assignment[inst.instId]?.half!=="")?1:2,
+        kind:"Перенос",source:sub.date,note:sub.note||""});
+    }
+    // Дополнительные пары фиксируются отдельной записью; отменённые, но ещё не назначенные не считаются проведёнными.
+    for(const sub of substitutions){
+      if(!["extra","additional"].includes(sub.type)||!sub.date||sub.date<reportStart||sub.date>reportEnd)continue;
+      const hours=Number(sub.actualHours);
+      if(![1,2].includes(hours)){review.push([sub.date,sub.importGroup||"",sub.importSubject||"","Дополнительное","Некорректная длительность"]);continue;}
+      record({key:`extra|${sub.id}`,date:sub.date,period:Number(sub.importNewPeriod||0)||"",
+        group:sub.importGroup||groupNames.get(String(sub.importGroupId))||"",subject:sub.importSubject||"",
+        teacherIds:[sub.newTeacherId||sub.importOldTeacherId].filter(Boolean),teacherFallback:sub.importNewTeacher||"",hours,
+        kind:"Дополнительное",note:sub.note||""});
+    }
+    for(const sub of substitutions){
+      if(!sub.importUnresolved||["extra","additional"].includes(sub.type))continue;
+      const dateValue=sub.type==="moved"&&sub.targetDate?sub.targetDate:sub.date;
+      if(dateValue<reportStart||dateValue>reportEnd)continue;
+      review.push([dateValue,sub.importGroup||"",sub.importSubject||"",sub.type==="moved"?"Перенос":"Неназначенная / отменённая", "Не связана с занятием сетки; не включена в фактические часы"]);
+    }
+    const total=new Map();
+    for(const row of detail){
+      const t=total.get(row.teacherId)||{name:row.teacher,pairs:0,hours:0,regular:0,moved:0,additional:0};
+      t.pairs++;t.hours+=row.hours;
+      if(row.kind==="Перенос")t.moved+=row.hours;
+      else if(row.kind==="Дополнительное")t.additional+=row.hours;
+      else t.regular+=row.hours;
+      total.set(row.teacherId,t);
+    }
+    const wb=XLSX.utils.book_new();
+    const append=(name,rows,widths)=>{const ws=XLSX.utils.aoa_to_sheet(rows);ws["!cols"]=widths.map(w=>({wch:w}));XLSX.utils.book_append_sheet(wb,ws,name);};
+    append("Свод по преподавателям",[["Преподаватель","Пар","Всего ак. ч.","По сетке и заменам","Переносы","Дополнительные","С","По"],
+      ...[...total.values()].sort((a,b)=>a.name.localeCompare(b.name,"ru")).map(t=>[t.name,t.pairs,t.hours,t.regular,t.moved,t.additional,reportStart,reportEnd])],[38,12,16,23,16,19,16,16]);
+    append("Детализация",[["Дата","Пара","Группа","Дисциплина","Преподаватель","Ак. часов","Основание","Исходная дата","Комментарий"],
+      ...detail.sort((a,b)=>a.date.localeCompare(b.date)||a.period-b.period||a.teacher.localeCompare(b.teacher,"ru"))
+        .map(r=>[r.date,r.period,r.group,r.subject,r.teacher,r.hours,r.kind,r.source,r.note])],[16,9,25,43,38,13,23,18,48]);
+    append("Требует сверки",[["Дата","Группа","Дисциплина","Тип","Причина"],...review],[16,25,43,22,65]);
+    XLSX.writeFile(wb,`fakt_chasy_${reportStart}_${reportEnd}.xlsx`);
+    setExportMsg(`Отчёт: ${total.size} преподавателей, ${detail.length} учтённых преподавательских занятий, ${review.length} записей для сверки. Листы: свод, детализация, требует сверки. Данные отражают записи расписания и замен, а не подтверждение посещаемости.`);
+  };
   const day = weekdayOf(date);
   const byId = (arr, id) => arr.find((x) => x.id === id);
   const scheduleInstances = sched.instances || [];
@@ -23599,9 +23721,21 @@ ${warnings.join("\n")}
         <input ref={importSubFileRef} type="file" accept=".xlsx,.xls" style={{display:"none"}} onChange={e=>{void importSubstitutionsFile(e.target.files?.[0]);e.target.value="";}} />
         <button className="btn ghost sm" disabled={importBusy} onClick={()=>importSubFileRef.current?.click()} title="Добавить записи замен из Excel без удаления существующих">{importBusy?"Импортирую…":"↑ Импорт записей замен"}</button>
         <button className="btn ghost sm" onClick={()=>exportSubstitutionsExcel("week")} title="Выгрузить все замены, отмены и переносы за неделю выбранной даты"><Download size={14}/> Excel за неделю</button>
+        <button className="btn ghost sm" onClick={()=>{setManualCancelled(v=>({...v,date}));setShowManualCancelled(v=>!v);}}>+ Отменённая пара вручную</button>
+        <button className="btn ghost sm" onClick={()=>setShowActualReport(v=>!v)}>Отчёт по часам</button>
         <button className="btn ghost sm" onClick={()=>exportSubstitutionsExcel("month")} title="Выгрузить все замены, отмены и переносы за календарный месяц выбранной даты"><Download size={14}/> Excel за месяц</button>
         {noOrdinaryClassesToday&&<span className="holiday-warn">⛔ день без обычных занятий</span>}
       </div>
+      {showActualReport&&<div className="notice timetable-extra-panel"><h3>Фактически проведённые занятия — отчёт и дополнительные пары</h3><p>Расчёт по сетке с заменами, переносами на целевую дату и отдельно введёнными дополнительными парами. Непривязанные записи выводятся на лист «Требует сверки».</p><div className="timetable-extra-fields"><label>С<input type="date" value={reportStart} onChange={e=>setReportStart(e.target.value)}/></label><label>По<input type="date" value={reportEnd} onChange={e=>setReportEnd(e.target.value)}/></label><button className="btn primary" onClick={exportActualHours}><Download size={14}/> Скачать отчёт Excel</button></div><h4>Дополнительное проведённое занятие</h4><div className="timetable-extra-fields"><label>Дата<input type="date" value={extraEntry.date} onChange={e=>setExtraEntry(v=>({...v,date:e.target.value}))}/></label><label>Пара<select value={extraEntry.period} onChange={e=>setExtraEntry(v=>({...v,period:Number(e.target.value)}))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1}</option>)}</select></label><label>Группа<select value={extraEntry.groupId} onChange={e=>setExtraEntry(v=>({...v,groupId:e.target.value}))}><option value="">Выберите группу</option>{(data.groups||[]).map(g=><option key={g.id} value={g.id}>{g.name}</option>)}</select></label><label>Преподаватель<select value={extraEntry.teacherId} onChange={e=>setExtraEntry(v=>({...v,teacherId:e.target.value}))}><option value="">Выберите преподавателя</option>{(data.teachers||[]).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Дисциплина<input value={extraEntry.subject} onChange={e=>setExtraEntry(v=>({...v,subject:e.target.value}))}/></label><label>Академических часов<select value={extraEntry.hours} onChange={e=>setExtraEntry(v=>({...v,hours:Number(e.target.value)}))}><option value={2}>2</option><option value={1}>1</option></select></label><label>Примечание<input value={extraEntry.note} onChange={e=>setExtraEntry(v=>({...v,note:e.target.value}))}/></label><button className="btn primary" onClick={saveExtraEntry}>+ Учесть занятие</button></div><div className="computer-hint">Введённые дополнительные занятия учитываются в отчёте, но сами по себе не размещаются в сетке и не резервируют кабинет.</div>{(data.substitutions||[]).filter(s=>s.type==="extra"||s.type==="additional").length>0&&<div className="pending-transfers-list">{(data.substitutions||[]).filter(s=>s.type==="extra"||s.type==="additional").map(s=><div className="pending-transfer-row" key={s.id}><span>{s.date} · {s.importGroup} · {s.importSubject} · {s.importNewTeacher} · {s.actualHours} ак. ч.</span><button className="btn ghost sm" onClick={()=>set("substitutions")((data.substitutions||[]).filter(x=>x.id!==s.id))}>Удалить</button></div>)}</div>}</div>}
+      {showManualCancelled&&<div className="notice timetable-extra-panel"><h3>Добавить отменённую пару для последующего переноса</h3><div className="timetable-extra-fields">
+        <label>Дата<input type="date" value={manualCancelled.date} onChange={e=>setManualCancelled(v=>({...v,date:e.target.value}))}/></label>
+        <label>Номер пары<select value={manualCancelled.period} onChange={e=>setManualCancelled(v=>({...v,period:Number(e.target.value)}))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option value={i} key={i}>{i+1}</option>)}</select></label>
+        <label>Группа<select value={manualCancelled.groupId} onChange={e=>setManualCancelled(v=>({...v,groupId:e.target.value}))}><option value="">Выберите группу</option>{(data.groups||[]).map(g=><option key={g.id} value={g.id}>{g.name}</option>)}</select></label>
+        <label>Преподаватель<select value={manualCancelled.teacherId} onChange={e=>setManualCancelled(v=>({...v,teacherId:e.target.value}))}><option value="">Не указан</option>{(data.teachers||[]).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label>
+        <label>Название дисциплины<input value={manualCancelled.subject} onChange={e=>setManualCancelled(v=>({...v,subject:e.target.value}))} placeholder="Название отменённой дисциплины"/></label>
+        <label>Примечание<input value={manualCancelled.note} onChange={e=>setManualCancelled(v=>({...v,note:e.target.value}))} placeholder="Причина отмены / перенос"/></label>
+        </div><button className="btn primary sm" onClick={saveManualCancelled}>Сохранить в реестр</button></div>}
+      {((data.substitutions||[]).some(x=>x.importUnresolved||x.manualCancellation))&&<div className="notice timetable-extra-panel"><h3>Неназначенные / ожидают замены — {(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).length}</h3><p>Все импортированные отмены и переносы без однозначной привязки к занятию. Сохранены исходные названия, преподаватели и даты. Эти записи не занимают аудитории и не включаются в фактические часы, пока не назначены.</p><div className="timetable-orphan-list">{(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).sort((a,b)=>String(a.date).localeCompare(String(b.date))).map(x=><div key={x.id} className="timetable-orphan-row"><span>{formatDateDM(x.date)} · {x.importOldPeriod||"?"} пара · {x.importGroup||"Группа не найдена"} · <b>{x.importSubject||"Без названия"}</b> · {x.importOldTeacher||""} · {x.type==="cancel_assignment"?"Отмена с заданием":x.type==="pending_move"?"Ожидает переноса":x.type==="cancel"?"Отмена":"Замена / перенос"}{x.note?` · ${x.note}`:""}</span><button className="btn ghost sm" onClick={()=>{setDate(x.date);setFilterGroupId(x.importGroupId||"");setFilterTeacherId(x.importOldTeacherId||"");setImportMsg(`Выбрана дата ${formatDateDM(x.date)}. Для проведения замены необходимо сопоставить исходную пару с занятиями расписания.`);}}>Открыть дату</button><button className="btn ghost sm" onClick={()=>set("substitutions")((data.substitutions||[]).filter(y=>y.id!==x.id))}>Удалить</button></div>)}</div></div>}
       {importMsg&&<div className="notice">{importMsg}</div>}
       {exportMsg&&<div className="notice">{exportMsg}</div>}
       {noOrdinaryClassesToday && subs.length>0 && <div className="notice">На этой дате отключено обычное расписание. Сохранённые ранее операции замены для регулярных пар не применяются к закрытому дню и не выводятся в список.</div>}
@@ -24904,12 +25038,14 @@ function PublicNotices({ data }) {
   );
 }
 
-function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRoute = null, onOpenTeacher = null, onViewChange = null, scheduleLoading = false, syncUrl = true }) {
+function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRoute = null, onOpenTeacher = null, onOpenGroup = null, onViewChange = null, scheduleLoading = false, syncUrl = true }) {
   const list = kind === "group" ? data.groups : (kind === "teacher" ? data.teachers : data.rooms);
   const [viewId, setViewId] = useState("");
   const [query, setQuery] = useState("");
   const [teacherDepartmentFilter, setTeacherDepartmentFilter] = useState("");
   const [roomCategoryFilter, setRoomCategoryFilter] = useState("");
+  const [roomCheckDay, setRoomCheckDay] = useState(0);
+  const [roomCheckPeriod, setRoomCheckPeriod] = useState(0);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [weekOffset, setWeekOffset] = useState(0);
   const [step, setStep] = useState(kind === "group" ? "specialty" : "schedule");
@@ -25485,7 +25621,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
             <span className="public-publication-dot" aria-hidden="true"></span>
             <span>{publicationStatusLabel}</span>
           </div>
-          <button type="button" className="public-refresh-btn" onClick={forcePublicRefresh} title="Загрузить последнюю опубликованную версию без кэша">↻ Обновить расписание</button>
+          <button type="button" className="public-refresh-btn" onClick={forcePublicRefresh} title="Загрузить последнюю опубликованную версию без кэша"><RefreshCw size={15} aria-hidden="true"/> Обновить</button>
         </div>
       </div>
 
@@ -25573,6 +25709,21 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                 <button className={scope === "semester" ? "on" : ""} onClick={() => setScope("semester")}>на семестр</button>
               </div>
 
+              {kind === "room" && scope === "week" && <div className="notice timetable-room-availability">
+                <strong>Занятость кабинета по дню и паре</strong>
+                <div className="timetable-extra-fields"><label>День этой недели<select value={roomCheckDay} onChange={e=>setRoomCheckDay(Number(e.target.value))}>{weekDates.map(({day,date})=><option key={day} value={day}>{formatRuDateFull(date)}</option>)}</select></label>
+                <label>Пара<select value={roomCheckPeriod} onChange={e=>setRoomCheckPeriod(Number(e.target.value))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1} пара · {data.config.periodTimes?.[i]||""}</option>)}</select></label></div>
+                {(() => {const selected=weekDates.find(x=>x.day===roomCheckDay);if(!selected)return <span>Выберите день.</span>;
+                  if(scheduleLoading)return <span>Загружаем занятия кабинета…</span>;
+                  if(!publicCurrentWeekVisible)return <span>Неделя не опубликована.</span>;
+                  if(isNoClassDate(data,selected.date))return <b>Занятий нет (неучебный день).</b>;
+                  const result=lessonsFor(selected.day,selected.date);
+                  const busy=(result.regular||[]).filter(x=>Number(x.a?.period)===roomCheckPeriod&&!x.subOverride?.cancelled);
+                  const bookings=(data.practices||[]).some(p=>practiceRoomBookings(p).some(b=>b.date===selected.date&&Number(b.period)===roomCheckPeriod&&String(b.roomId)===String(viewId)));
+                  const attest=(data.interimAssessments||[]).some(a=>a.date===selected.date&&Number(a.period)===roomCheckPeriod&&String(a.roomId)===String(viewId));
+                  return busy.length||bookings||attest?<b>Занято · {busy.map(x=>lessonLabel(x.inst,data).subj).filter(Boolean).join(", ")||"практика / аттестация"}</b>:<b>Свободно по опубликованным данным</b>;
+                })()}
+              </div>}
               {scope === "week" && (
                 <div className="public-week-nav">
                   <button onClick={() => movePublicWeek(-1)} disabled={publicWeekSelectionEnabled && !publicVisibleWeeks.some((w)=>weekNum && w<weekNum)}>«</button>
@@ -25830,7 +25981,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                                 {(cell.inst.streamGroupIds || []).length > 0 ? <span className="ev-subgroup"> · 🔗 поток</span> : null}
                               </div>
                               <div className={`ev-row${duplicateRoomConflictText ? " public-room-conflict" : ""}`}><span className="ev-ico">📍</span> {duplicateRoomConflictText ? <>⚠ <b>Конфликт кабинетов:</b> {duplicateRoomConflictText}</> : (cell.inst.format === "remote" ? "дистанционно" : `ауд. ${room}`)}</div>
-                              <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" && teacherId ? <button type="button" className={`public-teacher-link${teacherChangedBySubstitution ? " public-teacher-replacement" : ""}`} onClick={() => onOpenTeacher?.(teacherId, viewId)} title="Открыть расписание преподавателя">{teacher}</button> : group}</div>
+                              <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" && teacherId ? <button type="button" className={`public-teacher-link${teacherChangedBySubstitution ? " public-teacher-replacement" : ""}`} onClick={() => onOpenTeacher?.(teacherId, viewId)} title="Открыть расписание преподавателя">{teacher}</button> : kind === "teacher" ? <button type="button" className="public-teacher-link" onClick={() => onOpenGroup?.(cell.inst.groupId || cell.inst.streamGroupIds?.[0])} title="Открыть расписание группы">{group}</button> : group}</div>
                               {kind === "room" && teacher && <div className="ev-row"><span className="ev-ico">👤</span> {teacher}</div>}
                               {kind === "teacher" && teacherChangedBySubstitution && <div className="ev-row public-teacher-replacement-row"><span className="ev-ico">👤</span> <span className="public-teacher-replacement">{teacher} · замена</span></div>}
                               {cell.subOverride?.moved && <div className="ev-row ev-subgroup">↪ Перенесено с {formatDateDM(cell.subOverride.sourceDate)}{Number.isFinite(Number(cell.subOverride.sourcePeriod)) ? ` · ${Number(cell.subOverride.sourcePeriod)+1} пары` : ""}</div>}
@@ -29423,7 +29574,7 @@ export default function App() {
             </>
           )}
           {role === "student" && !publicPaused && <ReadOnlySchedule data={data} kind="group" initialViewId={publicGroupReturnId} initialSpecialtyRoute={publicSpecialtyRoute} scheduleLoading={publicScheduleLoading} syncUrl={!browserNavApplying} onViewChange={loadPublicScheduleTarget} onOpenTeacher={(teacherId, groupId) => { setPublicGroupReturnId(groupId || ""); setPublicTeacherJumpId(teacherId); setRole("teacher"); }} />}
-          {role === "teacher" && !publicPaused && <ReadOnlySchedule data={data} kind="teacher" initialViewId={publicTeacherJumpId} scheduleLoading={publicScheduleLoading} syncUrl={!browserNavApplying} onViewChange={loadPublicScheduleTarget} />}
+          {role === "teacher" && !publicPaused && <ReadOnlySchedule data={data} kind="teacher" initialViewId={publicTeacherJumpId} onOpenGroup={(groupId)=>{if (!groupId)return;setPublicGroupReturnId(groupId);setRole("student");}} scheduleLoading={publicScheduleLoading} syncUrl={!browserNavApplying} onViewChange={loadPublicScheduleTarget} />}
           {role === "room" && !publicPaused && <ReadOnlySchedule data={data} kind="room" initialViewId={publicRoomJumpId} scheduleLoading={publicScheduleLoading} syncUrl={!browserNavApplying} onViewChange={loadPublicScheduleTarget} />}
         </main>
 
