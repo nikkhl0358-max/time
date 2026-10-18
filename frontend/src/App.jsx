@@ -25751,7 +25751,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                 <div className="public-room-overview-column"><h3>Занято <span>{busy.length}</span></h3>{busy.length===0?<p>Занятых кабинетов нет</p>:busy.map(r=><button key={r.id} className="public-room-overview-item busy" onClick={()=>{setViewId(r.id);setPickerOpen(false);}}><strong>{r.name}</strong>{r.lessons.map((lesson,i)=><span key={i}>{[lesson.group,lesson.subject,lesson.teacher].filter(Boolean).join(" · ")}</span>)}</button>)}</div>
               </div>;
             })()}
-          </div>}
+          </div>
         </div>
       )}
       {kind === "room" && (
