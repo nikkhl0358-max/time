@@ -33,3 +33,9 @@
 @media(max-width:640px){.public-room-overview-results{grid-template-columns:1fr}.public-room-overview-body{padding:12px}}
 
 .public-stream-group-links{display:inline-flex;flex-wrap:wrap;gap:5px 10px;vertical-align:middle}.public-stream-group-links .public-teacher-link{white-space:normal}.actual-hours-controls,.actual-hours-tabs,.actual-hours-stats{display:flex;flex-wrap:wrap;align-items:end;gap:12px;margin:16px 0}.actual-hours-controls label{display:flex;flex-direction:column;gap:5px;min-width:145px}.actual-hours-controls input,.actual-hours-controls select{min-height:38px;padding:7px;border:1px solid #d9d9d9;border-radius:8px}.actual-hours-stats>div{min-width:155px;flex:1;display:flex;flex-direction:column;gap:6px;padding:17px;background:#f7f7f5;border:1px solid #e5e1d9;border-radius:12px}.actual-hours-stats b{font-size:23px}.actual-hours-stats span{font-size:12px;color:#666}.actual-hours-table-wrap{overflow-x:auto;border:1px solid #e5e1d9;border-radius:10px}.actual-hours-table{width:100%;border-collapse:collapse;font-size:13px}.actual-hours-table th,.actual-hours-table td{padding:10px 12px;text-align:left;border-bottom:1px solid #e9e6e0}.actual-hours-table th{background:#f4f5f7;white-space:nowrap}.actual-hours-table tbody tr:hover{background:#fafafa}.actual-hours-add{margin-top:20px;padding:16px;border:1px solid #e6e1d6;border-radius:12px}.actual-hours-add summary{cursor:pointer;font-weight:600}
+
+/* Unified all-room day/period overview — always visible above individual room schedule. */
+.public-room-overview-heading{display:flex;flex-direction:column;gap:5px;padding:16px 18px 5px;color:#173c6a}
+.public-room-overview-heading strong{font-size:17px}
+.public-room-overview-heading span{font-size:13px;color:#67788c}
+.public-room-overview-filters input[type=date]{width:100%;min-height:40px;padding:8px;border:1px solid #d8dfe9;border-radius:8px;background:#fff;color:inherit;font:inherit}

@@ -25105,7 +25105,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
   const [roomCategoryFilter, setRoomCategoryFilter] = useState("");
   const [roomCheckDay, setRoomCheckDay] = useState(0);
   const [roomCheckPeriod, setRoomCheckPeriod] = useState(0);
-  const [roomOverviewOpen, setRoomOverviewOpen] = useState(false);
+  const [roomOverviewDate, setRoomOverviewDate] = useState(todayISO());
   const [roomOverview, setRoomOverview] = useState(null);
   const [roomOverviewLoading, setRoomOverviewLoading] = useState(false);
   const [roomOverviewError, setRoomOverviewError] = useState("");
@@ -25243,9 +25243,9 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
 
   const monday = addDays(mondayOf(todayISO()), weekOffset * 7);
   const weekDates = activeDayIndices.map((d) => ({ day: d, date: addDays(monday, d) }));
-  const overviewDate = weekDates.find(x=>x.day===roomCheckDay)?.date || weekDates[0]?.date || "";
+  const overviewDate = roomOverviewDate;
   useEffect(() => {
-    if (kind !== "room" || !roomOverviewOpen || !overviewDate) return;
+    if (kind !== "room" || !overviewDate) return;
     const controller = new AbortController();
     setRoomOverviewLoading(true);
     setRoomOverviewError("");
@@ -25256,7 +25256,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
       .catch(error=>{if(error.name!=="AbortError")setRoomOverviewError(error.message||"Ошибка загрузки");})
       .finally(()=>{if(!controller.signal.aborted)setRoomOverviewLoading(false);});
     return ()=>controller.abort();
-  }, [kind, roomOverviewOpen, overviewDate, roomCheckPeriod, data.publishedAt]);
+  }, [kind, overviewDate, roomCheckPeriod, data.publishedAt]);
   const rangeLabel = weekDates.length
     ? `${formatRuDate(weekDates[0].date)} – ${formatRuDate(weekDates[weekDates.length - 1].date)}`
     : "";
@@ -25734,19 +25734,17 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
 
       {kind === "room" && (
         <div className="public-room-overview">
-          <button type="button" className="public-room-overview-toggle" onClick={()=>setRoomOverviewOpen(v=>!v)} aria-expanded={roomOverviewOpen}>
-            <span>◷ &nbsp; Посмотреть свободные и занятые кабинеты</span><span>{roomOverviewOpen?"Свернуть −":"Открыть +"}</span>
-          </button>
-          {roomOverviewOpen && <div className="public-room-overview-body">
+          <div className="public-room-overview-heading"><strong>Занятость всех кабинетов</strong><span>Выберите дату и пару — покажем все свободные и занятые аудитории</span></div>
+          <div className="public-room-overview-body">
             <div className="public-room-overview-filters">
-              <label>Дата<select value={roomCheckDay} onChange={e=>setRoomCheckDay(Number(e.target.value))}>{weekDates.map(({day,date})=><option key={day} value={day}>{formatRuDateFull(date)}</option>)}</select></label>
+              <label>Дата<input type="date" value={roomOverviewDate} min={data.config.semesterStart || undefined} max={data.config.semesterEnd || undefined} onChange={e=>setRoomOverviewDate(e.target.value)}/></label>
               <label>Пара<select value={roomCheckPeriod} onChange={e=>setRoomCheckPeriod(Number(e.target.value))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1} пара · {data.config.periodTimes?.[i]||""}</option>)}</select></label>
             </div>
-            <p className="public-room-overview-note">Данные опубликованного расписания. Выберите день и пару, чтобы увидеть все кабинеты сразу.</p>
+            <p className="public-room-overview-note">Статусы рассчитаны по опубликованному расписанию на выбранную дату и пару.</p>
             {roomOverviewLoading && <div className="public-room-overview-info">Проверяем занятость…</div>}
             {roomOverviewError && <div className="public-room-overview-info" role="alert">{roomOverviewError}</div>}
             {roomOverview && !roomOverviewLoading && (()=>{
-              const visible=(roomOverview.rooms||[]).filter(r=>!roomCategoryFilter || publicRoomCategory(byId(data.rooms,r.id))===roomCategoryFilter).filter(r=>!query.trim() || String(r.name||"").toLowerCase().includes(query.toLowerCase().trim())).sort((a,b)=>String(a.name).localeCompare(String(b.name),"ru",{numeric:true}));
+              const visible=(roomOverview.rooms||[]).sort((a,b)=>String(a.name).localeCompare(String(b.name),"ru",{numeric:true}));
               const free=visible.filter(r=>!r.busy), busy=visible.filter(r=>r.busy);
               return <div className="public-room-overview-results">
                 <div className="public-room-overview-column"><h3>Свободно <span>{free.length}</span></h3>{free.length===0?<p>Нет свободных кабинетов</p>:free.map(r=><button key={r.id} className="public-room-overview-item" onClick={()=>{setViewId(r.id);setPickerOpen(false);}}> <strong>{r.name}</strong><span>Свободен</span></button>)}</div>
@@ -25810,21 +25808,6 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                 <button className={scope === "semester" ? "on" : ""} onClick={() => setScope("semester")}>на семестр</button>
               </div>
 
-              {kind === "room" && scope === "week" && <div className="notice timetable-room-availability">
-                <strong>Занятость кабинета по дню и паре</strong>
-                <div className="timetable-extra-fields"><label>День этой недели<select value={roomCheckDay} onChange={e=>setRoomCheckDay(Number(e.target.value))}>{weekDates.map(({day,date})=><option key={day} value={day}>{formatRuDateFull(date)}</option>)}</select></label>
-                <label>Пара<select value={roomCheckPeriod} onChange={e=>setRoomCheckPeriod(Number(e.target.value))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1} пара · {data.config.periodTimes?.[i]||""}</option>)}</select></label></div>
-                {(() => {const selected=weekDates.find(x=>x.day===roomCheckDay);if(!selected)return <span>Выберите день.</span>;
-                  if(scheduleLoading)return <span>Загружаем занятия кабинета…</span>;
-                  if(!publicCurrentWeekVisible)return <span>Неделя не опубликована.</span>;
-                  if(isNoClassDate(data,selected.date))return <b>Занятий нет (неучебный день).</b>;
-                  const result=lessonsFor(selected.day,selected.date);
-                  const busy=(result.regular||[]).filter(x=>Number(x.a?.period)===roomCheckPeriod&&!x.subOverride?.cancelled);
-                  const bookings=(data.practices||[]).some(p=>practiceRoomBookings(p).some(b=>b.date===selected.date&&Number(b.period)===roomCheckPeriod&&String(b.roomId)===String(viewId)));
-                  const attest=(data.interimAssessments||[]).some(a=>a.date===selected.date&&Number(a.period)===roomCheckPeriod&&String(a.roomId)===String(viewId));
-                  return busy.length||bookings||attest?<b>Занято · {busy.map(x=>lessonLabel(x.inst,data).subj).filter(Boolean).join(", ")||"практика / аттестация"}</b>:<b>Свободно по опубликованным данным</b>;
-                })()}
-              </div>}
               {scope === "week" && (
                 <div className="public-week-nav">
                   <button onClick={() => movePublicWeek(-1)} disabled={publicWeekSelectionEnabled && !publicVisibleWeeks.some((w)=>weekNum && w<weekNum)}>«</button>
