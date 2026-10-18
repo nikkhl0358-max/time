@@ -25105,6 +25105,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
   const [roomCategoryFilter, setRoomCategoryFilter] = useState("");
   const [roomCheckDay, setRoomCheckDay] = useState(0);
   const [roomCheckPeriod, setRoomCheckPeriod] = useState(0);
+  const [roomOverviewOpen, setRoomOverviewOpen] = useState(false);
   const [roomOverviewDate, setRoomOverviewDate] = useState(todayISO());
   const [roomOverview, setRoomOverview] = useState(null);
   const [roomOverviewLoading, setRoomOverviewLoading] = useState(false);
@@ -25245,7 +25246,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
   const weekDates = activeDayIndices.map((d) => ({ day: d, date: addDays(monday, d) }));
   const overviewDate = roomOverviewDate;
   useEffect(() => {
-    if (kind !== "room" || !overviewDate) return;
+    if (kind !== "room" || !roomOverviewOpen || !overviewDate) return;
     const controller = new AbortController();
     setRoomOverviewLoading(true);
     setRoomOverviewError("");
@@ -25256,7 +25257,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
       .catch(error=>{if(error.name!=="AbortError")setRoomOverviewError(error.message||"Ошибка загрузки");})
       .finally(()=>{if(!controller.signal.aborted)setRoomOverviewLoading(false);});
     return ()=>controller.abort();
-  }, [kind, overviewDate, roomCheckPeriod, data.publishedAt]);
+  }, [kind, roomOverviewOpen, overviewDate, roomCheckPeriod, data.publishedAt]);
   const rangeLabel = weekDates.length
     ? `${formatRuDate(weekDates[0].date)} – ${formatRuDate(weekDates[weekDates.length - 1].date)}`
     : "";
@@ -25733,26 +25734,33 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
       )}
 
       {kind === "room" && (
-        <div className="public-room-overview">
-          <div className="public-room-overview-heading"><strong>Занятость всех кабинетов</strong><span>Выберите дату и пару — покажем все свободные и занятые аудитории</span></div>
-          <div className="public-room-overview-body">
+        <section className="public-room-overview">
+          <button type="button" className="public-room-overview-toggle" aria-expanded={roomOverviewOpen} onClick={() => setRoomOverviewOpen(open => !open)}>
+            <span className="public-room-overview-toggle-title"><CalendarDays size={17} aria-hidden="true"/> Проверить занятость кабинетов</span>
+            <span className="public-room-overview-toggle-right">{roomOverviewOpen ? "Свернуть" : "Выбрать дату и пару"} <span aria-hidden="true">{roomOverviewOpen ? "▴" : "▾"}</span></span>
+          </button>
+          {roomOverviewOpen && <div className="public-room-overview-body">
             <div className="public-room-overview-filters">
               <label>Дата<input type="date" value={roomOverviewDate} min={data.config.semesterStart || undefined} max={data.config.semesterEnd || undefined} onChange={e=>setRoomOverviewDate(e.target.value)}/></label>
               <label>Пара<select value={roomCheckPeriod} onChange={e=>setRoomCheckPeriod(Number(e.target.value))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1} пара · {data.config.periodTimes?.[i]||""}</option>)}</select></label>
             </div>
-            <p className="public-room-overview-note">Статусы рассчитаны по опубликованному расписанию на выбранную дату и пару.</p>
             {roomOverviewLoading && <div className="public-room-overview-info">Проверяем занятость…</div>}
             {roomOverviewError && <div className="public-room-overview-info" role="alert">{roomOverviewError}</div>}
             {roomOverview && !roomOverviewLoading && (()=>{
-              const visible=(roomOverview.rooms||[]).sort((a,b)=>String(a.name).localeCompare(String(b.name),"ru",{numeric:true}));
+              const visible=[...(roomOverview.rooms||[])].sort((a,b)=>String(a.name).localeCompare(String(b.name),"ru",{numeric:true}));
               const free=visible.filter(r=>!r.busy), busy=visible.filter(r=>r.busy);
-              return <div className="public-room-overview-results">
-                <div className="public-room-overview-column"><h3>Свободно <span>{free.length}</span></h3>{free.length===0?<p>Нет свободных кабинетов</p>:free.map(r=><button key={r.id} className="public-room-overview-item" onClick={()=>{setViewId(r.id);setPickerOpen(false);}}> <strong>{r.name}</strong><span>Свободен</span></button>)}</div>
-                <div className="public-room-overview-column"><h3>Занято <span>{busy.length}</span></h3>{busy.length===0?<p>Занятых кабинетов нет</p>:busy.map(r=><button key={r.id} className="public-room-overview-item busy" onClick={()=>{setViewId(r.id);setPickerOpen(false);}}><strong>{r.name}</strong>{r.lessons.map((lesson,i)=><span key={i}>{[lesson.group,lesson.subject,lesson.teacher].filter(Boolean).join(" · ")}</span>)}</button>)}</div>
+              return <div className="public-room-overview-content">
+                <div className="public-room-overview-summary"><span><b>{free.length}</b> свободно</span><span><b>{busy.length}</b> занято</span><small>По опубликованному расписанию</small></div>
+                <div className="public-room-overview-section"><h3>Свободные кабинеты <span>{free.length}</span></h3>
+                  {free.length===0 ? <p className="public-room-overview-empty">Свободных кабинетов нет</p> : <div className="public-room-overview-chips">{free.map(r=><button type="button" key={r.id} className="public-room-chip" title={`Открыть расписание кабинета ${r.name}`} onClick={()=>{setViewId(r.id);setPickerOpen(false);}}>{r.name}</button>)}</div>}
+                </div>
+                <div className="public-room-overview-section"><h3>Занятые кабинеты <span>{busy.length}</span></h3>
+                  {busy.length===0 ? <p className="public-room-overview-empty">На эту пару занятых кабинетов нет</p> : <div className="public-room-overview-busy-list">{busy.map(r=><button type="button" key={r.id} className="public-room-busy-row" onClick={()=>{setViewId(r.id);setPickerOpen(false);}}><strong>{r.name}</strong><span>{(r.lessons||[]).map(lesson=>[lesson.group,lesson.subject,lesson.teacher].filter(Boolean).join(" · ")).join("; ") || "Занят"}</span><span aria-hidden="true">›</span></button>)}</div>}
+                </div>
               </div>;
             })()}
-          </div>
-        </div>
+          </div>}
+        </section>
       )}
       {kind === "room" && (
         <div className="public-search public-room-search">

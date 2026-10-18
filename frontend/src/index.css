@@ -39,3 +39,29 @@
 .public-room-overview-heading strong{font-size:17px}
 .public-room-overview-heading span{font-size:13px;color:#67788c}
 .public-room-overview-filters input[type=date]{width:100%;min-height:40px;padding:8px;border:1px solid #d8dfe9;border-radius:8px;background:#fff;color:inherit;font:inherit}
+
+/* Compact, opt-in room occupancy viewer */
+.public-room-overview{margin:12px 0 16px;border:1px solid #e2ddd3;border-radius:10px;background:#fff;overflow:hidden}
+.public-room-overview-toggle{padding:12px 15px;background:#fff;color:#263d59;font-size:14px;line-height:1.3}
+.public-room-overview-toggle:hover{background:#f7f8fa}
+.public-room-overview-toggle-title{display:inline-flex;align-items:center;gap:9px;font-weight:650}
+.public-room-overview-toggle-right{display:inline-flex;align-items:center;gap:9px;color:#6c7683;font-size:12px;font-weight:500;white-space:nowrap}
+.public-room-overview-body{padding:14px 16px 17px;border-top:1px solid #e9e9e9}
+.public-room-overview-filters{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.public-room-overview-filters label{min-width:0;font-size:12px;color:#4b5563}
+.public-room-overview-filters input[type=date],.public-room-overview-filters select{box-sizing:border-box;width:100%;min-height:38px;padding:7px 10px;border:1px solid #d8dce4;border-radius:7px;font:inherit;color:#273343;background:white}
+.public-room-overview-summary{display:flex;align-items:center;flex-wrap:wrap;gap:8px 15px;margin:14px 0 12px;font-size:12px;color:#475569}
+.public-room-overview-summary b{font-size:16px;color:#25374c}
+.public-room-overview-summary small{margin-left:auto;color:#8490a0;font-size:11px}
+.public-room-overview-section{padding-top:12px;border-top:1px solid #edf0f2;margin-top:12px}
+.public-room-overview-section h3{display:flex;align-items:center;gap:7px;margin:0 0 10px;font-size:13px;font-weight:700;color:#344054}
+.public-room-overview-section h3 span{font-size:12px;color:#98a2b3;font-weight:500}
+.public-room-overview-chips{display:flex;flex-wrap:wrap;gap:6px;max-height:190px;overflow-y:auto;align-content:flex-start}
+.public-room-chip{padding:6px 10px;border-radius:6px;border:1px solid #dbe5dd;background:#f5faf6;font-weight:600;font-size:12px;color:#34624a;cursor:pointer}
+.public-room-chip:hover{background:#e8f4eb;border-color:#b6d3c0}
+.public-room-overview-busy-list{display:grid;gap:5px;max-height:250px;overflow-y:auto}
+.public-room-busy-row{display:grid;grid-template-columns:minmax(50px,85px) minmax(0,1fr) 10px;align-items:center;gap:10px;text-align:left;border:1px solid #eee6dc;border-radius:7px;padding:8px 10px;background:#fffcf8;color:#3c4652;cursor:pointer}
+.public-room-busy-row strong{font-size:12px}.public-room-busy-row span{min-width:0;font-size:12px;line-height:1.35;color:#64748b;overflow-wrap:anywhere}
+.public-room-busy-row:hover{background:#fff5e8}
+.public-room-overview-empty{font-size:12px;color:#8190a0;margin:0 0 3px}
+@media(max-width:640px){.public-room-overview-toggle-right{font-size:11px}.public-room-overview-body{padding:12px}.public-room-overview-filters{grid-template-columns:1fr}.public-room-overview-summary small{margin-left:0;width:100%}}
