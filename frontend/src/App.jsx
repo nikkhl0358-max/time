@@ -23160,10 +23160,15 @@ function Stat({ label, value, good, warn }) {
     const record=(entry)=>{
       const ids=[...new Set((entry.teacherIds||[]).filter(Boolean).map(String))];
       if(!ids.length){review.push([entry.date,entry.group,entry.subject,entry.kind,"Не определён преподаватель"]);return;}
+      // Каждый участник потока считается отдельной группой и получает полную длительность пары.
+      const groups=[...new Set(String(entry.group||"").split(/,\s*/).map(x=>x.trim()).filter(Boolean))];
+      if(!groups.length)groups.push("—");
       for(const id of ids){
-        const key=[entry.key,id].join("|");if(dedup.has(key))continue;dedup.add(key);
-        detail.push({date:entry.date,period:entry.period,group:entry.group,subject:entry.subject,teacher:nameForTeacher(id,entry.teacherFallback),teacherId:id,
-          hours:entry.hours,kind:entry.kind,source:entry.source||"",note:entry.note||""});
+        for(const group of groups){
+          const key=[entry.key,id,group].join("|");if(dedup.has(key))continue;dedup.add(key);
+          detail.push({date:entry.date,period:entry.period,group,subject:entry.subject,teacher:nameForTeacher(id,entry.teacherFallback),teacherId:id,
+            hours:entry.hours,kind:entry.kind,source:entry.source||"",note:entry.note||""});
+        }
       }
     };
     for(const dateValue of days){
@@ -23226,6 +23231,7 @@ function ActualHoursPanel({data,set}) {
   const [reportEnd,setReportEnd]=useState(todayISO());
   const [teacherFilter,setTeacherFilter]=useState("");
   const [view,setView]=useState("summary");
+  const [expandedTeacher,setExpandedTeacher]=useState("");
   const [exportMsg,setExportMsg]=useState("");
   const [extraEntry,setExtraEntry]=useState({date:todayISO(),period:0,groupId:"",subject:"",teacherId:"",hours:2,note:""});
   const report=useMemo(()=>calculateActualHours(data,reportStart,reportEnd),[data,reportStart,reportEnd]);
@@ -23243,11 +23249,28 @@ function ActualHoursPanel({data,set}) {
 
   const filteredDetail=(report.detail||[]).filter(r=>!teacherFilter||String(r.teacherId)===String(teacherFilter));
   const filteredTotals=(report.totals||[]).filter(r=>!teacherFilter||String(r.teacherId)===String(teacherFilter));
+  // Each group of a stream is one separate accounting entry.
+  const subjectsByTeacher=useMemo(()=>{
+    const grouped=new Map();
+    for(const lesson of filteredDetail){
+      const teacherId=String(lesson.teacherId);
+      if(!grouped.has(teacherId))grouped.set(teacherId,new Map());
+      const bySubject=grouped.get(teacherId);
+      const subject=(lesson.subject||"Без названия дисциплины").trim();
+      if(!bySubject.has(subject))bySubject.set(subject,{subject,pairs:0,hours:0,groups:new Set(),lessons:[]});
+      const item=bySubject.get(subject);
+      item.pairs+=1;item.hours+=Number(lesson.hours)||0;item.lessons.push(lesson);
+      String(lesson.group||"").split(/,\s*/).map(x=>x.trim()).filter(Boolean).forEach(group=>item.groups.add(group));
+    }
+    return grouped;
+  },[filteredDetail]);
+  const detailedSubjects=(teacherId)=>[...(subjectsByTeacher.get(String(teacherId))||new Map()).values()].sort((a,b)=>a.subject.localeCompare(b.subject,"ru"));
   const download=()=>{
     if(report.error){setExportMsg(report.error);return;}
     const wb=XLSX.utils.book_new();
     const append=(name,rows,widths)=>{const ws=XLSX.utils.aoa_to_sheet(rows);ws["!cols"]=widths.map(w=>({wch:w}));XLSX.utils.book_append_sheet(wb,ws,name);};
     append("Свод по преподавателям",[["Преподаватель","Пар","Всего ак. ч.","По сетке и заменам","Переносы","Дополнительные"],...filteredTotals.map(t=>[t.name,t.pairs,t.hours,t.regular,t.moved,t.additional])],[38,12,16,23,16,19]);
+    append("По дисциплинам",[["Преподаватель","Дисциплина","Группы","Пар","Ак. часов"],...filteredTotals.flatMap(t=>detailedSubjects(t.teacherId).map(item=>[t.name,item.subject,[...item.groups].sort((a,b)=>a.localeCompare(b,"ru")).join(", "),item.pairs,item.hours]))],[38,44,55,12,16]);
     append("Детализация",[["Дата","Пара","Группа","Дисциплина","Преподаватель","Ак. часов","Основание","Исходная дата","Комментарий"],...filteredDetail.map(r=>[r.date,r.period,r.group,r.subject,r.teacher,r.hours,r.kind,r.source,r.note])],[16,9,25,43,38,13,23,18,48]);
     append("Требует сверки",[["Дата","Группа","Дисциплина","Тип","Причина"],...(report.review||[])],[16,25,43,22,65]);
     XLSX.writeFile(wb,`fakt_chasy_${reportStart}_${reportEnd}.xlsx`);
@@ -23257,9 +23280,22 @@ function ActualHoursPanel({data,set}) {
     <div className="actual-hours-controls"><label>С <input type="date" value={reportStart} onChange={e=>setReportStart(e.target.value)}/></label><label>По <input type="date" value={reportEnd} onChange={e=>setReportEnd(e.target.value)}/></label><label>Преподаватель<select value={teacherFilter} onChange={e=>setTeacherFilter(e.target.value)}><option value="">Все преподаватели</option>{(data.teachers||[]).slice().sort((a,b)=>a.name.localeCompare(b.name,"ru")).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><button className="btn primary" onClick={download}><Download size={14}/> Excel</button></div>
     {exportMsg&&<div className="notice">{exportMsg}</div>}
     {report.error?<div className="notice">{report.error}</div>:<>
-      <div className="actual-hours-stats"><div><b>{filteredTotals.length}</b><span>Преподавателей</span></div><div><b>{filteredDetail.reduce((v,r)=>v+r.hours,0)}</b><span>Академических часов</span></div><div><b>{filteredDetail.length}</b><span>Проведённых преподавательских занятий</span></div><div><b>{(report.review||[]).length}</b><span>Требуют сверки</span></div></div>
+      <div className="actual-hours-stats"><div><b>{filteredTotals.length}</b><span>Преподавателей</span></div><div><b>{filteredDetail.reduce((v,r)=>v+r.hours,0)}</b><span>Академических часов</span></div><div><b>{filteredDetail.length}</b><span>Проведённых пар по группам</span></div><div><b>{(report.review||[]).length}</b><span>Требуют сверки</span></div></div>
       <div className="actual-hours-tabs"><button className={view==="summary"?"btn primary":"btn ghost"} onClick={()=>setView("summary")}>Сводка</button><button className={view==="detail"?"btn primary":"btn ghost"} onClick={()=>setView("detail")}>Занятия</button><button className={view==="review"?"btn primary":"btn ghost"} onClick={()=>setView("review")}>Требует сверки</button></div>
-      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead>{view==="summary"?<tr><th>Преподаватель</th><th>Пар</th><th>Всего, ак. ч.</th><th>По сетке / заменам</th><th>Переносы</th><th>Дополнительные</th></tr>:view==="detail"?<tr><th>Дата</th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Преподаватель</th><th>Часы</th><th>Основание</th></tr>:<tr><th>Дата</th><th>Группа</th><th>Дисциплина</th><th>Тип</th><th>Причина</th></tr>}</thead><tbody>{view==="summary"?filteredTotals.map(r=><tr key={r.name}><td>{r.name}</td><td>{r.pairs}</td><td><b>{r.hours}</b></td><td>{r.regular}</td><td>{r.moved}</td><td>{r.additional}</td></tr>):view==="detail"?filteredDetail.map((r,i)=><tr key={`${r.date}-${r.teacherId}-${i}`}><td>{r.date}</td><td>{r.period}</td><td>{r.group}</td><td>{r.subject}</td><td>{r.teacher}</td><td>{r.hours}</td><td>{r.kind}</td></tr>):(report.review||[]).map((r,i)=><tr key={i}>{r.map((v,j)=><td key={j}>{v}</td>)}</tr>)}</tbody></table></div>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead>{view==="summary"?<tr><th>Преподаватель / дисциплины</th><th>Пар</th><th>Всего, ак. ч.</th><th>По сетке / заменам</th><th>Переносы</th><th>Дополнительные</th></tr>:view==="detail"?<tr><th>Дата</th><th>Пара</th><th>Группы</th><th>Дисциплина</th><th>Преподаватель</th><th>Часы</th><th>Основание</th></tr>:<tr><th>Дата</th><th>Группа</th><th>Дисциплина</th><th>Тип</th><th>Причина</th></tr>}</thead><tbody>{view==="summary"?filteredTotals.map(r=><Fragment key={r.teacherId||r.name}>
+        <tr className="actual-hours-teacher-row" onClick={()=>setExpandedTeacher(v=>v===String(r.teacherId)?"":String(r.teacherId))}>
+          <td><button type="button" className="actual-hours-teacher-toggle" aria-expanded={expandedTeacher===String(r.teacherId)}><span>{expandedTeacher===String(r.teacherId)?"▾":"▸"}</span> {r.name}</button></td>
+          <td>{r.pairs}</td><td><b>{r.hours}</b></td><td>{r.regular}</td><td>{r.moved}</td><td>{r.additional}</td>
+        </tr>
+        {expandedTeacher===String(r.teacherId)&&<tr className="actual-hours-expanded"><td colSpan={6}>
+          <div className="actual-hours-expanded-title">Нагрузка по дисциплинам и группам</div>
+          <table className="actual-hours-subject-table"><thead><tr><th>Дисциплина</th><th>Группы</th><th>Пар по группам</th><th>Ак. часов</th></tr></thead><tbody>
+          {detailedSubjects(r.teacherId).map(item=><Fragment key={item.subject}><tr className="actual-hours-subject-row"><td><strong>{item.subject}</strong></td><td>{[...item.groups].sort((a,b)=>a.localeCompare(b,"ru")).join(", ")||"—"}</td><td>{item.pairs}</td><td><strong>{item.hours}</strong></td></tr>
+          <tr><td colSpan={4}><details className="actual-hours-lessons"><summary>Показать занятия: {item.pairs}</summary><div className="actual-hours-lesson-scroll"><table><thead><tr><th>Дата</th><th>Пара</th><th>Группы</th><th>Часы</th><th>Тип занятия</th></tr></thead><tbody>{item.lessons.slice().sort((a,b)=>a.date.localeCompare(b.date)||Number(a.period)-Number(b.period)).map((lesson,i)=><tr key={`${lesson.date}-${lesson.period}-${i}`}><td>{lesson.date}</td><td>{lesson.period}</td><td>{lesson.group||"—"}</td><td>{lesson.hours}</td><td>{lesson.kind}{lesson.source?` (с ${lesson.source})`:""}</td></tr>)}</tbody></table></div></details></td></tr></Fragment>)}
+          </tbody></table>
+          <div className="actual-hours-expanded-footer">Итого: {r.pairs} пар · {r.hours} академических часов. Потоковые занятия рассчитаны отдельно по каждой группе.</div>
+        </td></tr>}
+      </Fragment>):view==="detail"?filteredDetail.map((r,i)=><tr key={`${r.date}-${r.teacherId}-${i}`}><td>{r.date}</td><td>{r.period}</td><td>{r.group}</td><td>{r.subject}</td><td>{r.teacher}</td><td>{r.hours}</td><td>{r.kind}</td></tr>):(report.review||[]).map((r,i)=><tr key={i}>{r.map((v,j)=><td key={j}>{v}</td>)}</tr>)}</tbody></table></div>
     </>}
     <details className="actual-hours-add"><summary>+ Дополнительное проведённое занятие</summary><div className="timetable-extra-fields"><label>Дата<input type="date" value={extraEntry.date} onChange={e=>setExtraEntry(v=>({...v,date:e.target.value}))}/></label><label>Пара<select value={extraEntry.period} onChange={e=>setExtraEntry(v=>({...v,period:Number(e.target.value)}))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1}</option>)}</select></label><label>Группа<select value={extraEntry.groupId} onChange={e=>setExtraEntry(v=>({...v,groupId:e.target.value}))}><option value="">Выберите группу</option>{(data.groups||[]).map(g=><option key={g.id} value={g.id}>{g.name}</option>)}</select></label><label>Преподаватель<select value={extraEntry.teacherId} onChange={e=>setExtraEntry(v=>({...v,teacherId:e.target.value}))}><option value="">Выберите преподавателя</option>{(data.teachers||[]).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Дисциплина<input value={extraEntry.subject} onChange={e=>setExtraEntry(v=>({...v,subject:e.target.value}))}/></label><label>Академических часов<select value={extraEntry.hours} onChange={e=>setExtraEntry(v=>({...v,hours:Number(e.target.value)}))}><option value={2}>2</option><option value={1}>1</option></select></label><label>Примечание<input value={extraEntry.note} onChange={e=>setExtraEntry(v=>({...v,note:e.target.value}))}/></label><button className="btn primary" onClick={saveExtraEntry}>Учесть занятие</button></div><div className="computer-hint">Дополнительные занятия учитываются в отчёте, но не резервируют кабинет.</div></details>
   </div>;
