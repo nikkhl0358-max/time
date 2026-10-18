@@ -10673,7 +10673,7 @@ function lessonLabel(inst, data) {
   if (inst?.isScheduleEvent) {
     return { subj: inst.eventTitle || scheduleEventLabel(inst), type: scheduleEventLabel(inst) };
   }
-  const subj = data.subjects.find((s) => s.id === inst.subjectId)?.name || "";
+  const subj = data.subjects.find((s) => s.id === inst.subjectId)?.name || inst.importSubject || "";
   const type = data.lessonTypes.find((t) => t.id === inst.typeId)?.name || "";
   return { subj, type };
 }
@@ -10729,6 +10729,18 @@ function movedCellForSubstitution(data, sub) {
   if (!data?.schedule || !sub || sub.type !== "moved" || !sub.targetDate) return null;
   const rawInst = (data.schedule.instances || []).find((i) => publicInstMatchesSubstitution(i, sub));
   const base = rawInst ? data.schedule.assignment?.[rawInst.instId] : null;
+  // Импортированная отмена может не иметь действующего instanceId: создаём
+  // виртуальную ЯЧЕЙКУ только для отображения назначенного переноса.
+  // Исходную сетку и нагрузку при этом не изменяем.
+  if ((!rawInst || !base) && sub.importUnresolved && sub.importGroupId && (sub.newTeacherId || sub.importOldTeacherId)) {
+    const subject=(data.subjects||[]).find(x=>String(x.name||"").trim().toLocaleLowerCase("ru-RU")===String(sub.importSubject||"").trim().toLocaleLowerCase("ru-RU"));
+    const inst={instId:`orphan-move-${sub.id}`,groupId:sub.importGroupId,teacherId:sub.newTeacherId||sub.importOldTeacherId,
+      subjectId:subject?.id||"",importSubject:sub.importSubject||"",format:sub.newFormat||"inperson",isImportedMove:true,
+      subgroup:0,halfPair:Number(sub.actualHours)===1};
+    return {inst,a:{day:weekdayOf(sub.targetDate),period:Number(sub.targetPeriod)||0,roomId:sub.newFormat==="remote"?null:(sub.newRoomId||null)},
+      subOverride:{substituted:true,moved:true,teacherId:inst.teacherId,note:sub.note||"Импортированный перенос",sourceDate:sub.date,
+        sourcePeriod:Math.max(0,(Number(sub.importOldPeriod)||1)-1),format:inst.format,changeType:"moved"}};
+  }
   if (!rawInst || !base) return null;
   const inst = sub.newFormat ? { ...rawInst, format: sub.newFormat } : rawInst;
   return {
@@ -20582,31 +20594,12 @@ ${check.reason || "Конфликт расписания"}
     const wb = XLSX.utils.book_new();
     const used = new Set();
     for (const teacher of teachers) {
-      const rows = semester ? excelSemesterRowsForEntity("teacher",teacher.id) : excelWeekRowsForEntity("teacher",teacher.id);
-      const monday = data.config.semesterStart ? addDays(mondayOf(data.config.semesterStart),(scheduleWeek-1)*7) : "";
-      const aoa = [
-        [teacher.name || ""],
-        [semester ? "Расписание на весь семестр" : `${monday ? formatDateDM(monday) : ""} — ${monday ? formatDateDM(addDays(monday,6)) : ""}`],
-        ["День", "Время", "Название", "Места проведения", "Учебные группы"]
-      ];
-      for (const row of rows) {
-        const date = !semester && monday ? addDays(monday,Number(row.day||0)) : "";
-        const day = `${DAY_LABELS_FULL[row.day] || ""}${date ? `, ${formatDateDM(date)}` : ""}`;
-        aoa.push([day, row.time || "", `${row.title||""}${semester && row.dates?.length ? `\n${excelSemesterDatesCaption(row.dates)}` : ""}`,row.room||"",row.groups||""]);
-      }
-      if (!rows.length) aoa.push(["Занятий нет"]);
-      const ws = XLSX.utils.aoa_to_sheet(aoa);
-      ws["!cols"] = [{wch:24},{wch:19},{wch:62},{wch:27},{wch:35}];
-      ws["!rows"] = [{hpt:26},{hpt:23},{hpt:28},...rows.map(()=>({hpt:38}))];
-      ws["!merges"] = [{s:{r:0,c:0},e:{r:0,c:4}},{s:{r:1,c:0},e:{r:1,c:4}}];
-      for(let r=0;r<aoa.length;r++)for(let c=0;c<aoa[r].length;c++){
-        const addr=XLSX.utils.encode_cell({r,c});if(!ws[addr])continue;
-        ws[addr].s={font:{bold:r<3,sz:r===0?15:11,color:{rgb:r===2?"FFFFFF":"25354A"}},
-          fill:r===2?{fgColor:{rgb:"254E7A"}}:(r>2&&r%2===0?{fgColor:{rgb:"F1F6FB"}}:undefined),
-          alignment:{vertical:"center",wrapText:true},border:r>=2?{bottom:{style:"hair",color:{rgb:"D9E2EC"}}}:undefined};
-      }
-      const base=String(teacher.name||"Преподаватель").replace(/[\\\/:*?\[\]]/g,"").slice(0,31)||"Преподаватель";
-      let title=base, n=2;while(used.has(title)){title=base.slice(0,27)+`_${n++}`;}used.add(title);
+      // Exactly the same formatted sheet as for a single teacher export.
+      const ws = makeSpbuExcelSheet("teacher", teacher, semester);
+      const base=excelSafeSheetName(teacher.name || "Преподаватель").slice(0,31);
+      let title=base,n=2;
+      while(used.has(title)) title=`${base.slice(0,27)}_${n++}`;
+      used.add(title);
       XLSX.utils.book_append_sheet(wb,ws,title);
     }
     const scope = semester ? "ves_semester" : `nedelya_${scheduleWeek}`;
@@ -23144,151 +23137,18 @@ function Stat({ label, value, good, warn }) {
   );
 }
 
-/* ============================== Замены ============================== */
 
-function SubstitutionsPanel({ data, set, onPublish }) {
-  const [date, setDate] = useState(todayISO());
-  const [editingKey, setEditingKey] = useState(null);
-  const [draggingId, setDraggingId] = useState(null);
-  const [dropId, setDropId] = useState(null);
-  const [error, setError] = useState("");
-  const [moveLater, setMoveLater] = useState(null);
-  const [joinSubgroup, setJoinSubgroup] = useState(null);
-  const [publishing, setPublishing] = useState(false);
-  const [publishMsg, setPublishMsg] = useState("");
-  const [exportMsg, setExportMsg] = useState("");
-  const [importMsg, setImportMsg] = useState("");
-  const [importBusy, setImportBusy] = useState(false);
-  const importSubFileRef = useRef(null);
-  const [filterGroupId, setFilterGroupId] = useState("");
-  const [filterTeacherId, setFilterTeacherId] = useState("");
-  const [onlyChanged, setOnlyChanged] = useState(false);
-  const [manualCancelled, setManualCancelled] = useState({date:todayISO(),period:0,groupId:"",subject:"",teacherId:"",note:""});
-  const [showManualCancelled, setShowManualCancelled] = useState(false);
-  const [reportStart, setReportStart] = useState(() => mondayOf(todayISO()));
-  const [reportEnd, setReportEnd] = useState(todayISO());
-  const [showActualReport, setShowActualReport] = useState(false);
-  const [extraEntry, setExtraEntry] = useState({date:todayISO(),period:0,groupId:"",subject:"",teacherId:"",hours:2,note:""});
-  const sched = data.schedule;
-
-  if (!sched) {
-    return <div className="section"><header className="section-head"><h1>Замены</h1></header><div className="notice">Сначала сгенерируйте расписание на вкладке «Расписание».</div></div>;
-  }
-
-  const importSubstitutionsFile = async (file) => {
-    if (!file || importBusy) return;
-    setImportBusy(true); setImportMsg("");
-    try {
-      const book = XLSX.read(await file.arrayBuffer(), {type:"array", cellDates:false});
-      const required = ["Дата","Группа","Предмет","Тип изменения"];
-      const normalize = (v) => String(v ?? "").trim().toLocaleLowerCase("ru-RU").replace(/ё/g,"е").replace(/\s+/g," ");
-      const parsed = new Map();
-      for (const sheetName of book.SheetNames) {
-        if (book.SheetNames.some(n=>n==="Все изменения") && sheetName!=="Все изменения") continue;
-        const rows = XLSX.utils.sheet_to_json(book.Sheets[sheetName], {defval:"",raw:false});
-        if (!rows.length || !required.every(k=>Object.prototype.hasOwnProperty.call(rows[0],k))) continue;
-        for (const r of rows) {
-          const id = String(r["ID записи"]||"").trim() || `xlsx-${["Дата","Группа","Предмет","Тип изменения","Был преподаватель","Стал преподаватель","Аудитория до","Аудитория после","Пара до","Пара после","Дата переноса","Примечание"].map(k=>normalize(r[k])).join("|")}`;
-          if (!parsed.has(id)) parsed.set(id,r);
-        }
-      }
-      if (!parsed.size) throw new Error("Не найдены строки с колонками 'Дата', 'Группа', 'Предмет', 'Тип изменения'.");
-      const current = data.substitutions || [];
-      const currentIds = new Set(current.map(s=>String(s.id)));
-      const scheduleInsts = data.schedule?.instances || [];
-      const instById = new Map(scheduleInsts.map(i=>[String(i.instId),i]));
-      const assignments = data.schedule?.assignment || {};
-      const groupByName = new Map((data.groups||[]).map(g=>[normalize(g.name),String(g.id)]));
-      const teacherByName = new Map((data.teachers||[]).map(t=>[normalize(t.name),String(t.id)]));
-      const roomByName = new Map((data.rooms||[]).map(r=>[normalize(r.name),String(r.id)]));
-      const subjectsById = new Map((data.subjects||[]).map(x=>[String(x.id),normalize(x.name)]));
-      const dateISO = (v) => {
-        const str=String(v||"").trim();
-        if (/^\d{4}-\d{2}-\d{2}/.test(str))return str.slice(0,10);
-        const m=str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
-        return m?`${m[3]}-${m[2]}-${m[1]}`:"";
-      };
-      let skipped=0, unresolved=0;
-      const additions=[];
-      const sampleUnresolved=[];
-      for (const [id,r] of parsed) {
-        if (currentIds.has(id)){skipped++;continue;}
-        const date=dateISO(r["Дата"]);
-        if(!date)throw new Error(`Неправильная дата в записи ${id}`);
-        const groupName=normalize(r["Группа"]), subjectName=normalize(r["Предмет"]);
-        const groupId=groupByName.get(groupName)||"";
-        const sourceInstId=String(r["ID занятия"]||"").trim();
-        let inst=instById.get(sourceInstId);
-        if(!inst) {
-          const options=scheduleInsts.filter(i=>{
-            const groups=streamGroups(i).map(String);
-            if (!groupId || (!groups.includes(groupId) && String(i.groupId)!==groupId))return false;
-            const subj=subjectsById.get(String(i.subjectId)) || subjectsById.get(String((data.loads||[]).find(l=>String(l.id)===String(i.loadId))?.subjectId||""));
-            return subj===subjectName && assignments[i.instId]?.day===weekdayOf(date) && instanceAppliesToDate(data.config,i,date);
-          });
-          const pair=Number(r["Пара до"]);
-          const narrowed=Number.isFinite(pair)&&pair>0?options.filter(i=>assignments[i.instId]?.period===pair-1):options;
-          if(narrowed.length===1)inst=narrowed[0];
-          else if(options.length===1)inst=options[0];
-        }
-        if(!inst) {unresolved++;if(sampleUnresolved.length<6)sampleUnresolved.push(`${r["Дата"]} ${r["Группа"]} — ${r["Предмет"]}`);}
-        const rawType=normalize(r["Тип изменения"]);
-        const type=rawType.includes("задани")?"cancel_assignment":rawType.includes("отмен")?"cancel":rawType.includes("перенос")?"moved":rawType.includes("ожида")?"pending_move":"sub";
-        const oldTeacher=normalize(r["Был преподаватель"]),newTeacher=normalize(r["Стал преподаватель"]);
-        const oldRoom=normalize(r["Аудитория до"]),newRoom=normalize(r["Аудитория после"]);
-        const teacherId=teacherByName.get(newTeacher)||"";
-        const roomId=roomByName.get(newRoom)||"";
-        const row={id,date,instId:inst?.instId||sourceInstId,type,newTeacherId:teacherId,newRoomId:roomId,note:String(r["Примечание"]||""),importSource:String(r["Источник"]||""),importOriginalInstId:sourceInstId,importGroup:String(r["Группа"]||""),importSubject:String(r["Предмет"]||""),importOldTeacher:String(r["Был преподаватель"]||""),importNewTeacher:String(r["Стал преподаватель"]||""),importOldRoom:String(r["Аудитория до"]||""),importNewRoom:String(r["Аудитория после"]||""),importOldPeriod:String(r["Пара до"]||""),importNewPeriod:String(r["Пара после"]||""),importUnresolved:!inst, pendingForReplacement:!inst, importGroupId:groupId, importOldTeacherId:teacherByName.get(oldTeacher)||""};
-        if(type==="moved"){
-          row.targetDate=dateISO(r["Дата переноса"]);
-          const targetPeriod=Number(r["Пара после"]);
-          if(Number.isFinite(targetPeriod)&&targetPeriod>0)row.targetPeriod=targetPeriod-1;
-        } else {
-          const afterPeriod=Number(r["Пара после"]);
-          if(Number.isFinite(afterPeriod)&&afterPeriod>0)row.newPeriod=afterPeriod-1;
-        }
-        additions.push(row);
-      }
-      if(!additions.length){setImportMsg(`Новых записей нет. Уже имеются: ${skipped}.`);return;}
-      const warning=unresolved?`\n\nНе привязаны к текущим занятиям: ${unresolved}. Они появятся в разделе «Неназначенные / ожидают замены» с исходными названиями. Размещённое расписание не изменится.\n${sampleUnresolved.join("\n")}`:"";
-      if(!window.confirm(`Импорт замен из ${file.name}\nНовых записей: ${additions.length}\nУже существующих ID: ${skipped}\nТекущее расписание и записи замен не удаляются.${warning}\n\nДобавить записи?`))return;
-      set("substitutions")([...current,...additions]);
-      setImportMsg(`Импортировано ${additions.length}; уже существовали ${skipped}; в «Неназначенные / ожидают замены» отправлено ${unresolved}. Сохраните изменения в системе.`);
-    } catch(e){setImportMsg(`Ошибка импорта: ${e.message||e}`);} finally {setImportBusy(false);}
-  };
-
-  const saveManualCancelled = () => {
-    if (!manualCancelled.date || !manualCancelled.groupId || !manualCancelled.subject.trim()) {
-      setImportMsg("Укажите дату, группу и название дисциплины.");return;
-    }
-    const row={id:uid(),date:manualCancelled.date,instId:`manual-${uid()}`,type:"pending_move",
-      importUnresolved:true,manualCancellation:true,pendingForReplacement:true,importGroupId:manualCancelled.groupId,importOldTeacherId:manualCancelled.teacherId,importGroup:(data.groups||[]).find(g=>g.id===manualCancelled.groupId)?.name||"",
-      importSubject:manualCancelled.subject.trim(),importOldTeacher:(data.teachers||[]).find(t=>t.id===manualCancelled.teacherId)?.name||"",
-      importOldPeriod:String(Number(manualCancelled.period)+1),note:manualCancelled.note||"Ожидает переноса"};
-    set("substitutions")([...(data.substitutions||[]),row]);
-    setShowManualCancelled(false);setImportMsg("Отменённая пара сохранена в реестре. Для включения в сетку свяжите её с действующим занятием.");
-  };
-  const saveExtraEntry = () => {
-    if (!extraEntry.date || !extraEntry.teacherId || !extraEntry.groupId || !extraEntry.subject.trim() || ![1,2].includes(Number(extraEntry.hours))) {
-      setExportMsg("Для дополнительного занятия укажите дату, преподавателя, группу, дисциплину и 1 или 2 академических часа.");return;
-    }
-    const teacher=(data.teachers||[]).find(t=>String(t.id)===String(extraEntry.teacherId));
-    const group=(data.groups||[]).find(g=>String(g.id)===String(extraEntry.groupId));
-    set("substitutions")([...(data.substitutions||[]),{id:uid(),date:extraEntry.date,type:"extra",instId:`extra-${uid()}`,
-      newTeacherId:extraEntry.teacherId,importGroupId:extraEntry.groupId,importGroup:group?.name||"",importSubject:extraEntry.subject.trim(),
-      importNewTeacher:teacher?.name||"",importNewPeriod:String(Number(extraEntry.period)+1),actualHours:Number(extraEntry.hours),note:extraEntry.note||"Дополнительное занятие",manualExtra:true}]);
-    setExportMsg("Дополнительное занятие добавлено. Сохраните изменения; оно появится в отчёте по факту.");
-  };
-  const exportActualHours = () => {
-    if(!reportStart||!reportEnd||reportStart>reportEnd){setExportMsg("Проверьте даты отчёта.");return;}
+/* Фактическая нагрузка — самостоятельная вкладка. */
+  const calculateActualHours = (data,reportStart,reportEnd) => {
+    if(!reportStart||!reportEnd||reportStart>reportEnd){return {error:"Проверьте даты отчёта."};}
     const days=datesBetween(reportStart,reportEnd);
-    if(days.length>190){setExportMsg("Максимальный период одного отчёта — 190 дней.");return;}
+    if(days.length>190){return {error:"Максимальный период одного отчёта — 190 дней."};}
+    const sched=data.schedule||{};
     const substitutions=data.substitutions||[];
     const instances=sched.instances||[];
     const assignment=sched.assignment||{};
     const teacherNames=new Map((data.teachers||[]).map(t=>[String(t.id),t.name]));
     const groupNames=new Map((data.groups||[]).map(g=>[String(g.id),g.name]));
-    const instById=new Map(instances.map(inst=>[String(inst.instId),inst]));
     const changesBySource=new Map();
     for(const sub of substitutions){
       if(!sub.date||!sub.instId)continue;
@@ -23328,7 +23188,7 @@ function SubstitutionsPanel({ data, set, onPublish }) {
       if(!cell){review.push([sub.targetDate,sub.importGroup||"",sub.importSubject||"","Перенос","Не удалось связать с исходной парой; часы не начислены"]);continue;}
       const inst=cell.inst;
       record({key:`moved|${sub.id||`${sub.date}|${sub.instId}`}`,date:sub.targetDate,period:Number(cell.a.period)+1,
-        group:instanceGroupNames(data,inst).join(", ")||sub.importGroup||"",subject:labelForInst(inst)||sub.importSubject||"",
+        group:instanceGroupNames(data,inst).join(", ")||sub.importGroup||"",subject:inst.isImportedMove?(sub.importSubject||""):(labelForInst(inst)||sub.importSubject||""),
         teacherIds:sub.newTeacherId?[sub.newTeacherId]:instanceTeacherIds(inst),hours:(inst.halfPair||assignment[inst.instId]?.half!=null&&assignment[inst.instId]?.half!=="")?1:2,
         kind:"Перенос",source:sub.date,note:sub.note||""});
     }
@@ -23344,6 +23204,7 @@ function SubstitutionsPanel({ data, set, onPublish }) {
     }
     for(const sub of substitutions){
       if(!sub.importUnresolved||["extra","additional"].includes(sub.type))continue;
+      if(sub.type==="moved"&&movedCellForSubstitution(data,sub))continue;
       const dateValue=sub.type==="moved"&&sub.targetDate?sub.targetDate:sub.date;
       if(dateValue<reportStart||dateValue>reportEnd)continue;
       review.push([dateValue,sub.importGroup||"",sub.importSubject||"",sub.type==="moved"?"Перенос":"Неназначенная / отменённая", "Не связана с занятием сетки; не включена в фактические часы"]);
@@ -23357,16 +23218,182 @@ function SubstitutionsPanel({ data, set, onPublish }) {
       else t.regular+=row.hours;
       total.set(row.teacherId,t);
     }
+    return {detail,review,totals:[...total.values()].sort((a,b)=>a.name.localeCompare(b.name,"ru"))};
+  };
+
+function ActualHoursPanel({data,set}) {
+  const [reportStart,setReportStart]=useState(()=>mondayOf(todayISO()));
+  const [reportEnd,setReportEnd]=useState(todayISO());
+  const [teacherFilter,setTeacherFilter]=useState("");
+  const [view,setView]=useState("summary");
+  const [exportMsg,setExportMsg]=useState("");
+  const [extraEntry,setExtraEntry]=useState({date:todayISO(),period:0,groupId:"",subject:"",teacherId:"",hours:2,note:""});
+  const report=useMemo(()=>calculateActualHours(data,reportStart,reportEnd),[data,reportStart,reportEnd]);
+  const saveExtraEntry = () => {
+    if (!extraEntry.date || !extraEntry.teacherId || !extraEntry.groupId || !extraEntry.subject.trim() || ![1,2].includes(Number(extraEntry.hours))) {
+      setExportMsg("Для дополнительного занятия укажите дату, преподавателя, группу, дисциплину и 1 или 2 академических часа.");return;
+    }
+    const teacher=(data.teachers||[]).find(t=>String(t.id)===String(extraEntry.teacherId));
+    const group=(data.groups||[]).find(g=>String(g.id)===String(extraEntry.groupId));
+    set("substitutions")([...(data.substitutions||[]),{id:uid(),date:extraEntry.date,type:"extra",instId:`extra-${uid()}`,
+      newTeacherId:extraEntry.teacherId,importGroupId:extraEntry.groupId,importGroup:group?.name||"",importSubject:extraEntry.subject.trim(),
+      importNewTeacher:teacher?.name||"",importNewPeriod:String(Number(extraEntry.period)+1),actualHours:Number(extraEntry.hours),note:extraEntry.note||"Дополнительное занятие",manualExtra:true}]);
+    setExportMsg("Дополнительное занятие добавлено. Сохраните изменения; оно появится в отчёте по факту.");
+  };
+
+  const filteredDetail=(report.detail||[]).filter(r=>!teacherFilter||String(r.teacherId)===String(teacherFilter));
+  const filteredTotals=(report.totals||[]).filter(r=>!teacherFilter||String(r.teacherId)===String(teacherFilter));
+  const download=()=>{
+    if(report.error){setExportMsg(report.error);return;}
     const wb=XLSX.utils.book_new();
     const append=(name,rows,widths)=>{const ws=XLSX.utils.aoa_to_sheet(rows);ws["!cols"]=widths.map(w=>({wch:w}));XLSX.utils.book_append_sheet(wb,ws,name);};
-    append("Свод по преподавателям",[["Преподаватель","Пар","Всего ак. ч.","По сетке и заменам","Переносы","Дополнительные","С","По"],
-      ...[...total.values()].sort((a,b)=>a.name.localeCompare(b.name,"ru")).map(t=>[t.name,t.pairs,t.hours,t.regular,t.moved,t.additional,reportStart,reportEnd])],[38,12,16,23,16,19,16,16]);
-    append("Детализация",[["Дата","Пара","Группа","Дисциплина","Преподаватель","Ак. часов","Основание","Исходная дата","Комментарий"],
-      ...detail.sort((a,b)=>a.date.localeCompare(b.date)||a.period-b.period||a.teacher.localeCompare(b.teacher,"ru"))
-        .map(r=>[r.date,r.period,r.group,r.subject,r.teacher,r.hours,r.kind,r.source,r.note])],[16,9,25,43,38,13,23,18,48]);
-    append("Требует сверки",[["Дата","Группа","Дисциплина","Тип","Причина"],...review],[16,25,43,22,65]);
+    append("Свод по преподавателям",[["Преподаватель","Пар","Всего ак. ч.","По сетке и заменам","Переносы","Дополнительные"],...filteredTotals.map(t=>[t.name,t.pairs,t.hours,t.regular,t.moved,t.additional])],[38,12,16,23,16,19]);
+    append("Детализация",[["Дата","Пара","Группа","Дисциплина","Преподаватель","Ак. часов","Основание","Исходная дата","Комментарий"],...filteredDetail.map(r=>[r.date,r.period,r.group,r.subject,r.teacher,r.hours,r.kind,r.source,r.note])],[16,9,25,43,38,13,23,18,48]);
+    append("Требует сверки",[["Дата","Группа","Дисциплина","Тип","Причина"],...(report.review||[])],[16,25,43,22,65]);
     XLSX.writeFile(wb,`fakt_chasy_${reportStart}_${reportEnd}.xlsx`);
-    setExportMsg(`Отчёт: ${total.size} преподавателей, ${detail.length} учтённых преподавательских занятий, ${review.length} записей для сверки. Листы: свод, детализация, требует сверки. Данные отражают записи расписания и замен, а не подтверждение посещаемости.`);
+  };
+  return <div className="section actual-hours-section">
+    <header className="section-head"><div><h1>Фактически проведённые часы</h1><p>Сетка, замены, переносы и дополнительные занятия. Отменённые пары исключены. Не связанные с сеткой записи требуют сверки.</p></div></header>
+    <div className="actual-hours-controls"><label>С <input type="date" value={reportStart} onChange={e=>setReportStart(e.target.value)}/></label><label>По <input type="date" value={reportEnd} onChange={e=>setReportEnd(e.target.value)}/></label><label>Преподаватель<select value={teacherFilter} onChange={e=>setTeacherFilter(e.target.value)}><option value="">Все преподаватели</option>{(data.teachers||[]).slice().sort((a,b)=>a.name.localeCompare(b.name,"ru")).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><button className="btn primary" onClick={download}><Download size={14}/> Excel</button></div>
+    {exportMsg&&<div className="notice">{exportMsg}</div>}
+    {report.error?<div className="notice">{report.error}</div>:<>
+      <div className="actual-hours-stats"><div><b>{filteredTotals.length}</b><span>Преподавателей</span></div><div><b>{filteredDetail.reduce((v,r)=>v+r.hours,0)}</b><span>Академических часов</span></div><div><b>{filteredDetail.length}</b><span>Проведённых преподавательских занятий</span></div><div><b>{(report.review||[]).length}</b><span>Требуют сверки</span></div></div>
+      <div className="actual-hours-tabs"><button className={view==="summary"?"btn primary":"btn ghost"} onClick={()=>setView("summary")}>Сводка</button><button className={view==="detail"?"btn primary":"btn ghost"} onClick={()=>setView("detail")}>Занятия</button><button className={view==="review"?"btn primary":"btn ghost"} onClick={()=>setView("review")}>Требует сверки</button></div>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead>{view==="summary"?<tr><th>Преподаватель</th><th>Пар</th><th>Всего, ак. ч.</th><th>По сетке / заменам</th><th>Переносы</th><th>Дополнительные</th></tr>:view==="detail"?<tr><th>Дата</th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Преподаватель</th><th>Часы</th><th>Основание</th></tr>:<tr><th>Дата</th><th>Группа</th><th>Дисциплина</th><th>Тип</th><th>Причина</th></tr>}</thead><tbody>{view==="summary"?filteredTotals.map(r=><tr key={r.name}><td>{r.name}</td><td>{r.pairs}</td><td><b>{r.hours}</b></td><td>{r.regular}</td><td>{r.moved}</td><td>{r.additional}</td></tr>):view==="detail"?filteredDetail.map((r,i)=><tr key={`${r.date}-${r.teacherId}-${i}`}><td>{r.date}</td><td>{r.period}</td><td>{r.group}</td><td>{r.subject}</td><td>{r.teacher}</td><td>{r.hours}</td><td>{r.kind}</td></tr>):(report.review||[]).map((r,i)=><tr key={i}>{r.map((v,j)=><td key={j}>{v}</td>)}</tr>)}</tbody></table></div>
+    </>}
+    <details className="actual-hours-add"><summary>+ Дополнительное проведённое занятие</summary><div className="timetable-extra-fields"><label>Дата<input type="date" value={extraEntry.date} onChange={e=>setExtraEntry(v=>({...v,date:e.target.value}))}/></label><label>Пара<select value={extraEntry.period} onChange={e=>setExtraEntry(v=>({...v,period:Number(e.target.value)}))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1}</option>)}</select></label><label>Группа<select value={extraEntry.groupId} onChange={e=>setExtraEntry(v=>({...v,groupId:e.target.value}))}><option value="">Выберите группу</option>{(data.groups||[]).map(g=><option key={g.id} value={g.id}>{g.name}</option>)}</select></label><label>Преподаватель<select value={extraEntry.teacherId} onChange={e=>setExtraEntry(v=>({...v,teacherId:e.target.value}))}><option value="">Выберите преподавателя</option>{(data.teachers||[]).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Дисциплина<input value={extraEntry.subject} onChange={e=>setExtraEntry(v=>({...v,subject:e.target.value}))}/></label><label>Академических часов<select value={extraEntry.hours} onChange={e=>setExtraEntry(v=>({...v,hours:Number(e.target.value)}))}><option value={2}>2</option><option value={1}>1</option></select></label><label>Примечание<input value={extraEntry.note} onChange={e=>setExtraEntry(v=>({...v,note:e.target.value}))}/></label><button className="btn primary" onClick={saveExtraEntry}>Учесть занятие</button></div><div className="computer-hint">Дополнительные занятия учитываются в отчёте, но не резервируют кабинет.</div></details>
+  </div>;
+}
+
+/* ============================== Замены ============================== */
+
+function SubstitutionsPanel({ data, set, onPublish }) {
+  const [date, setDate] = useState(todayISO());
+  const [editingKey, setEditingKey] = useState(null);
+  const [draggingId, setDraggingId] = useState(null);
+  const [dropId, setDropId] = useState(null);
+  const [error, setError] = useState("");
+  const [moveLater, setMoveLater] = useState(null);
+  const [orphanMove,setOrphanMove]=useState(null);
+  const [joinSubgroup, setJoinSubgroup] = useState(null);
+  const [publishing, setPublishing] = useState(false);
+  const [publishMsg, setPublishMsg] = useState("");
+  const [exportMsg, setExportMsg] = useState("");
+  const [importMsg, setImportMsg] = useState("");
+  const [importBusy, setImportBusy] = useState(false);
+  const importSubFileRef = useRef(null);
+  const [filterGroupId, setFilterGroupId] = useState("");
+  const [filterTeacherId, setFilterTeacherId] = useState("");
+  const [onlyChanged, setOnlyChanged] = useState(false);
+  const [manualCancelled, setManualCancelled] = useState({date:todayISO(),period:0,groupId:"",subject:"",teacherId:"",note:""});
+  const [showManualCancelled, setShowManualCancelled] = useState(false);
+  const sched = data.schedule;
+
+  if (!sched) {
+    return <div className="section"><header className="section-head"><h1>Замены</h1></header><div className="notice">Сначала сгенерируйте расписание на вкладке «Расписание».</div></div>;
+  }
+
+  const importSubstitutionsFile = async (file) => {
+    if (!file || importBusy) return;
+    setImportBusy(true); setImportMsg("");
+    try {
+      const book = XLSX.read(await file.arrayBuffer(), {type:"array", cellDates:false});
+      const required = ["Дата","Группа","Предмет","Тип изменения"];
+      const normalize = (v) => String(v ?? "").trim().toLocaleLowerCase("ru-RU").replace(/ё/g,"е").replace(/\s+/g," ");
+      const parsed = new Map();
+      for (const sheetName of book.SheetNames) {
+        if (book.SheetNames.some(n=>n==="Все изменения") && sheetName!=="Все изменения") continue;
+        const rows = XLSX.utils.sheet_to_json(book.Sheets[sheetName], {defval:"",raw:false});
+        if (!rows.length || !required.every(k=>Object.prototype.hasOwnProperty.call(rows[0],k))) continue;
+        for (const r of rows) {
+          const id = String(r["ID записи"]||"").trim() || `xlsx-${["Дата","Группа","Предмет","Тип изменения","Был преподаватель","Стал преподаватель","Аудитория до","Аудитория после","Пара до","Пара после","Дата переноса","Примечание"].map(k=>normalize(r[k])).join("|")}`;
+          if (!parsed.has(id)) parsed.set(id,r);
+        }
+      }
+      if (!parsed.size) throw new Error("Не найдены строки с колонками 'Дата', 'Группа', 'Предмет', 'Тип изменения'.");
+      const current = data.substitutions || [];
+      const currentIds = new Set(current.map(s=>String(s.id)));
+      const scheduleInsts = data.schedule?.instances || [];
+      const instById = new Map(scheduleInsts.map(i=>[String(i.instId),i]));
+      const assignments = data.schedule?.assignment || {};
+      const groupByName = new Map((data.groups||[]).map(g=>[normalize(g.name),String(g.id)]));
+      const teacherByName = new Map((data.teachers||[]).map(t=>[normalize(t.name),String(t.id)]));
+      const roomByName = new Map((data.rooms||[]).map(r=>[normalize(r.name),String(r.id)]));
+      const subjectsById = new Map((data.subjects||[]).map(x=>[String(x.id),normalize(x.name)]));
+      const dateISO = (v) => {
+        const str=String(v||"").trim();
+        if (/^\d{4}-\d{2}-\d{2}/.test(str))return str.slice(0,10);
+        const m=str.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+        return m?`${m[3]}-${m[2]}-${m[1]}`:"";
+      };
+      let skipped=0, unresolved=0, enriched=0;
+      const upgraded=new Map();
+      const additions=[];
+      const sampleUnresolved=[];
+      for (const [id,r] of parsed) {
+        const existing=current.find(x=>String(x.id)===id);
+        if (existing && existing.importGroup && existing.importSubject && existing.importOldTeacher) {skipped++;continue;}
+        const date=dateISO(r["Дата"]);
+        if(!date)throw new Error(`Неправильная дата в записи ${id}`);
+        const groupName=normalize(r["Группа"]), subjectName=normalize(r["Предмет"]);
+        const groupId=groupByName.get(groupName)||"";
+        const sourceInstId=String(r["ID занятия"]||"").trim();
+        let inst=instById.get(sourceInstId);
+        if(!inst) {
+          const options=scheduleInsts.filter(i=>{
+            const groups=streamGroups(i).map(String);
+            if (!groupId || (!groups.includes(groupId) && String(i.groupId)!==groupId))return false;
+            const subj=subjectsById.get(String(i.subjectId)) || subjectsById.get(String((data.loads||[]).find(l=>String(l.id)===String(i.loadId))?.subjectId||""));
+            return subj===subjectName && assignments[i.instId]?.day===weekdayOf(date) && instanceAppliesToDate(data.config,i,date);
+          });
+          const pair=Number(r["Пара до"]);
+          const narrowed=Number.isFinite(pair)&&pair>0?options.filter(i=>assignments[i.instId]?.period===pair-1):options;
+          if(narrowed.length===1)inst=narrowed[0];
+          else if(options.length===1)inst=options[0];
+        }
+        if(!inst) {unresolved++;if(sampleUnresolved.length<6)sampleUnresolved.push(`${r["Дата"]} ${r["Группа"]} — ${r["Предмет"]}`);}
+        const rawType=normalize(r["Тип изменения"]);
+        const type=rawType.includes("задани")?"cancel_assignment":rawType.includes("отмен")?"cancel":rawType.includes("перенос")?"moved":rawType.includes("ожида")?"pending_move":"sub";
+        const oldTeacher=normalize(r["Был преподаватель"]),newTeacher=normalize(r["Стал преподаватель"]);
+        const oldRoom=normalize(r["Аудитория до"]),newRoom=normalize(r["Аудитория после"]);
+        const teacherId=teacherByName.get(newTeacher)||"";
+        const roomId=roomByName.get(newRoom)||"";
+        const row={id,date,instId:inst?.instId||sourceInstId,type,newTeacherId:teacherId,newRoomId:roomId,note:String(r["Примечание"]||""),importSource:String(r["Источник"]||""),importOriginalInstId:sourceInstId,importGroup:String(r["Группа"]||""),importSubject:String(r["Предмет"]||""),importOldTeacher:String(r["Был преподаватель"]||""),importNewTeacher:String(r["Стал преподаватель"]||""),importOldRoom:String(r["Аудитория до"]||""),importNewRoom:String(r["Аудитория после"]||""),importOldPeriod:String(r["Пара до"]||""),importNewPeriod:String(r["Пара после"]||""),importUnresolved:!inst, pendingForReplacement:!inst, importGroupId:groupId, importOldTeacherId:teacherByName.get(oldTeacher)||""};
+        if(type==="moved"){
+          row.targetDate=dateISO(r["Дата переноса"]);
+          if(!row.targetDate)row.type="pending_move";
+          const targetPeriod=Number(r["Пара после"]);
+          if(Number.isFinite(targetPeriod)&&targetPeriod>0)row.targetPeriod=targetPeriod-1;
+        } else {
+          const afterPeriod=Number(r["Пара после"]);
+          if(Number.isFinite(afterPeriod)&&afterPeriod>0)row.newPeriod=afterPeriod-1;
+        }
+        if(existing){
+          // В уже сохранённых записях не стираем выбранные ранее поля и статусы.
+          const fill={};
+          for(const key of ["importGroup","importSubject","importOldTeacher","importNewTeacher","importOldRoom","importNewRoom","importOldPeriod","importNewPeriod","importGroupId","importOldTeacherId"])
+            if(!existing[key] && row[key])fill[key]=row[key];
+          if(Object.keys(fill).length){upgraded.set(id,{...existing,...fill});enriched++;}else skipped++;
+        }else additions.push(row);
+      }
+      if(!additions.length&&!upgraded.size){setImportMsg(`Новых данных нет. Уже имеются: ${skipped}.`);return;}
+      const warning=unresolved?`\n\nНе привязаны к текущим занятиям: ${unresolved}. Они появятся в разделе «Неназначенные / ожидают замены» с исходными названиями. Размещённое расписание не изменится.\n${sampleUnresolved.join("\n")}`:"";
+      if(!window.confirm(`Импорт замен из ${file.name}\nНовых записей: ${additions.length}\nУже существующих ID: ${skipped}\nТекущее расписание и записи замен не удаляются.${warning}\n\nДобавить записи?`))return;
+      set("substitutions")([...current.map(x=>upgraded.get(String(x.id))||x),...additions]);
+      setImportMsg(`Новых записей: ${additions.length}; восстановлены сведения в ${enriched}; без изменений ${skipped}; не сопоставлены с сеткой ${unresolved}. Сохраните изменения в системе.`);
+    } catch(e){setImportMsg(`Ошибка импорта: ${e.message||e}`);} finally {setImportBusy(false);}
+  };
+
+  const saveManualCancelled = () => {
+    if (!manualCancelled.date || !manualCancelled.groupId || !manualCancelled.subject.trim()) {
+      setImportMsg("Укажите дату, группу и название дисциплины.");return;
+    }
+    const row={id:uid(),date:manualCancelled.date,instId:`manual-${uid()}`,type:"pending_move",
+      importUnresolved:true,manualCancellation:true,pendingForReplacement:true,importGroupId:manualCancelled.groupId,importOldTeacherId:manualCancelled.teacherId,importGroup:(data.groups||[]).find(g=>g.id===manualCancelled.groupId)?.name||"",
+      importSubject:manualCancelled.subject.trim(),importOldTeacher:(data.teachers||[]).find(t=>t.id===manualCancelled.teacherId)?.name||"",
+      importOldPeriod:String(Number(manualCancelled.period)+1),note:manualCancelled.note||"Ожидает переноса"};
+    set("substitutions")([...(data.substitutions||[]),row]);
+    setShowManualCancelled(false);setImportMsg("Отменённая пара сохранена в реестре. Для включения в сетку свяжите её с действующим занятием.");
   };
   const day = weekdayOf(date);
   const byId = (arr, id) => arr.find((x) => x.id === id);
@@ -23430,6 +23457,25 @@ ${warnings.join("\n")}
 Всё равно назначить перенос?`))return false;
     writeSub(instId,{type:"moved",targetDate,targetPeriod:period,newFormat:effectiveFormat||undefined,newRoomId:effectiveFormat==="remote"?"":effectiveRoomId||undefined,note:`Перенос с ${formatDateDM(sourceDate)}`}, sourceDate);
     return true;
+  };
+
+  const saveOrphanMove = () => {
+    if(!orphanMove?.targetDate || !orphanMove.groupId || !orphanMove.teacherId || !orphanMove.subject?.trim()){
+      setError("Для переноса укажите новую дату, группу, преподавателя и дисциплину.");return;
+    }
+    if(orphanMove.targetDate===orphanMove.date){setError("Для переноса выберите другую дату.");return;}
+    if(orphanMove.format!=="remote"&&!orphanMove.roomId){setError("Выберите аудиторию или дистанционный формат.");return;}
+    const warnings=findDateConflicts(data,{date:orphanMove.targetDate,period:Number(orphanMove.period),
+      groupId:orphanMove.groupId,teacherId:orphanMove.teacherId,roomId:orphanMove.format==="remote"?"":orphanMove.roomId});
+    if(warnings.length&&!window.confirm(`На выбранную дату есть пересечения:\n${warnings.join("\n")}\nВсё равно назначить?`))return;
+    set("substitutions")((data.substitutions||[]).map(x=>String(x.id)!==String(orphanMove.id)?x:{...x,
+      type:"moved",targetDate:orphanMove.targetDate,targetPeriod:Number(orphanMove.period),
+      importGroupId:orphanMove.groupId,importGroup:data.groups.find(g=>String(g.id)===String(orphanMove.groupId))?.name||x.importGroup,
+      importSubject:orphanMove.subject.trim(),importOldTeacherId:orphanMove.teacherId,
+      importOldTeacher:data.teachers.find(t=>String(t.id)===String(orphanMove.teacherId))?.name||x.importOldTeacher,
+      newTeacherId:orphanMove.teacherId,newFormat:orphanMove.format,newRoomId:orphanMove.format==="remote"?"":orphanMove.roomId,
+      actualHours:Number(orphanMove.hours)||2,pendingForReplacement:false,note:x.note||"Назначен перенос отменённой пары"}));
+    setOrphanMove(null);setError("");setImportMsg("Перенос назначен. Сохраните изменения и опубликуйте расписание.");
   };
 
   const effective = (row, patch={}) => {
@@ -23506,7 +23552,7 @@ ${warnings.join("\n")}
   };
 
   const pendingItems = (data.substitutions || [])
-    .filter((x) => x.type === "pending_move")
+    .filter((x) => x.type === "pending_move" || (x.importUnresolved && x.pendingForReplacement && ["cancel","cancel_assignment"].includes(x.type)))
     .map((x) => {
       const source = resolveSourceRow(x.instId, x.date);
       const inst = source?.inst || instanceById.get(String(x.instId));
@@ -23722,11 +23768,10 @@ ${warnings.join("\n")}
         <button className="btn ghost sm" disabled={importBusy} onClick={()=>importSubFileRef.current?.click()} title="Добавить записи замен из Excel без удаления существующих">{importBusy?"Импортирую…":"↑ Импорт записей замен"}</button>
         <button className="btn ghost sm" onClick={()=>exportSubstitutionsExcel("week")} title="Выгрузить все замены, отмены и переносы за неделю выбранной даты"><Download size={14}/> Excel за неделю</button>
         <button className="btn ghost sm" onClick={()=>{setManualCancelled(v=>({...v,date}));setShowManualCancelled(v=>!v);}}>+ Отменённая пара вручную</button>
-        <button className="btn ghost sm" onClick={()=>setShowActualReport(v=>!v)}>Отчёт по часам</button>
+
         <button className="btn ghost sm" onClick={()=>exportSubstitutionsExcel("month")} title="Выгрузить все замены, отмены и переносы за календарный месяц выбранной даты"><Download size={14}/> Excel за месяц</button>
         {noOrdinaryClassesToday&&<span className="holiday-warn">⛔ день без обычных занятий</span>}
       </div>
-      {showActualReport&&<div className="notice timetable-extra-panel"><h3>Фактически проведённые занятия — отчёт и дополнительные пары</h3><p>Расчёт по сетке с заменами, переносами на целевую дату и отдельно введёнными дополнительными парами. Непривязанные записи выводятся на лист «Требует сверки».</p><div className="timetable-extra-fields"><label>С<input type="date" value={reportStart} onChange={e=>setReportStart(e.target.value)}/></label><label>По<input type="date" value={reportEnd} onChange={e=>setReportEnd(e.target.value)}/></label><button className="btn primary" onClick={exportActualHours}><Download size={14}/> Скачать отчёт Excel</button></div><h4>Дополнительное проведённое занятие</h4><div className="timetable-extra-fields"><label>Дата<input type="date" value={extraEntry.date} onChange={e=>setExtraEntry(v=>({...v,date:e.target.value}))}/></label><label>Пара<select value={extraEntry.period} onChange={e=>setExtraEntry(v=>({...v,period:Number(e.target.value)}))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1}</option>)}</select></label><label>Группа<select value={extraEntry.groupId} onChange={e=>setExtraEntry(v=>({...v,groupId:e.target.value}))}><option value="">Выберите группу</option>{(data.groups||[]).map(g=><option key={g.id} value={g.id}>{g.name}</option>)}</select></label><label>Преподаватель<select value={extraEntry.teacherId} onChange={e=>setExtraEntry(v=>({...v,teacherId:e.target.value}))}><option value="">Выберите преподавателя</option>{(data.teachers||[]).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select></label><label>Дисциплина<input value={extraEntry.subject} onChange={e=>setExtraEntry(v=>({...v,subject:e.target.value}))}/></label><label>Академических часов<select value={extraEntry.hours} onChange={e=>setExtraEntry(v=>({...v,hours:Number(e.target.value)}))}><option value={2}>2</option><option value={1}>1</option></select></label><label>Примечание<input value={extraEntry.note} onChange={e=>setExtraEntry(v=>({...v,note:e.target.value}))}/></label><button className="btn primary" onClick={saveExtraEntry}>+ Учесть занятие</button></div><div className="computer-hint">Введённые дополнительные занятия учитываются в отчёте, но сами по себе не размещаются в сетке и не резервируют кабинет.</div>{(data.substitutions||[]).filter(s=>s.type==="extra"||s.type==="additional").length>0&&<div className="pending-transfers-list">{(data.substitutions||[]).filter(s=>s.type==="extra"||s.type==="additional").map(s=><div className="pending-transfer-row" key={s.id}><span>{s.date} · {s.importGroup} · {s.importSubject} · {s.importNewTeacher} · {s.actualHours} ак. ч.</span><button className="btn ghost sm" onClick={()=>set("substitutions")((data.substitutions||[]).filter(x=>x.id!==s.id))}>Удалить</button></div>)}</div>}</div>}
       {showManualCancelled&&<div className="notice timetable-extra-panel"><h3>Добавить отменённую пару для последующего переноса</h3><div className="timetable-extra-fields">
         <label>Дата<input type="date" value={manualCancelled.date} onChange={e=>setManualCancelled(v=>({...v,date:e.target.value}))}/></label>
         <label>Номер пары<select value={manualCancelled.period} onChange={e=>setManualCancelled(v=>({...v,period:Number(e.target.value)}))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option value={i} key={i}>{i+1}</option>)}</select></label>
@@ -23756,7 +23801,7 @@ ${warnings.join("\n")}
         })}
         {rows.length===0&&<tr><td colSpan={7} className="empty-row">По выбранным фильтрам занятий нет</td></tr>}
       </tbody></table></div>
-      {pendingItems.length > 0 && <div className="pending-transfers"><div className="pending-transfers-head"><div><h2 className="sub-heading">Нужно назначить перенос</h2><p className="avail-hint">Отменены конкретные занятия, для которых дата переноса ещё не выбрана. Здесь показываются и импортированные записи, даже если они пока не привязаны к текущему расписанию.</p></div><div className="pending-count">{pendingItems.length}</div></div><div className="pending-transfers-list">{pendingItems.map(({ sub, inst, assignment, groupLabel, subjectLabel, teacherLabel, periodLabel, canAssign }) => <div key={sub.id} className={`pending-transfer-row${canAssign ? "" : " unresolved"}`}><div className="pending-transfer-main"><div className="pending-transfer-title"><b>{formatDateDM(sub.date)}</b><span>{groupLabel}</span><span>{subjectLabel}</span></div><div className="pending-transfer-meta"><span>{teacherLabel || "Преподаватель не указан"}</span><span>{periodLabel}</span>{sub.note && <span>{sub.note}</span>}{!canAssign && <span className="pending-warning">Не привязано к текущему расписанию</span>}</div></div><div className="pending-transfer-actions">{canAssign ? <button className="btn ghost sm" onClick={()=>setMoveLater({instId:sub.instId,sourceDate:sub.date,targetDate:"",targetPeriod:Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) : 0,newFormat:inst?.format||"inperson",newRoomId:assignment?.roomId||""})}>Назначить перенос</button> : <button className="btn ghost sm" disabled title="Сначала нужно привязать запись к занятию текущего расписания">Нет связи с занятием</button>}</div></div>)}</div></div>}
+      {pendingItems.length > 0 && <div className="pending-transfers"><div className="pending-transfers-head"><div><h2 className="sub-heading">Нужно назначить перенос</h2><p className="avail-hint">Отменены конкретные занятия, для которых дата переноса ещё не выбрана. Здесь показываются и импортированные записи, даже если они пока не привязаны к текущему расписанию.</p></div><div className="pending-count">{pendingItems.length}</div></div><div className="pending-transfers-list">{pendingItems.map(({ sub, inst, assignment, groupLabel, subjectLabel, teacherLabel, periodLabel, canAssign }) => <div key={sub.id} className={`pending-transfer-row${canAssign ? "" : " unresolved"}`}><div className="pending-transfer-main"><div className="pending-transfer-title"><b>{formatDateDM(sub.date)}</b><span>{groupLabel}</span><span>{subjectLabel}</span></div><div className="pending-transfer-meta"><span>{teacherLabel || "Преподаватель не указан"}</span><span>{periodLabel}</span>{sub.note && <span>{sub.note}</span>}{!canAssign && <span className="pending-warning">Не привязано к текущему расписанию</span>}</div></div><div className="pending-transfer-actions">{canAssign ? <button className="btn ghost sm" onClick={()=>setMoveLater({instId:sub.instId,sourceDate:sub.date,targetDate:"",targetPeriod:Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) : 0,newFormat:inst?.format||"inperson",newRoomId:assignment?.roomId||""})}>Назначить перенос</button> : <button className="btn primary sm" onClick={()=>{setError("");setOrphanMove({id:sub.id,date:sub.date,targetDate:"",period:Math.max(0,(Number(sub.importOldPeriod)||1)-1),groupId:sub.importGroupId||"",teacherId:sub.importOldTeacherId||"",subject:sub.importSubject||"",format:"inperson",roomId:"",hours:2});}}>Назначить перенос</button>}</div></div>)}</div></div>}
       {joinSubgroup && (()=>{
         const source=baseRows.find((r)=>String(r.inst.instId)===String(joinSubgroup.sourceInstId));
         if(!source) return <Modal title="Объединить подгруппы" onClose={()=>setJoinSubgroup(null)}><div className="notice">Исходная подгруппа не найдена на выбранную дату.</div></Modal>;
@@ -23777,6 +23822,20 @@ ${warnings.join("\n")}
           </tbody></table></div>
         </Modal>;
       })()}
+      {orphanMove && <Modal title="Перенос импортированной отменённой пары" onClose={()=>setOrphanMove(null)}>
+        <p className="muted">Исходная дата: {formatDateDM(orphanMove.date)}. Укажите недостающие данные, затем дату и место проведения. Исходную нагрузку не изменяем.</p>
+        {error&&<div className="notice">{error}</div>}
+        <div className="retake-form-grid">
+          <label>Группа<select value={orphanMove.groupId} onChange={e=>setOrphanMove(v=>({...v,groupId:e.target.value}))}><option value="">Выберите группу</option>{data.groups.map(g=><option value={g.id} key={g.id}>{g.name}</option>)}</select></label>
+          <label>Преподаватель<select value={orphanMove.teacherId} onChange={e=>setOrphanMove(v=>({...v,teacherId:e.target.value}))}><option value="">Выберите преподавателя</option>{data.teachers.map(t=><option value={t.id} key={t.id}>{t.name}</option>)}</select></label>
+          <label>Дисциплина<input value={orphanMove.subject} onChange={e=>setOrphanMove(v=>({...v,subject:e.target.value}))}/></label>
+          <label>Дата проведения<input type="date" value={orphanMove.targetDate} onChange={e=>setOrphanMove(v=>({...v,targetDate:e.target.value}))}/></label>
+          <label>Пара<select value={orphanMove.period} onChange={e=>setOrphanMove(v=>({...v,period:Number(e.target.value)}))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option value={i} key={i}>{i+1} пара</option>)}</select></label>
+          <label>Часы<select value={orphanMove.hours} onChange={e=>setOrphanMove(v=>({...v,hours:Number(e.target.value)}))}><option value={2}>2 ак. ч.</option><option value={1}>1 ак. ч.</option></select></label>
+          <label>Формат<select value={orphanMove.format} onChange={e=>setOrphanMove(v=>({...v,format:e.target.value,roomId:""}))}><option value="inperson">Очно</option><option value="remote">Дистанционно</option></select></label>
+          {orphanMove.format!=="remote"&&<label>Аудитория<select value={orphanMove.roomId} onChange={e=>setOrphanMove(v=>({...v,roomId:e.target.value}))}><option value="">Выберите кабинет</option>{data.rooms.map(r=><option value={r.id} key={r.id}>{r.name}</option>)}</select></label>}
+        </div><div className="inspect-actions"><button className="btn ghost" onClick={()=>setOrphanMove(null)}>Отмена</button><button className="btn primary" onClick={saveOrphanMove}>Сохранить перенос</button></div>
+      </Modal>}
       {moveLater && <Modal title="Назначить перенос конкретной пары" onClose={()=>setMoveLater(null)}><div className="retake-form-grid"><label>Исходная дата<input type="date" value={moveLater.sourceDate||date} disabled /></label><label>Дата переноса<input type="date" value={moveLater.targetDate||""} onChange={(e)=>setMoveLater({...moveLater,targetDate:e.target.value})}/></label><label>Пара<select value={moveLater.targetPeriod??0} onChange={(e)=>setMoveLater({...moveLater,targetPeriod:Number(e.target.value)})}>{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label><label>Формат<select value={moveLater.newFormat||"inperson"} onChange={(e)=>setMoveLater({...moveLater,newFormat:e.target.value,newRoomId:e.target.value==="remote"?"":(moveLater.newRoomId||"")})}><option value="inperson">Очно</option><option value="remote">ДО</option></select></label>{(moveLater.newFormat||"inperson")!=="remote"&&<label>Аудитория<SearchableSelect value={moveLater.newRoomId||""} onChange={(v)=>setMoveLater({...moveLater,newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Выберите аудиторию…"/></label>}</div><div className="inspect-actions"><button className="btn ghost" onClick={()=>setMoveLater(null)}>Отмена</button><button className="btn primary" disabled={!moveLater.targetDate} onClick={()=>{if(scheduleMove(moveLater.instId,moveLater.targetDate,moveLater.targetPeriod,moveLater.newFormat,moveLater.newRoomId,moveLater.sourceDate||date))setMoveLater(null)}}>Назначить перенос</button></div></Modal>}
     </div>
   );
@@ -25046,6 +25105,10 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
   const [roomCategoryFilter, setRoomCategoryFilter] = useState("");
   const [roomCheckDay, setRoomCheckDay] = useState(0);
   const [roomCheckPeriod, setRoomCheckPeriod] = useState(0);
+  const [roomOverviewOpen, setRoomOverviewOpen] = useState(false);
+  const [roomOverview, setRoomOverview] = useState(null);
+  const [roomOverviewLoading, setRoomOverviewLoading] = useState(false);
+  const [roomOverviewError, setRoomOverviewError] = useState("");
   const [pickerOpen, setPickerOpen] = useState(false);
   const [weekOffset, setWeekOffset] = useState(0);
   const [step, setStep] = useState(kind === "group" ? "specialty" : "schedule");
@@ -25180,6 +25243,20 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
 
   const monday = addDays(mondayOf(todayISO()), weekOffset * 7);
   const weekDates = activeDayIndices.map((d) => ({ day: d, date: addDays(monday, d) }));
+  const overviewDate = weekDates.find(x=>x.day===roomCheckDay)?.date || weekDates[0]?.date || "";
+  useEffect(() => {
+    if (kind !== "room" || !roomOverviewOpen || !overviewDate) return;
+    const controller = new AbortController();
+    setRoomOverviewLoading(true);
+    setRoomOverviewError("");
+    setRoomOverview(null);
+    fetch(`/api/public-room-availability?date=${encodeURIComponent(overviewDate)}&period=${roomCheckPeriod}`, {signal:controller.signal,cache:"no-store"})
+      .then(async r=>{const body=await r.json();if(!r.ok)throw new Error(body.error||"Не удалось загрузить занятость");return body;})
+      .then(body=>setRoomOverview(body))
+      .catch(error=>{if(error.name!=="AbortError")setRoomOverviewError(error.message||"Ошибка загрузки");})
+      .finally(()=>{if(!controller.signal.aborted)setRoomOverviewLoading(false);});
+    return ()=>controller.abort();
+  }, [kind, roomOverviewOpen, overviewDate, roomCheckPeriod, data.publishedAt]);
   const rangeLabel = weekDates.length
     ? `${formatRuDate(weekDates[0].date)} – ${formatRuDate(weekDates[weekDates.length - 1].date)}`
     : "";
@@ -25656,6 +25733,30 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
       )}
 
       {kind === "room" && (
+        <div className="public-room-overview">
+          <button type="button" className="public-room-overview-toggle" onClick={()=>setRoomOverviewOpen(v=>!v)} aria-expanded={roomOverviewOpen}>
+            <span>◷ &nbsp; Посмотреть свободные и занятые кабинеты</span><span>{roomOverviewOpen?"Свернуть −":"Открыть +"}</span>
+          </button>
+          {roomOverviewOpen && <div className="public-room-overview-body">
+            <div className="public-room-overview-filters">
+              <label>Дата<select value={roomCheckDay} onChange={e=>setRoomCheckDay(Number(e.target.value))}>{weekDates.map(({day,date})=><option key={day} value={day}>{formatRuDateFull(date)}</option>)}</select></label>
+              <label>Пара<select value={roomCheckPeriod} onChange={e=>setRoomCheckPeriod(Number(e.target.value))}>{Array.from({length:data.config.periodsPerDay||4},(_,i)=><option key={i} value={i}>{i+1} пара · {data.config.periodTimes?.[i]||""}</option>)}</select></label>
+            </div>
+            <p className="public-room-overview-note">Данные опубликованного расписания. Выберите день и пару, чтобы увидеть все кабинеты сразу.</p>
+            {roomOverviewLoading && <div className="public-room-overview-info">Проверяем занятость…</div>}
+            {roomOverviewError && <div className="public-room-overview-info" role="alert">{roomOverviewError}</div>}
+            {roomOverview && !roomOverviewLoading && (()=>{
+              const visible=(roomOverview.rooms||[]).filter(r=>!roomCategoryFilter || publicRoomCategory(byId(data.rooms,r.id))===roomCategoryFilter).filter(r=>!query.trim() || String(r.name||"").toLowerCase().includes(query.toLowerCase().trim())).sort((a,b)=>String(a.name).localeCompare(String(b.name),"ru",{numeric:true}));
+              const free=visible.filter(r=>!r.busy), busy=visible.filter(r=>r.busy);
+              return <div className="public-room-overview-results">
+                <div className="public-room-overview-column"><h3>Свободно <span>{free.length}</span></h3>{free.length===0?<p>Нет свободных кабинетов</p>:free.map(r=><button key={r.id} className="public-room-overview-item" onClick={()=>{setViewId(r.id);setPickerOpen(false);}}> <strong>{r.name}</strong><span>Свободен</span></button>)}</div>
+                <div className="public-room-overview-column"><h3>Занято <span>{busy.length}</span></h3>{busy.length===0?<p>Занятых кабинетов нет</p>:busy.map(r=><button key={r.id} className="public-room-overview-item busy" onClick={()=>{setViewId(r.id);setPickerOpen(false);}}><strong>{r.name}</strong>{r.lessons.map((lesson,i)=><span key={i}>{[lesson.group,lesson.subject,lesson.teacher].filter(Boolean).join(" · ")}</span>)}</button>)}</div>
+              </div>;
+            })()}
+          </div>}
+        </div>
+      )}
+      {kind === "room" && (
         <div className="public-search public-room-search">
           <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
             <select value={roomCategoryFilter} onChange={(e)=>{setRoomCategoryFilter(e.target.value); setPickerOpen(true);}} style={{width:"auto",minWidth:190}}>
@@ -25981,7 +26082,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                                 {(cell.inst.streamGroupIds || []).length > 0 ? <span className="ev-subgroup"> · 🔗 поток</span> : null}
                               </div>
                               <div className={`ev-row${duplicateRoomConflictText ? " public-room-conflict" : ""}`}><span className="ev-ico">📍</span> {duplicateRoomConflictText ? <>⚠ <b>Конфликт кабинетов:</b> {duplicateRoomConflictText}</> : (cell.inst.format === "remote" ? "дистанционно" : `ауд. ${room}`)}</div>
-                              <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" && teacherId ? <button type="button" className={`public-teacher-link${teacherChangedBySubstitution ? " public-teacher-replacement" : ""}`} onClick={() => onOpenTeacher?.(teacherId, viewId)} title="Открыть расписание преподавателя">{teacher}</button> : kind === "teacher" ? <button type="button" className="public-teacher-link" onClick={() => onOpenGroup?.(cell.inst.groupId || cell.inst.streamGroupIds?.[0])} title="Открыть расписание группы">{group}</button> : group}</div>
+                              <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" && teacherId ? <button type="button" className={`public-teacher-link${teacherChangedBySubstitution ? " public-teacher-replacement" : ""}`} onClick={() => onOpenTeacher?.(teacherId, viewId)} title="Открыть расписание преподавателя">{teacher}</button> : kind === "teacher" ? <span className="public-stream-group-links">{streamGroups(cell.inst).map((gid) => { const found=(data.groups||[]).find(g=>String(g.id)===String(gid)); return <button key={gid} type="button" className="public-teacher-link" onClick={() => onOpenGroup?.(gid)} title={`Открыть расписание группы ${found?.name||gid}`}>{found?.name||gid}</button>; })}</span> : group}</div>
                               {kind === "room" && teacher && <div className="ev-row"><span className="ev-ico">👤</span> {teacher}</div>}
                               {kind === "teacher" && teacherChangedBySubstitution && <div className="ev-row public-teacher-replacement-row"><span className="ev-ico">👤</span> <span className="public-teacher-replacement">{teacher} · замена</span></div>}
                               {cell.subOverride?.moved && <div className="ev-row ev-subgroup">↪ Перенесено с {formatDateDM(cell.subOverride.sourceDate)}{Number.isFinite(Number(cell.subOverride.sourcePeriod)) ? ` · ${Number(cell.subOverride.sourcePeriod)+1} пары` : ""}</div>}
@@ -26137,6 +26238,7 @@ const ADMIN_TABS = [
   { key: "graphs", label: "Графики", icon: ClipboardList },
   { key: "schedule", label: "Расписание", icon: Wand2 },
   { key: "substitutions", label: "Замены", icon: Repeat },
+  { key: "actualHours", label: "Фактические часы", icon: ClipboardList },
   { key: "scenarios", label: "Сценарии замен", icon: Repeat },
   { key: "attestation", label: "Промежуточная аттестация", icon: GraduationCap },
   { key: "practices", label: "Практики", icon: Repeat },
@@ -26166,6 +26268,7 @@ const TAB_SAVE_KEYS = {
   // mutate the base schedule. Shipping the multi-MB schedule on every change
   // made this page unnecessarily slow and could delay publication.
   substitutions: ["substitutions"],
+  actualHours: ["substitutions"],
   // Scenarios can create substitutions/retakes as well as the scenario record.
   scenarios: ["absenceScenarios","substitutions","retakes"],
   retakes: ["retakes"],
@@ -29293,6 +29396,24 @@ export default function App() {
   return (
     <div className="app-root">
       <style>{`${CSS}
+/* Published room occupancy overview */
+.public-room-overview{margin:16px 0 18px;border:1px solid #dce2ea;border-radius:12px;background:#fff;overflow:hidden}
+.public-room-overview-toggle{width:100%;display:flex;justify-content:space-between;align-items:center;gap:12px;padding:15px 18px;border:0;background:#f4f7fb;color:#193d6a;font-weight:650;text-align:left;cursor:pointer}
+.public-room-overview-body{padding:18px}
+.public-room-overview-filters{display:flex;gap:12px;flex-wrap:wrap}
+.public-room-overview-filters label{display:flex;flex:1;min-width:180px;flex-direction:column;gap:6px;font-size:13px;font-weight:600}
+.public-room-overview-filters select{width:100%;min-height:40px;padding:8px;border:1px solid #d8dfe9;border-radius:8px;background:#fff}
+.public-room-overview-note{font-size:12px;color:#657486;margin:12px 0}
+.public-room-overview-results{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px}
+.public-room-overview-column{min-width:0;display:flex;flex-direction:column;gap:7px}
+.public-room-overview-column h3{margin:0 0 5px;font-size:15px;display:flex;justify-content:space-between}
+.public-room-overview-column h3 span{font-weight:500;color:#69798e}
+.public-room-overview-item{display:flex;flex-direction:column;align-items:flex-start;gap:4px;text-align:left;background:#f4fbf6;border:1px solid #d6ebdb;border-radius:8px;padding:10px 12px;cursor:pointer;color:#24583b;overflow-wrap:anywhere}
+.public-room-overview-item.busy{background:#fff8f4;border-color:#f1e0d5;color:#713e2a}
+.public-room-overview-item span{font-size:12px;line-height:1.4}
+.public-room-overview-info{padding:12px;color:#50617a}
+@media(max-width:640px){.public-room-overview-results{grid-template-columns:1fr}.public-room-overview-body{padding:12px}}
+
 
 /* v1476: compact Graphs table + independent table scrolling.
    The graph grid owns both vertical and horizontal scrolling so the toolbar stays on screen.
@@ -29556,6 +29677,7 @@ export default function App() {
                 setScheduleRouteGroupId(next);
               }} />}
               {tab === "substitutions" && <SubstitutionsPanel data={data} set={set} onPublish={publishSchedule} />}
+              {tab === "actualHours" && <ActualHoursPanel data={data} set={set} />}
               {tab === "scenarios" && <SubstitutionScenariosPanel data={data} set={set} />}
               {tab === "attestation" && <AttestationPanel data={data} set={set} onPublish={publishSchedule} />}
               {tab === "practices" && <PracticesPanel data={data} set={set} />}

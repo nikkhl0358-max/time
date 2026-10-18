@@ -2918,6 +2918,109 @@ def public_status():
         return jsonify({"error": str(exc)}), 500
 
 
+@app.get("/api/public-room-availability")
+def public_room_availability():
+    """Published room occupancy for one actual date/period; no working draft leaks."""
+    from datetime import date as date_cls, timedelta
+    if _public_pause_state().get("paused"):
+        return jsonify({"error": "Публичное расписание временно недоступно"}), 503
+    date_str = str(request.args.get("date") or "")
+    try:
+        target = date_cls.fromisoformat(date_str)
+        period = int(request.args.get("period", "-1"))
+        if period < 0 or period > 20:
+            raise ValueError("invalid period")
+    except (ValueError, TypeError):
+        return jsonify({"error": "Некорректная дата или номер пары"}), 400
+    project, marker = _public_project_for_shard()
+    if not project:
+        return jsonify({"error": "Расписание не опубликовано"}), 404
+    cfg = project.get("config") or {}
+    try:
+        start = date_cls.fromisoformat(str(cfg.get("semesterStart")))
+        end = date_cls.fromisoformat(str(cfg.get("semesterEnd")))
+    except ValueError:
+        return jsonify({"error": "Даты семестра не настроены"}), 400
+    if not start <= target <= end:
+        return jsonify({"error": "Дата вне семестра"}), 400
+    week = ((target - (start - timedelta(days=start.weekday()))).days // 7) + 1
+    if project.get("publicWeekSelectionEnabled") is True and week not in {int(w) for w in (project.get("publishedWeeks") or []) if str(w).isdigit()}:
+        return jsonify({"error": "Неделя не опубликована"}), 404
+    schedule = project.get("schedule") or {}
+    instances = schedule.get("instances") or []
+    assignment = schedule.get("assignment") or {}
+    substitutions = project.get("substitutions") or []
+    subjects = {str(x.get("id")): x.get("name", "") for x in project.get("subjects", []) if isinstance(x, dict)}
+    groups = {str(x.get("id")): x.get("name", "") for x in project.get("groups", []) if isinstance(x, dict)}
+    teachers = {str(x.get("id")): x.get("name", "") for x in project.get("teachers", []) if isinstance(x, dict)}
+    rooms = project.get("rooms") or []
+    occupied = {str(r.get("id")): [] for r in rooms if isinstance(r, dict)}
+    def room_ids(a):
+        ids = [a.get("roomId"), a.get("extraRoomId")]
+        for key in ("roomIds", "additionalRoomIds", "extraRoomIds"):
+            for v in (a.get(key) or []):
+                ids.append((v.get("roomId") or v.get("id")) if isinstance(v, dict) else v)
+        return {str(v) for v in ids if v}
+    def add(rids, inst, teacher_id=None, label=None):
+        group_ids = _instance_group_ids(inst)
+        item = {"group": ", ".join(groups.get(str(g), str(g)) for g in group_ids),
+                "teacher": teachers.get(str(teacher_id or inst.get("teacherId") or ""), ""),
+                "subject": label or subjects.get(str(inst.get("subjectId") or ""), "Занятие")}
+        for rid in rids:
+            if rid in occupied and item not in occupied[rid]:
+                occupied[rid].append(item)
+    weekday = target.weekday()
+    # Same instance identifiers as the public room shards, including rewritten weekly ids.
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        a = assignment.get(str(inst.get("instId") or ""))
+        if not isinstance(a, dict) or int(a.get("day", -1)) != weekday or int(a.get("period", -1)) != period:
+            continue
+        if week not in _instance_weeks_py(cfg, inst):
+            continue
+        matching = next((sub for sub in substitutions if isinstance(sub, dict) and str(sub.get("date") or "") == date_str
+                        and bool(_public_instance_identity_ids(inst).intersection(_public_substitution_source_ids(sub)))), None)
+        if matching and matching.get("type") in {"cancel", "cancel_assignment", "pending_move", "moved"}:
+            continue
+        actual_period = int(matching.get("newPeriod") if matching and matching.get("newPeriod") is not None else period)
+        if actual_period != period:
+            continue
+        rids = room_ids(a)
+        if matching and matching.get("newFormat") == "remote":
+            rids = set()
+        elif matching and matching.get("newRoomId") and matching.get("type") != "join_subgroup":
+            rids = {str(matching["newRoomId"])}
+        add(rids, inst, matching.get("newTeacherId") if matching else None)
+    # Moved lessons are added to the target, not their original day.
+    instance_by_identity = {}
+    for inst in instances:
+        if isinstance(inst, dict):
+            for iid in _public_instance_identity_ids(inst):
+                instance_by_identity.setdefault(iid, inst)
+    for sub in substitutions:
+        if not isinstance(sub, dict) or sub.get("type") != "moved" or sub.get("targetDate") != date_str:
+            continue
+        ids = _public_substitution_source_ids(sub)
+        inst = next((instance_by_identity[x] for x in ids if x in instance_by_identity), None)
+        if not inst:
+            continue
+        a = assignment.get(str(inst.get("instId") or "")) or {}
+        target_period = sub.get("targetPeriod") if sub.get("targetPeriod") is not None else a.get("period", -1)
+        if int(target_period) != period or sub.get("newFormat") == "remote":
+            continue
+        add({str(sub.get("newRoomId"))} if sub.get("newRoomId") else room_ids(a), inst, sub.get("newTeacherId"))
+    for row in project.get("retakes") or []:
+        if isinstance(row, dict) and row.get("date") == date_str and int(row.get("period") or 0) == period:
+            add({str(row.get("roomId"))}, row, row.get("teacherId"), subjects.get(str(row.get("subjectId")), "Пересдача / перенос"))
+    for row in project.get("interimAssessments") or []:
+        if isinstance(row, dict) and row.get("date") == date_str and int(row.get("period") or 0) == period:
+            add({str(row.get("roomId"))}, row, row.get("teacherId"), "Промежуточная аттестация")
+    result = [{"id": str(r.get("id")), "name": r.get("name", ""), "busy": bool(occupied.get(str(r.get("id")))), "lessons": occupied.get(str(r.get("id")), [])}
+              for r in rooms if isinstance(r, dict)]
+    return jsonify({"date": date_str, "period": period, "rooms": result, "publication": marker})
+
+
 @app.get("/api/public-schedule/<kind>/<path:entity_id>")
 def public_schedule_shard(kind, entity_id):
     if _public_pause_state().get("paused"):
