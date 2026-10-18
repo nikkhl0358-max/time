@@ -1,7 +1,7 @@
 /**
- * A lossless, all-group snapshot of one timetable week into another.
- * The target graph contributes only requirements that do not exist in the
- * source snapshot; it never rewrites manual format / location choices.
+ * Copy placement from a source week onto the EXISTING canonical requirements of
+ * a target week.  Neither source-only rows nor repeated requirement identities
+ * may create additional semester demand.
  */
 export function planExactBulkWeekCopy({
   sourceWeek, targetWeek, currentWeek, instances, assignment, locked, unplaced,
@@ -11,10 +11,11 @@ export function planExactBulkWeekCopy({
   if (!Number.isInteger(source) || !Number.isInteger(target) || source < 1 || target < 1 || source === target) {
     throw new Error('Недели источника и назначения должны различаться.');
   }
+  if (target < Number(currentWeek)) throw new Error('Прошедшие недели нельзя перезаписывать.');
   const all = Array.isArray(instances) ? instances : [];
   const assignments = assignment || {};
-  const lockedSet = new Set((locked || []).map(String));
-  const unplacedSet = new Set((unplaced || []).map(String));
+  const nextLocked = new Set((locked || []).map(String));
+  const nextUnplaced = new Set((unplaced || []).map(String));
   const sourceLessons = all.filter(x => !x.isScheduleEvent && weeksFor(x).map(Number).includes(source));
   const usedIds = new Set(all.map(x => String(x.instId)));
   const unique = seed => {
@@ -25,16 +26,12 @@ export function planExactBulkWeekCopy({
     return id;
   };
   const nextAssignment = {...assignments};
-  const nextLocked = new Set(lockedSet);
-  const nextUnplaced = new Set(unplacedSet);
   const nextInstances = [];
   const pastTrimIds = [];
   let trimmed = 0;
   for (const inst of all) {
     const weeks = weeksFor(inst).map(Number);
-    if (!weeks.includes(target)) { nextInstances.push(inst); continue; }
-    // Only lessons, not one-off events: event dates cannot be safely translated.
-    if (inst.isScheduleEvent) { nextInstances.push(inst); continue; }
+    if (!weeks.includes(target) || inst.isScheduleEvent) { nextInstances.push(inst); continue; }
     trimmed++;
     const remaining = weeks.filter(w => w !== target);
     if (!remaining.length) {
@@ -53,24 +50,44 @@ export function planExactBulkWeekCopy({
     });
   }
 
-  // Format-independent semantic requirement identity. A manual switch to ДО
-  // is never rejected merely because the canonical graph uses 'inperson'.
   const reqKey = (load, layer) => `${String(load)}|${String(layer)}`;
-  const covered = new Set();
-  const cover = inst => {
-    for (const load of requirementIds(inst)) covered.add(reqKey(load, requirementLayer(inst)));
-  };
-  let placed = 0, copiedUnplaced = 0, remote = 0, offGraph = 0;
-  const targetGraphKeys = new Set();
+  const targetKeys = new Set();
   for (const inst of targetGraphInstances) {
     if (inst.isScheduleEvent) continue;
-    for (const load of requirementIds(inst)) targetGraphKeys.add(reqKey(load, requirementLayer(inst)));
+    const layer = requirementLayer(inst);
+    for (const load of requirementIds(inst)) targetKeys.add(reqKey(load, layer));
   }
-  for (const inst of sourceLessons) {
+  if (!targetKeys.size) throw new Error(`График ${target}-й недели пуст. Копирование отменено, чтобы не потерять занятия.`);
+
+  const covered = new Set();
+  let placed = 0, copiedUnplaced = 0, remote = 0, skipped = 0, duplicate = 0;
+  // Assignments take priority over unplaced source rows for a given load/layer.
+  const orderedSource = [...sourceLessons].sort((a,b) => Number(!!assignments[b.instId]) - Number(!!assignments[a.instId]));
+  for (const inst of orderedSource) {
+    const layer = requirementLayer(inst);
+    const eligible = requirementIds(inst).map(String).filter(load => targetKeys.has(reqKey(load,layer)) && !covered.has(reqKey(load,layer)));
+    if (!eligible.length) {
+      if (requirementIds(inst).some(load => targetKeys.has(reqKey(load,layer)))) duplicate++;
+      else skipped++;
+      continue;
+    }
+    const allIds = requirementIds(inst).map(String);
+    let rowParticipants = null;
+    if (eligible.length !== allIds.length) {
+      const members = participantsFor?.(inst) || [];
+      rowParticipants = members.filter(p => eligible.includes(String(p.loadId || '')));
+      // Never keep the other stream groups implicitly if a subset cannot be proven.
+      if (rowParticipants.length !== eligible.length) { skipped++; continue; }
+    }
     const id = unique(`${inst.instId}__EXACT_W${target}`);
+    const root = rowParticipants?.[0];
     const row = {
       ...inst, instId:id, weekPattern:'custom', customWeeks:[target],
-      requirementLayer:requirementLayer(inst),
+      ...(root ? {groupId:root.groupId, loadId:root.loadId, subgroup:Number(root.subgroup||0),
+        streamParticipants:rowParticipants.slice(1).map(p=>({...p})),
+        streamGroupIds:rowParticipants.slice(1).map(p=>p.groupId),
+        streamId:rowParticipants.length>1?(inst.streamId||''):''} : {}),
+      requirementLayer:layer,
       blockId:'', blockIndex:0, blockSize:1, blockMode:'',
       manualSplit:true, userManualSplit:true,
       exactBulkWeekCopy:true, repeatedFromWeek:source,
@@ -78,8 +95,6 @@ export function planExactBulkWeekCopy({
     nextInstances.push(row);
     const a = assignments[inst.instId];
     if (a) {
-      // Preserve everything: ДО/очно is on instance; room, extra room, split
-      // half, day, period, and other placement flags are on assignment.
       nextAssignment[id] = {...a};
       nextLocked.add(id);
       nextUnplaced.delete(id);
@@ -89,39 +104,44 @@ export function planExactBulkWeekCopy({
       copiedUnplaced++;
     }
     if (row.format === 'remote') remote++;
-    if (requirementIds(inst).some(load => !targetGraphKeys.has(reqKey(load,requirementLayer(inst))))) offGraph++;
-    cover(inst);
+    for (const load of eligible) covered.add(reqKey(load,layer));
   }
 
-  // Graph-only lessons are retained as unplaced; never steal a slot or
-  // override a source lesson. Split missing members of streams when possible.
+  // Only missing canonical requirements become unplaced; never append a second
+  // row for a requirement already represented by the source week.
   let graphOnly = 0;
   for (const inst of targetGraphInstances) {
     if (inst.isScheduleEvent) continue;
     const layer = requirementLayer(inst);
-    const missing = requirementIds(inst).filter(load => !covered.has(reqKey(load,layer)));
+    const missing = requirementIds(inst).map(String).filter(load => !covered.has(reqKey(load,layer)));
     if (!missing.length) continue;
-    const members = (participantsFor?.(inst) || []);
-    const chosen = members.filter(p => missing.includes(String(p.loadId || '')));
-    const subset = chosen.length && chosen.length < members.length ? chosen : members;
+    const members = participantsFor?.(inst) || [];
+    const chosen = members.filter(p => missing.includes(String(p.loadId||'')));
+    if (missing.length !== requirementIds(inst).length && chosen.length !== missing.length) {
+      // Prevent accidental duplication of other participants in a stream.
+      throw new Error('Не удалось разделить поток по группам для требований целевой недели.');
+    }
+    const subset = chosen.length ? chosen : members;
     const root = subset[0];
     const row = {
       ...inst,
-      ...(root ? {groupId:root.groupId, subgroup:Number(root.subgroup || 0), loadId:root.loadId || inst.loadId} : {}),
-      ...(root ? {streamParticipants:subset.slice(1).map(p=>({...p})), streamGroupIds:subset.slice(1).map(p=>p.groupId), streamId:subset.length>1?(inst.streamId || ''):''} : {}),
+      ...(root ? {groupId:root.groupId, subgroup:Number(root.subgroup||0),loadId:root.loadId||inst.loadId,
+        streamParticipants:subset.slice(1).map(p=>({...p})),
+        streamGroupIds:subset.slice(1).map(p=>p.groupId), streamId:subset.length>1?(inst.streamId||''):''} : {}),
       instId:unique(`${inst.instId}__GRAPH_ONLY_W${target}`),
       weekPattern:'custom', customWeeks:[target], requirementLayer:layer,
       blockId:'', blockIndex:0, blockSize:1, blockMode:'',
-      manualSplit:true, userManualSplit:true, bulkWeekGraphOnly:true,
+      manualSplit:true,userManualSplit:true,bulkWeekGraphOnly:true,
     };
     nextInstances.push(row);
     nextUnplaced.add(row.instId);
-    for (const id of missing) covered.add(reqKey(id,layer));
+    for (const load of missing) covered.add(reqKey(load,layer));
     graphOnly++;
   }
+  if (covered.size !== targetKeys.size) throw new Error('Некоторые требования целевой недели не обработаны. Изменения отменены.');
   return {
-    instances:nextInstances, assignment:nextAssignment,
-    locked:[...nextLocked], unplaced:[...nextUnplaced], pastTrimIds,
-    counts:{trimmed, placed, copiedUnplaced, graphOnly, remote, offGraph},
+    instances:nextInstances,assignment:nextAssignment,
+    locked:[...nextLocked],unplaced:[...nextUnplaced],pastTrimIds,
+    counts:{trimmed,placed,copiedUnplaced,graphOnly,remote,offGraph:skipped,duplicate},
   };
 }

@@ -15642,7 +15642,8 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     if (bulkWeekOperationRef.current) return;
     const original = rawSchedLocalRef.current || rawSched || sched;
     if (!original) return;
-    const plan = planExactBulkWeekCopy({
+    let plan;
+    try { plan = planExactBulkWeekCopy({
       sourceWeek: source, targetWeek: target,
       currentWeek: Number(currentWeekGuess || 1),
       instances: original.instances || [],
@@ -15654,7 +15655,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       requirementIds: inst => scheduleRequirementLoadIds(inst),
       requirementLayer: inst => scheduleRequirementLayer(inst),
       participantsFor: inst => streamParticipants(enrichScheduleInstance(inst)),
-    });
+    }); } catch (err) { setManualError(`Копирование отменено: ${err?.message || err}`); return; }
     const c = plan.counts;
     if (!c.placed && !c.copiedUnplaced) {
       setManualError(`На исходной неделе ${source} нет занятий для копирования.`);
@@ -15665,7 +15666,8 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       `Скопировано размещённых пар: ${c.placed} (ДО: ${c.remote}).\n` +
       `Скопировано неразмещённых: ${c.copiedUnplaced}.\n` +
       `Только по графику целевой недели (останутся неразмещёнными): ${c.graphOnly}.\n` +
-      (c.offGraph ? `Ручные занятия вне графика: ${c.offGraph} — сохраняются как в исходной неделе.\n` : '') +
+      (c.offGraph ? `Пар исходной недели вне графика целевой: ${c.offGraph} — НЕ копируются.\n` : '') +
+      (c.duplicate ? `Повторяющихся требований в исходной неделе: ${c.duplicate} — пропущены.\n` : '') +
       `Другие недели и мероприятия сохраняются; изменения для целевой недели нужно опубликовать отдельно. Продолжить?`;
     if (!window.confirm(confirmation)) return;
     const next = {...original, instances:plan.instances, assignment:plan.assignment,
@@ -15688,6 +15690,92 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       changeScheduleWeek(target);
     } catch(e) {setManualError(`Ошибка копирования: ${e?.message || e}`);}
     finally {bulkWeekOperationRef.current = false;}
+  };
+
+  // Targeted repair after historical week-copy: never change placed lessons or the graph.
+  // Only exact unplaced technical clones sharing a provenance are eligible.
+  const previewWeekCopyDuplicates = (week) => {
+    const source = rawSchedLocalRef.current || rawSched || sched;
+    if (!source) return { removable:[], review:[], checked:0 };
+    const w = Number(week);
+    const groups = new Map();
+    const live = new Set((source.unplaced || []).map(String));
+    const assigned = source.assignment || {};
+    for (const raw of (source.instances || [])) {
+      if (!raw || raw.isScheduleEvent || !weekNumbersForInstance(data.config,raw).includes(w)) continue;
+      const id = String(raw.instId || '');
+      if (!id) continue;
+      const req = scheduleRequirementKeys(raw).filter(k=>Number(k.split('|')[1])===w).sort();
+      if (!req.length) continue;
+      const provenance = String(raw.splitFromInstId || raw.copiedFromInstId || raw.sourceInstId || '');
+      // Identical metadata is not proof: two legitimate lessons can have the same load.
+      const signature = JSON.stringify({req,groupId:raw.groupId,subgroup:raw.subgroup||0,
+        subjectId:raw.subjectId,teacherId:raw.teacherId,typeId:raw.typeId,
+        lessonTypeId:raw.lessonTypeId,format:raw.format,halfPair:!!raw.halfPair,
+        streamParticipants:streamParticipants(enrichScheduleInstance(raw)).map(p=>
+          [String(p.groupId||''),String(p.loadId||''),Number(p.subgroup||0)]).sort(),
+        provenance});
+      if (!groups.has(signature)) groups.set(signature,[]);
+      groups.get(signature).push({id,raw,provenance,placed:!!assigned[id],unplaced:live.has(id)});
+    }
+    const removable=[]; const review=[];
+    for (const rows of groups.values()) {
+      if (rows.length<2) continue;
+      // A clone can be automatically removed only with explicit shared ancestry,
+      // and only if it has no position or lock and is an unplaced entry.
+      const eligible = rows.filter(r=>!r.placed && r.unplaced &&
+        !(source.locked||[]).map(String).includes(r.id));
+      const protectedRows = rows.filter(r=>r.placed || !r.unplaced ||
+        (source.locked||[]).map(String).includes(r.id));
+      if (rows[0].provenance && eligible.length && (eligible.length>1 || protectedRows.length)) {
+        const keep = protectedRows.length ? null : eligible[0].id;
+        for (const row of eligible) if (row.id !== keep) removable.push(row);
+      } else review.push(rows);
+    }
+    return { removable, review, checked:groups.size };
+  };
+
+  const cleanupCopiedWeekDuplicates = async (week) => {
+    if (bulkWeekOperationRef.current || !sched) return;
+    const w=Number(week);
+    if (!Number.isInteger(w) || w<1 || w>weekToolTotal) {setManualError('Выберите неделю для проверки.');return;}
+    if (w<Number(currentWeekGuess||1)) {setManualError('Очистка прошлых недель запрещена.');return;}
+    const found=previewWeekCopyDuplicates(w);
+    const examples=found.removable.slice(0,12).map(r=>{
+      const g=byId(data.groups,r.raw.groupId)?.name||'Поток/группа';
+      const sub=byId(data.subjects,r.raw.subjectId)?.name||'Предмет';
+      return `${g} · ${sub} · ${r.id}`;
+    }).join('\n');
+    const notice=`Неделя ${w}: подтверждённых технических копий в «Не размещено»: ${found.removable.length}.`+
+      `\nНеоднозначных совпадающих наборов: ${found.review.length} (не удаляются).`+
+      (examples?`\n\nДля удаления:\n${examples}`:'');
+    if (!found.removable.length) {window.alert(notice+'\n\nАвтоматически ничего не изменено.');return;}
+    if (!window.confirm(notice+'\n\nСделать резервную копию и удалить только эти записи? Размещённые пары и график останутся без изменений.')) return;
+    bulkWeekOperationRef.current=true;
+    try {
+      await storageCreateBackup(currentUser?.id);
+      const original=rawSchedLocalRef.current||rawSched||sched;
+      const ids=new Set(found.removable.map(r=>r.id));
+      const removed=[]; const instancesSet={}; const instances=[];
+      for (const raw of original.instances||[]) {
+        const id=String(raw.instId||'');
+        if (!ids.has(id)) {instances.push(raw);continue;}
+        // Recheck assignment at save time; never erase a placed instance.
+        if (original.assignment?.[id]) {instances.push(raw);continue;}
+        const weeks=weekNumbersForInstance(data.config,raw).map(Number);
+        const keep=weeks.filter(n=>n!==w);
+        if (!keep.length) removed.push(id);
+        else {const trimmed={...raw,weekPattern:'custom',customWeeks:keep,weekCopyDuplicateTrimmed:true};instances.push(trimmed);instancesSet[id]=trimmed;}
+      }
+      const removedSet=new Set(removed);
+      const next={...original,instances,
+        unplaced:(original.unplaced||[]).filter(id=>!removedSet.has(String(id))),
+        locked:(original.locked||[]).filter(id=>!removedSet.has(String(id)))};
+      const result=await updateSchedule(next,buildAtomicScheduleDiff(original,next,{reason:'safe-week-copy-duplicate-cleanup'}));
+      if (!result?.ok) throw new Error('Сервер не подтвердил сохранение.');
+      setManualError(`✓ Неделя ${w}: очищено ${found.removable.length} технических копий; размещённые занятия и график сохранены.`);
+    } catch(e) {setManualError(`Очистка не выполнена: ${e?.message||e}`);}
+    finally {bulkWeekOperationRef.current=false;}
   };
 
   const bulkReplaceWeek = async ({sourceWeek=null, targetWeek, importedRows=null}) => {
@@ -21043,6 +21131,7 @@ th{background:#1E3A5F;color:#ffffff;}
           <div className="bulk-week-tools">
             <label className="bulk-week-field">Исходная неделя<select value={bulkSourceWeek||scheduleWeek} onChange={e=>setBulkSourceWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
             <label className="bulk-week-field">Целевая неделя<select value={bulkTargetWeek||scheduleWeek} onChange={e=>setBulkTargetWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
+            <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Проверить технические дубли неназначенных требований выбранной целевой недели. Сначала покажет список; перед очисткой создаст резервную копию." onClick={()=>cleanupCopiedWeekDuplicates(weekToolTarget)}>🧹 Проверить и убрать дубли целевой недели</button>
             <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Заменить расписание всех групп по графику целевой недели, сохраняя позиции пар из исходной" onClick={()=>bulkReplaceWeek({sourceWeek:weekToolSource,targetWeek:weekToolTarget})}>↻ Копировать все группы</button>
             <input type="file" accept=".xlsx,.xls" ref={bulkWeekFileRef} style={{display:'none'}} onChange={e=>{void importBulkWeekExcel(e.target.files?.[0]);e.target.value='';}}/>
             <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Загрузить Excel со всеми группами и полностью заменить выбранную неделю" onClick={()=>bulkWeekFileRef.current?.click()}>↑ Импорт Excel в целевую неделю</button>
