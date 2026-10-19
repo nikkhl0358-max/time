@@ -15778,7 +15778,27 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       `\nВсего предложено к удалению: ${safeIds.size}.`+
       `\nНеоднозначных совпадений: ${found.review.length + graphExcess.review.length}; прочих превышений: ${graphExcess.stillExcess.length} — они НЕ удаляются.`+
       (examples?`\n\nБудут удалены:\n${examples}`:'');
-    if (!safeIds.size) {window.alert(notice+'\n\nНичего не изменено.');return;}
+    if (!safeIds.size) {
+      // Diagnostic only: show the actual over-limit requirements instead of a
+      // generic “nothing changed”. No database write is performed here.
+      const source = rawSchedLocalRef.current || rawSched || sched;
+      const details = (graphExcess.stillExcess || []).map((item, index) => {
+        const [loadId, layer] = String(item.key || '').split('|');
+        const load = (data.loads || []).find(row => String(row.id || row.loadId) === loadId);
+        const sample = (source?.instances || []).find(row =>
+          String(row.loadId || '') === loadId &&
+          String(scheduleRequirementLayer(row)) === String(layer || '') &&
+          weekNumbersForInstance(data.config, row).map(Number).includes(w));
+        const row = load || sample || {};
+        const group = byId(data.groups, row.groupId)?.name || row.groupId || 'Группа не определена';
+        const subject = byId(data.subjects, row.subjectId)?.name || row.subjectId || 'Дисциплина не определена';
+        const teacher = byId(data.teachers, row.teacherId)?.name || row.teacherId || 'Преподаватель не определён';
+        return `${index + 1}. ${group} — ${subject} (${teacher}), слой ${layer || '—'}: в записях ${item.actual}, по графику ${item.expected}`;
+      });
+      window.alert(notice + (details.length ? '\n\nПревышения для проверки:\n' + details.join('\n') : '') +
+        '\n\nНичего не удалено. Для исправления требуется проверка привязок.');
+      return;
+    }
     if (!window.confirm(notice+'\n\nСоздать резервную копию и удалить ТОЛЬКО эти повторные назначения?'))return;
     bulkWeekOperationRef.current=true;
     try {
