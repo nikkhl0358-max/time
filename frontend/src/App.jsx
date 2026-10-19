@@ -15632,6 +15632,8 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
   const [bulkTargetWeek, setBulkTargetWeek] = useState(0);
   const [bulkSourceWeek, setBulkSourceWeek] = useState(0);
   const [bulkExportWeek, setBulkExportWeek] = useState(0);
+  const [weekMismatchReview, setWeekMismatchReview] = useState(null);
+  const [weekMismatchSelected, setWeekMismatchSelected] = useState([]);
   const weekToolTotal = Math.max(1, Number(totalWeeksInSchedule || 1));
   const weekToolTarget = Number(bulkTargetWeek || scheduleWeek || currentWeekGuess || 1);
   const weekToolSource = Number(bulkSourceWeek || scheduleWeek || currentWeekGuess || 1);
@@ -15756,6 +15758,77 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       requirementIds:inst=>scheduleRequirementLoadIds(inst),
       requirementLayer:inst=>scheduleRequirementLayer(inst),
     });
+  };
+
+  // Review off-graph records by ID, rather than interpreting every such row as
+  // a duplicate.  Placed lessons and multi-week/stream rows are READ ONLY.
+  const inspectWeekMismatches = (week) => {
+    const w=Number(week), source=rawSchedLocalRef.current||rawSched||sched;
+    if(!source)return;
+    const excess=previewGraphExcess(w);
+    const keys=new Set((excess.stillExcess||[]).map(x=>String(x.key)));
+    const rows=(source.instances||[]).filter(row=>!row.isScheduleEvent &&
+      weekNumbersForInstance(data.config,row).map(Number).includes(w)).flatMap(row=>{
+      const id=String(row.instId||'');
+      const reqIds=scheduleRequirementLoadIds(row).map(String);
+      const layer=String(scheduleRequirementLayer(row));
+      const matched=reqIds.filter(load=>keys.has(`${load}|${layer}`));
+      if(!matched.length)return [];
+      const load=loadByIdIndex(data).get(String(row.loadId||''));
+      const raw=load||row;
+      const placement=source.assignment?.[id];
+      const weeks=weekNumbersForInstance(data.config,row).map(Number);
+      const eligible=!placement && weeks.length===1 && weeks[0]===w &&
+        (row.exactBulkWeekCopy===true || row.bulkWeekGraphOnly===true) &&
+        reqIds.length===1 && !row.streamId && !(row.streamParticipants||[]).length &&
+        !(row.streamGroupIds||[]).length;
+      return [{id,keys:matched.map(load=>`${load}|${layer}`),
+        group:byId(data.groups,raw.groupId)?.name||raw.groupId||'—',
+        subject:byId(data.subjects,raw.subjectId)?.name||raw.subjectId||'—',
+        teacher:byId(data.teachers,raw.teacherId)?.name||raw.teacherId||'—',
+        placed:!!placement,placement:placement?`${Number(placement.day)+1}-й день, ${Number(placement.period)+1}-я пара`:'Не размещено',
+        eligible,origin:row.exactBulkWeekCopy?'Копия недели':row.bulkWeekGraphOnly?'Из графика':'Другой источник',
+        weeks,layer,subgroup:Number(row.subgroup||0)}];
+    });
+    setWeekMismatchSelected([]);
+    setWeekMismatchReview({week:w,rows,excess:excess.stillExcess||[]});
+  };
+
+  const removeSelectedWeekMismatches = async () => {
+    const review=weekMismatchReview;
+    if(!review || !weekMismatchSelected.length || bulkWeekOperationRef.current)return;
+    const original=rawSchedLocalRef.current||rawSched||sched;
+    const allowed=new Set(review.rows.filter(r=>r.eligible).map(r=>r.id));
+    const selected=[...new Set(weekMismatchSelected)].filter(id=>allowed.has(id));
+    // Never apply a review to a different local snapshot or to changed items.
+    if(selected.length!==weekMismatchSelected.length){setManualError('Выбор устарел. Проверьте неделю заново.');return;}
+    for(const id of selected){
+      const row=(original.instances||[]).find(r=>String(r.instId)===id);
+      if(!row || original.assignment?.[id] ||
+        weekNumbersForInstance(data.config,row).map(Number).join(',')!==String(review.week) ||
+        !(row.exactBulkWeekCopy===true || row.bulkWeekGraphOnly===true) ||
+        scheduleRequirementLoadIds(row).length!==1 || row.streamId ||
+        (row.streamParticipants||[]).length || (row.streamGroupIds||[]).length){
+        setManualError('Данные изменились. Повторите предварительный просмотр.');return;
+      }
+    }
+    if(!window.confirm(`Неделя ${review.week}. Удалить ${selected.length} вручную выбранных НЕРАЗМЕЩЁННЫХ технических записей?\n\nРазмещённые занятия останутся. Будет создана резервная копия.`))return;
+    bulkWeekOperationRef.current=true;
+    try{
+      await storageCreateBackup(currentUser?.id);
+      const ids=new Set(selected);
+      const next={...original,instances:(original.instances||[]).filter(r=>!ids.has(String(r.instId))),
+        assignment:{...(original.assignment||{})},
+        unplaced:(original.unplaced||[]).filter(id=>!ids.has(String(id))),
+        locked:(original.locked||[]).filter(id=>!ids.has(String(id)))};
+      const diff=buildAtomicScheduleDiff(original,next,{reason:'manual-reviewed-week9-offgraph-unplaced'});
+      if(!diff)throw new Error('Изменений не найдено');
+      const result=await updateSchedule(next,diff);
+      if(!result?.ok)throw new Error('Сервер не подтвердил сохранение');
+      setManualError(`Удалено ${ids.size} проверенных неназначенных записей. Размещённые занятия сохранены.`);
+      setWeekMismatchReview(null);setWeekMismatchSelected([]);
+    }catch(e){setManualError(`Очистка отменена: ${e?.message||e}`);}
+    finally{bulkWeekOperationRef.current=false;}
   };
 
   const cleanupCopiedWeekDuplicates = async (week) => {
@@ -21181,11 +21254,34 @@ th{background:#1E3A5F;color:#ffffff;}
           <div className="bulk-week-tools">
             <label className="bulk-week-field">Исходная неделя<select value={bulkSourceWeek||scheduleWeek} onChange={e=>setBulkSourceWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
             <label className="bulk-week-field">Целевая неделя<select value={bulkTargetWeek||scheduleWeek} onChange={e=>setBulkTargetWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
+            <button className="btn ghost" onClick={()=>inspectWeekMismatches(weekToolTarget)}>Показать расхождения с графиком</button>
             <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Проверить подтверждённые копии и сверхнормативные неназначенные технические записи целевой недели. Показывает предварительный список и создаёт резервную копию перед сохранением." onClick={()=>cleanupCopiedWeekDuplicates(weekToolTarget)}>🧹 Сверить с графиком и убрать лишнее</button>
             <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Заменить расписание всех групп по графику целевой недели, сохраняя позиции пар из исходной" onClick={()=>bulkReplaceWeek({sourceWeek:weekToolSource,targetWeek:weekToolTarget})}>↻ Копировать все группы</button>
             <input type="file" accept=".xlsx,.xls" ref={bulkWeekFileRef} style={{display:'none'}} onChange={e=>{void importBulkWeekExcel(e.target.files?.[0]);e.target.value='';}}/>
             <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Загрузить Excel со всеми группами и полностью заменить выбранную неделю" onClick={()=>bulkWeekFileRef.current?.click()}>↑ Импорт Excel в целевую неделю</button>
           </div>
+          {weekMismatchReview && <div className="week-mismatch-review" style={{marginTop:12,padding:14,border:'1px solid #d8dfe9',borderRadius:10,background:'#fff'}}>
+            <div style={{display:'flex',justifyContent:'space-between',gap:12,alignItems:'center'}}>
+              <strong>Проверка недели {weekMismatchReview.week}: {weekMismatchReview.excess.length} превышений, {weekMismatchReview.rows.length} связанных записей</strong>
+              <button className="btn ghost" onClick={()=>{setWeekMismatchReview(null);setWeekMismatchSelected([]);}}>Закрыть</button>
+            </div>
+            <p style={{fontSize:13,margin:'8px 0'}}>Здесь показаны ВСЕ связанные занятия. Размещённые занятия недоступны для удаления. Галочкой можно выбрать только одиночные неназначенные технические записи. Ноль в графике сам по себе не означает дубль.</p>
+            <div style={{maxHeight:360,overflow:'auto'}}>
+              <table style={{width:'100%',fontSize:12,borderCollapse:'collapse'}}>
+                <thead><tr><th>Выбор</th><th>Группа · дисциплина</th><th>Преподаватель</th><th>Источник</th><th>Размещение</th><th>ID</th></tr></thead>
+                <tbody>{weekMismatchReview.rows.map(r=><tr key={r.id} style={{borderTop:'1px solid #e5e7eb'}}>
+                  <td><input type="checkbox" disabled={!r.eligible} checked={weekMismatchSelected.includes(r.id)} onChange={e=>setWeekMismatchSelected(old=>e.target.checked?[...old,r.id]:old.filter(id=>id!==r.id))}/></td>
+                  <td>{r.group} · {r.subject}{r.subgroup?` · п/г ${r.subgroup}`:''}</td>
+                  <td>{r.teacher}</td><td>{r.origin}</td><td>{r.placement}</td>
+                  <td style={{wordBreak:'break-all',maxWidth:220}}>{r.id}</td>
+                </tr>)}</tbody>
+              </table>
+            </div>
+            <div style={{marginTop:10,display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+              <span>Выбрано: {weekMismatchSelected.length}</span>
+              <button className="btn danger" disabled={!weekMismatchSelected.length||bulkWeekOperationRef.current} onClick={removeSelectedWeekMismatches}>Создать backup и удалить выбранные неназначенные</button>
+            </div>
+          </div>}
           <div className="bulk-week-export-row">
             <label className="bulk-week-field">Выгрузить неделю
               <select value={bulkExportWeek||scheduleWeek} onChange={e=>setBulkExportWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select>
@@ -26248,7 +26344,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                                 {(cell.inst.streamGroupIds || []).length > 0 ? <span className="ev-subgroup"> · 🔗 поток</span> : null}
                               </div>
                               <div className={`ev-row${duplicateRoomConflictText ? " public-room-conflict" : ""}`}><span className="ev-ico">📍</span> {duplicateRoomConflictText ? <>⚠ <b>Конфликт кабинетов:</b> {duplicateRoomConflictText}</> : (cell.inst.format === "remote" ? "дистанционно" : `ауд. ${room}`)}</div>
-                              <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" && teacherId ? <button type="button" className={`public-teacher-link${teacherChangedBySubstitution ? " public-teacher-replacement" : ""}`} onClick={() => onOpenTeacher?.(teacherId, viewId)} title="Открыть расписание преподавателя">{teacher}</button> : kind === "teacher" ? <span className="public-stream-group-links">{streamGroups(cell.inst).map((gid) => { const found=(data.groups||[]).find(g=>String(g.id)===String(gid)); return <button key={gid} type="button" className="public-teacher-link" onClick={() => onOpenGroup?.(gid)} title={`Открыть расписание группы ${found?.name||gid}`}>{found?.name||gid}</button>; })}</span> : group}</div>
+                              <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" && teacherId ? <button type="button" className={`public-teacher-link${teacherChangedBySubstitution ? " public-teacher-replacement" : ""}`} onClick={() => onOpenTeacher?.(teacherId, viewId)} title="Открыть расписание преподавателя">{teacher}</button> : kind === "teacher" ? <span className="public-stream-group-links">{streamGroups(cell.inst).map((gid, index) => { const found=(data.groups||[]).find(g=>String(g.id)===String(gid)); return <Fragment key={gid}>{index > 0 && <span className="public-stream-group-separator" aria-hidden="true">, </span>}<button type="button" className="public-teacher-link" onClick={() => onOpenGroup?.(gid)} title={`Открыть расписание группы ${found?.name||gid}`}>{found?.name||gid}</button></Fragment>; })}</span> : group}</div>
                               {kind === "room" && teacher && <div className="ev-row"><span className="ev-ico">👤</span> {teacher}</div>}
                               {kind === "teacher" && teacherChangedBySubstitution && <div className="ev-row public-teacher-replacement-row"><span className="ev-ico">👤</span> <span className="public-teacher-replacement">{teacher} · замена</span></div>}
                               {cell.subOverride?.moved && <div className="ev-row ev-subgroup">↪ Перенесено с {formatDateDM(cell.subOverride.sourceDate)}{Number.isFinite(Number(cell.subOverride.sourcePeriod)) ? ` · ${Number(cell.subOverride.sourcePeriod)+1} пары` : ""}</div>}

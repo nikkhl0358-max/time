@@ -1,3 +1,4 @@
+import {lessonIdentity, buildUniqueGraphIdentityMap} from './week9LoadIdentity.mjs';
 /**
  * Copy placement from a source week onto the EXISTING canonical requirements of
  * a target week.  Neither source-only rows nor repeated requirement identities
@@ -62,6 +63,7 @@ export function planExactBulkWeekCopy({
   }
   if (!targetCounts.size) throw new Error(`График ${target}-й недели пуст. Копирование отменено, чтобы не потерять занятия.`);
 
+  const identityFallback = buildUniqueGraphIdentityMap(targetGraphInstances);
   const covered = new Map();
   const remainingFor = key => (targetCounts.get(key)||0)-(covered.get(key)||0);
   const claim = key => covered.set(key,(covered.get(key)||0)+1);
@@ -70,16 +72,29 @@ export function planExactBulkWeekCopy({
   const orderedSource = [...sourceLessons].sort((a,b) => Number(!!assignments[b.instId]) - Number(!!assignments[a.instId]));
   for (const inst of orderedSource) {
     const layer = requirementLayer(inst);
-    const eligible = requirementIds(inst).map(String).filter(load => remainingFor(reqKey(load,layer)) > 0);
+    let canonical = inst;
+    let eligible = requirementIds(inst).map(String).filter(load => remainingFor(reqKey(load,layer)) > 0);
+    // A restored 7th-week row can reference an obsolete load ID. Match only a
+    // UNIQUE, exact logical requirement of week 9, never by subject alone.
+    if (!eligible.length) {
+      const candidate = identityFallback.get(lessonIdentity({...inst,requirementLayer:layer}));
+      if (candidate && String(requirementLayer(candidate))===String(layer)) {
+        const candidateIds=requirementIds(candidate).map(String);
+        if(candidateIds.length && candidateIds.every(load=>remainingFor(reqKey(load,layer))>0)) {
+          canonical=candidate;
+          eligible=candidateIds;
+        }
+      }
+    }
     if (!eligible.length) {
       if (requirementIds(inst).some(load => targetCounts.has(reqKey(load,layer)))) duplicate++;
       else skipped++;
       continue;
     }
-    const allIds = requirementIds(inst).map(String);
+    const allIds = requirementIds(canonical).map(String);
     let rowParticipants = null;
     if (eligible.length !== allIds.length) {
-      const members = participantsFor?.(inst) || [];
+      const members = participantsFor?.(canonical) || [];
       rowParticipants = members.filter(p => eligible.includes(String(p.loadId || '')));
       // Never keep the other stream groups implicitly if a subset cannot be proven.
       if (rowParticipants.length !== eligible.length) { skipped++; continue; }
@@ -87,7 +102,7 @@ export function planExactBulkWeekCopy({
     const id = unique(`${inst.instId}__EXACT_W${target}`);
     const root = rowParticipants?.[0];
     const row = {
-      ...inst, instId:id, weekPattern:'custom', customWeeks:[target],
+      ...canonical, instId:id, weekPattern:'custom', customWeeks:[target],
       ...(root ? {groupId:root.groupId, loadId:root.loadId, subgroup:Number(root.subgroup||0),
         streamParticipants:rowParticipants.slice(1).map(p=>({...p})),
         streamGroupIds:rowParticipants.slice(1).map(p=>p.groupId),
@@ -96,6 +111,7 @@ export function planExactBulkWeekCopy({
       blockId:'', blockIndex:0, blockSize:1, blockMode:'',
       manualSplit:true, userManualSplit:true,
       exactBulkWeekCopy:true, repeatedFromWeek:source,
+      ...(canonical !== inst ? {weekCopyReconciledFromLoadId:String(inst.loadId||'')} : {}),
     };
     nextInstances.push(row);
     const a = assignments[inst.instId];
