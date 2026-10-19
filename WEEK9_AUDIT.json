@@ -1,0 +1,14 @@
+{
+  "week": 9,
+  "allExplicitWeekRows": 1394,
+  "flags": {
+    "graph_only": 1062,
+    "exact_copy": 292,
+    "placed": 22,
+    "unplaced": 1372
+  },
+  "duplicatedSemanticGroups": 0,
+  "potentiallyCoveredTechnicalGroups": [],
+  "ambiguousGroups": [],
+  "note": "READ-ONLY. No records removed. Review layers, intended weeklyPairs, flows and placements before edits."
+}

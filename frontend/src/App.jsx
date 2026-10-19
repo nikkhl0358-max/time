@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, useDeferredValue, Fragment, start
 import Papa from "papaparse";
 import * as XLSX from "xlsx-js-style";
 import { planExactBulkWeekCopy } from "./bulkWeekSnapshot.mjs";
+import { planWeekGraphExcess } from "./weekGraphExcess.mjs";
 import { storageGet, storageGetStrict, publicBootstrapGet, publicIndexGet, publicScheduleGet, publicStatusGet, publicControlGet, publicControlSet, storageSet, storageGraphMerge, storageGraphPatch, storageScheduleMerge, storageScheduleGroupMerge, storageSchedulePatch, storagePublishWeeks, storagePublicationCommit, storageSectionMerge, storageMeta, storageBackups, storageCreateBackup, storageDownloadBackup, storageRestoreBackup, storageRestorePublishedGroup, storageUndoPublishedGroupRestore, storageVersionGet, CLIENT_BUILD_ID, scheduleArchiveList, scheduleFinalizeWeek, scheduleArchiveGet, scheduleArchiveDownload, presenceHeartbeat, presenceLeave, serverGenerateStart, serverGenerateStatus, serverGenerateCancel, serverAutoGraphStart, serverAutoGraphStatus } from "./storage.js";
 import { MANUAL_POLICY, isGymRoomByPolicy, manualPolicyFlags } from "./manualPolicy.js";
 import { dedupePublicLessonRows } from "./publicLessonDedupe.js";
@@ -15745,23 +15746,39 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     return {removable,review,checked:groups.size};
   };
 
+  const previewGraphExcess = (week) => {
+    const source=rawSchedLocalRef.current||rawSched||sched;
+    if (!source) return {removable:[],review:[],stillExcess:[],examined:0};
+    return planWeekGraphExcess({
+      week,instances:source.instances||[],assignment:source.assignment||{},
+      targetGraphInstances:canonicalGraphInstancesByWeek.get(Number(week))||[],
+      weeksFor:inst=>weekNumbersForInstance(data.config,inst),
+      requirementIds:inst=>scheduleRequirementLoadIds(inst),
+      requirementLayer:inst=>scheduleRequirementLayer(inst),
+    });
+  };
+
   const cleanupCopiedWeekDuplicates = async (week) => {
     if (bulkWeekOperationRef.current || !sched) return;
     const w=Number(week);
     if (!Number.isInteger(w)||w<1||w>weekToolTotal) {setManualError('Выберите неделю для проверки.');return;}
     if (w<Number(currentWeekGuess||1)) {setManualError('Очистка прошлых недель запрещена.');return;}
     const found=previewWeekCopyDuplicates(w);
-    const examples=found.removable.slice(0,15).map(r=>{
+    const graphExcess=previewGraphExcess(w);
+    const safeIds=new Set([...found.removable.map(r=>r.id),...graphExcess.removable.map(r=>r.id)]);
+    const examples=found.removable.slice(0,10).map(r=>{
       const g=byId(data.groups,r.raw.groupId)?.name||'Поток/группа';
       const subj=byId(data.subjects,r.raw.subjectId)?.name||'Предмет';
       const a=(rawSchedLocalRef.current||rawSched||sched)?.assignment?.[r.id];
       return `${g} · ${subj} · ${a?`${Number(a.day)+1}-й день, ${Number(a.period)+1}-я пара`:'не размещено'} · ${r.id}`;
-    }).join('\n');
+    }).concat(graphExcess.removable.slice(0,10).map(r=>`${r.kind} · ${r.key} · ${r.id}`)).join('\n');
     const placedCount=found.removable.filter(r=>r.placed).length;
-    const notice=`Неделя ${w}: точных повторных копий: ${found.removable.length} (размещённых: ${placedCount}).`+
-      `\nНеоднозначных совпадений: ${found.review.length} — они НЕ удаляются.`+
+    const notice=`Неделя ${w}: подтверждённых точных копий: ${found.removable.length} (размещённых: ${placedCount}).`+
+      `\nДополнительных неназначенных технических записей сверх количества графика: ${graphExcess.removable.length}.`+
+      `\nВсего предложено к удалению: ${safeIds.size}.`+
+      `\nНеоднозначных совпадений: ${found.review.length + graphExcess.review.length}; прочих превышений: ${graphExcess.stillExcess.length} — они НЕ удаляются.`+
       (examples?`\n\nБудут удалены:\n${examples}`:'');
-    if (!found.removable.length) {window.alert(notice+'\n\nНичего не изменено.');return;}
+    if (!safeIds.size) {window.alert(notice+'\n\nНичего не изменено.');return;}
     if (!window.confirm(notice+'\n\nСоздать резервную копию и удалить ТОЛЬКО эти повторные назначения?'))return;
     bulkWeekOperationRef.current=true;
     try {
@@ -15769,7 +15786,11 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       const original=rawSchedLocalRef.current||rawSched||sched;
       // Recalculate against the latest local snapshot immediately before save.
       const fresh=previewWeekCopyDuplicates(w);
-      const ids=new Set(fresh.removable.filter(r=>r.weeks.length===1&&r.weeks[0]===w).map(r=>r.id));
+      const freshExcess=previewGraphExcess(w);
+      const ids=new Set([
+        ...fresh.removable.filter(r=>r.weeks.length===1&&r.weeks[0]===w).map(r=>r.id),
+        ...freshExcess.removable.map(r=>r.id),
+      ]);
       if (!ids.size) throw new Error('Подтверждённые копии не найдены.');
       const nextAssignment={...(original.assignment||{})};
       for (const id of ids) delete nextAssignment[id];
@@ -21140,7 +21161,7 @@ th{background:#1E3A5F;color:#ffffff;}
           <div className="bulk-week-tools">
             <label className="bulk-week-field">Исходная неделя<select value={bulkSourceWeek||scheduleWeek} onChange={e=>setBulkSourceWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
             <label className="bulk-week-field">Целевая неделя<select value={bulkTargetWeek||scheduleWeek} onChange={e=>setBulkTargetWeek(Number(e.target.value))}>{Array.from({length:weekToolTotal},(_,i)=><option key={i} value={i+1}>{i+1}</option>)}</select></label>
-            <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Проверить точные повторные копии назначенных и неназначенных пар выбранной недели. Сначала покажет список; перед очисткой создаст резервную копию." onClick={()=>cleanupCopiedWeekDuplicates(weekToolTarget)}>🧹 Проверить и убрать дубли целевой недели</button>
+            <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Проверить подтверждённые копии и сверхнормативные неназначенные технические записи целевой недели. Показывает предварительный список и создаёт резервную копию перед сохранением." onClick={()=>cleanupCopiedWeekDuplicates(weekToolTarget)}>🧹 Сверить с графиком и убрать лишнее</button>
             <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Заменить расписание всех групп по графику целевой недели, сохраняя позиции пар из исходной" onClick={()=>bulkReplaceWeek({sourceWeek:weekToolSource,targetWeek:weekToolTarget})}>↻ Копировать все группы</button>
             <input type="file" accept=".xlsx,.xls" ref={bulkWeekFileRef} style={{display:'none'}} onChange={e=>{void importBulkWeekExcel(e.target.files?.[0]);e.target.value='';}}/>
             <button className="btn ghost" disabled={bulkWeekOperationRef.current} title="Загрузить Excel со всеми группами и полностью заменить выбранную неделю" onClick={()=>bulkWeekFileRef.current?.click()}>↑ Импорт Excel в целевую неделю</button>

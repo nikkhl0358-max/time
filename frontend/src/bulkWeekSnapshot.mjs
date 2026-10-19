@@ -51,23 +51,28 @@ export function planExactBulkWeekCopy({
   }
 
   const reqKey = (load, layer) => `${String(load)}|${String(layer)}`;
-  const targetKeys = new Set();
+  const targetCounts = new Map();
   for (const inst of targetGraphInstances) {
     if (inst.isScheduleEvent) continue;
     const layer = requirementLayer(inst);
-    for (const load of requirementIds(inst)) targetKeys.add(reqKey(load, layer));
+    for (const load of requirementIds(inst)) {
+      const key=reqKey(load,layer);
+      targetCounts.set(key,(targetCounts.get(key)||0)+1);
+    }
   }
-  if (!targetKeys.size) throw new Error(`График ${target}-й недели пуст. Копирование отменено, чтобы не потерять занятия.`);
+  if (!targetCounts.size) throw new Error(`График ${target}-й недели пуст. Копирование отменено, чтобы не потерять занятия.`);
 
-  const covered = new Set();
+  const covered = new Map();
+  const remainingFor = key => (targetCounts.get(key)||0)-(covered.get(key)||0);
+  const claim = key => covered.set(key,(covered.get(key)||0)+1);
   let placed = 0, copiedUnplaced = 0, remote = 0, skipped = 0, duplicate = 0;
   // Assignments take priority over unplaced source rows for a given load/layer.
   const orderedSource = [...sourceLessons].sort((a,b) => Number(!!assignments[b.instId]) - Number(!!assignments[a.instId]));
   for (const inst of orderedSource) {
     const layer = requirementLayer(inst);
-    const eligible = requirementIds(inst).map(String).filter(load => targetKeys.has(reqKey(load,layer)) && !covered.has(reqKey(load,layer)));
+    const eligible = requirementIds(inst).map(String).filter(load => remainingFor(reqKey(load,layer)) > 0);
     if (!eligible.length) {
-      if (requirementIds(inst).some(load => targetKeys.has(reqKey(load,layer)))) duplicate++;
+      if (requirementIds(inst).some(load => targetCounts.has(reqKey(load,layer)))) duplicate++;
       else skipped++;
       continue;
     }
@@ -104,7 +109,7 @@ export function planExactBulkWeekCopy({
       copiedUnplaced++;
     }
     if (row.format === 'remote') remote++;
-    for (const load of eligible) covered.add(reqKey(load,layer));
+    for (const load of eligible) claim(reqKey(load,layer));
   }
 
   // Only missing canonical requirements become unplaced; never append a second
@@ -113,7 +118,7 @@ export function planExactBulkWeekCopy({
   for (const inst of targetGraphInstances) {
     if (inst.isScheduleEvent) continue;
     const layer = requirementLayer(inst);
-    const missing = requirementIds(inst).map(String).filter(load => !covered.has(reqKey(load,layer)));
+    const missing = requirementIds(inst).map(String).filter(load => remainingFor(reqKey(load,layer)) > 0);
     if (!missing.length) continue;
     const members = participantsFor?.(inst) || [];
     const chosen = members.filter(p => missing.includes(String(p.loadId||'')));
@@ -135,10 +140,10 @@ export function planExactBulkWeekCopy({
     };
     nextInstances.push(row);
     nextUnplaced.add(row.instId);
-    for (const load of missing) covered.add(reqKey(load,layer));
+    for (const load of missing) claim(reqKey(load,layer));
     graphOnly++;
   }
-  if (covered.size !== targetKeys.size) throw new Error('Некоторые требования целевой недели не обработаны. Изменения отменены.');
+  if ([...targetCounts].some(([key,required]) => (covered.get(key)||0)!==required)) throw new Error('Некоторые требования целевой недели не обработаны. Изменения отменены.');
   return {
     instances:nextInstances,assignment:nextAssignment,
     locked:[...nextLocked],unplaced:[...nextUnplaced],pastTrimIds,
