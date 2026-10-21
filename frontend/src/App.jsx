@@ -10707,9 +10707,11 @@ function overlayForCell(inst, a, date, substitutions) {
   const sub = (substitutions || []).find((s) => s.date === date && publicInstMatchesSubstitution(inst, s));
   if (!sub) return { inst, a, subOverride: null };
   if (sub.type === "excursion") return {
-    inst: { ...inst, isExcursion: true, importSubject: "Экскурсия" },
-    a: { ...a, roomId: null, extraRoomId: null },
-    subOverride: { substituted: true, cancelledLesson: true, excursion: true, teacherId: null,
+    // Preserve the original subject/teacher for the teacher timetable.
+    // The group sees the excursion event, while the teacher sees a crossed-out class.
+    inst,
+    a,
+    subOverride: { substituted: true, cancelled: true, cancelledLesson: true, excursion: true,
       note: sub.note || "Экскурсия", changeType: "excursion", format: "excursion" },
   };
   if (sub.type === "cancel") return { inst, a, subOverride: { cancelled: true, note: sub.note, changeType: "cancel" } };
@@ -10733,7 +10735,7 @@ function overlayForCell(inst, a, date, substitutions) {
 }
 
 function movedCellForSubstitution(data, sub) {
-  if (!data?.schedule || !sub || sub.type !== "moved" || !sub.targetDate) return null;
+  if (!data?.schedule || !sub || !["moved", "excursion"].includes(sub.type) || !sub.targetDate) return null;
   const rawInst = (data.schedule.instances || []).find((i) => publicInstMatchesSubstitution(i, sub));
   const base = rawInst ? data.schedule.assignment?.[rawInst.instId] : null;
   // Импортированная отмена может не иметь действующего instanceId: создаём
@@ -21474,11 +21476,20 @@ th{background:#1E3A5F;color:#ffffff;}
                           <span className="group-overlap-details">{groupOverlap.label}</span>
                         </div>}
                       {cells.map((cell) => {
-                          if (cell.subOverride?.cancelled) {
-                            const txt = cell.subOverride?.pendingMove ? "Перенос будет назначен позже" : cell.subOverride?.movedAway ? `Перенесено${cell.subOverride?.targetDate ? ` на ${formatDateDM(cell.subOverride.targetDate)}` : ""}` : cell.subOverride?.assignmentIssued ? "Занятие отменено · выдача задания" : "Занятие отменено";
-                            const gapGroupId = viewKind === "group" ? viewId : cell.inst.groupId; const internalGap = cancellationMakesInternalGroupGap(cell, day, p, gapGroupId); return <div key={scheduleRenderKey(cell.inst)} className={`lesson-chip cancelled-chip${internalGap ? " cancelled-gap-highlight" : ""}${cell.subOverride?.pendingMove ? " pending-move-chip" : cell.subOverride?.movedAway ? " moved-away-chip" : ""}`}><span>{txt}</span><span className="sub-badge cancel">{cell.subOverride?.movedAway?"перенос":cell.subOverride?.pendingMove?"перенос":cell.subOverride?.assignmentIssued?"выдача задания":"отмена"}</span></div>;
+                          if (cell.subOverride?.excursion && viewKind === "teacher") {
+                            const { subj, type } = lessonLabel(cell.inst, data);
+                            const groupNames = publicParticipantGroupLabels(data, cell.inst).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
+                            return <div key={scheduleRenderKey(cell.inst)} className="lesson-chip cancelled-chip excursion-teacher-cancelled">
+                              <div className="excursion-cancelled-title">🎓 {subj}{type ? `, ${type}` : ""}</div>
+                              <div className="excursion-cancelled-title">👥 {groupNames}</div>
+                              <span className="sub-badge cancel">Отменено · экскурсия у группы</span>
+                            </div>;
                           }
-                          if (cell.subOverride?.excursion) {
+                          if (cell.subOverride?.cancelled && !cell.subOverride?.excursion) {
+                            const txt = cell.subOverride?.pendingMove ? "Перенос будет назначен позже" : cell.subOverride?.movedAway ? `Перенесено${cell.subOverride?.targetDate ? ` на ${formatDateDM(cell.subOverride.targetDate)}` : ""}` : cell.subOverride?.assignmentIssued ? "Занятие отменено · выдача задания" : "Занятие отменено";
+                            const gapGroupId = viewKind === "group" ? viewId : cell.inst.groupId; const internalGap = cancellationMakesInternalGroupGap(cell, day, p, gapGroupId); return <div key={scheduleRenderKey(cell.inst)} className={`lesson-chip cancelled-chip${internalGap ? " cancelled-gap-highlight" : ""}${cell.subOverride?.pendingMove ? " pending-move-chip" : cell.subOverride?.movedAway ? " moved-away-chip" : ""}`}><span>{txt}</span><span className="sub-badge cancel">{cell.subOverride?.excursion?"экскурсия · отмена":cell.subOverride?.movedAway?"перенос":cell.subOverride?.pendingMove?"перенос":cell.subOverride?.assignmentIssued?"выдача задания":"отмена"}</span></div>;
+                          }
+                          if (cell.subOverride?.excursion && viewKind === "group") {
                             return <div key={cell.inst.instId} className="public-event excursion-event">
                               <div className="ev-row"><span className="sub-badge cancel">Учебная пара отменена</span></div>
                               <div className="ev-row"><span className="ev-ico">🚌</span> <b>Мероприятие: Экскурсия</b></div>
@@ -21637,7 +21648,7 @@ th{background:#1E3A5F;color:#ffffff;}
                       </div>}
                       {rowHasCustomBell&&<div className="group-custom-bell-time">🕐 {rowBellTime}</div>}
                       {cells.map((cell) => {
-                        if (cell.subOverride?.cancelled) { const txt=cell.subOverride?.pendingMove?"Перенос будет назначен позже":cell.subOverride?.movedAway?`Перенесено${cell.subOverride?.targetDate?` на ${formatDateDM(cell.subOverride.targetDate)}`:""}`:cell.subOverride?.assignmentIssued?"Занятие отменено · выдача задания":"Занятие отменено"; const internalGap=cancellationMakesInternalGroupGap(cell,day,p,group.id); return <div key={scheduleRenderKey(cell.inst)} className={`lesson-chip cancelled-chip${internalGap?" cancelled-gap-highlight":""}${cell.subOverride?.pendingMove?" pending-move-chip":cell.subOverride?.movedAway?" moved-away-chip":""}`}><span>{txt}</span><span className="sub-badge cancel">{cell.subOverride?.movedAway?"перенос":cell.subOverride?.pendingMove?"перенос":cell.subOverride?.assignmentIssued?"выдача задания":"отмена"}</span></div>; }
+                        if (cell.subOverride?.cancelled) { const txt=cell.subOverride?.pendingMove?"Перенос будет назначен позже":cell.subOverride?.movedAway?`Перенесено${cell.subOverride?.targetDate?` на ${formatDateDM(cell.subOverride.targetDate)}`:""}`:cell.subOverride?.assignmentIssued?"Занятие отменено · выдача задания":"Занятие отменено"; const internalGap=cancellationMakesInternalGroupGap(cell,day,p,group.id); return <div key={scheduleRenderKey(cell.inst)} className={`lesson-chip cancelled-chip${internalGap?" cancelled-gap-highlight":""}${cell.subOverride?.pendingMove?" pending-move-chip":cell.subOverride?.movedAway?" moved-away-chip":""}`}><span>{txt}</span><span className="sub-badge cancel">{cell.subOverride?.excursion?"экскурсия · отмена":cell.subOverride?.movedAway?"перенос":cell.subOverride?.pendingMove?"перенос":cell.subOverride?.assignmentIssued?"выдача задания":"отмена"}</span></div>; }
                         const { subj, type } = lessonLabel(cell.inst, data);
                         const cellTeacher = byId(data.teachers, cell.subOverride?.teacherId || cell.inst.teacherId);
                         const teacher = cell.inst.isScheduleEvent ? instanceTeacherNames(data,cell.inst).join(", ") : (cellTeacher?.name || "");
@@ -23705,6 +23716,8 @@ function SubstitutionsPanel({ data, set, onPublish }) {
     .map((inst) => ({ inst, a: sched.assignment[inst.instId] }))
     .filter((r) => r.a && r.a.day === day && instanceAppliesToDate(data.config, r.inst, date));
   const rows = baseRows
+    // Excursion replaces the regular class; cancelled original is managed below.
+    .filter((r) => subFor(r.inst.instId)?.type !== "excursion")
     .filter((r) => !filterGroupId || streamGroups(r.inst).map(String).includes(String(filterGroupId)))
     .filter((r) => !filterTeacherId || instanceTeacherIds(r.inst).map(String).includes(String(filterTeacherId)) || String(subFor(r.inst.instId)?.newTeacherId || "") === String(filterTeacherId))
     .filter((r) => !onlyChanged || !!subFor(r.inst.instId))
@@ -23732,6 +23745,7 @@ function SubstitutionsPanel({ data, set, onPublish }) {
   const scheduleMove = (instId, targetDate, targetPeriod, newFormat = "", newRoomId = "", sourceDate = date) => {
     const row = resolveSourceRow(instId, sourceDate) || baseRows.find((r)=>String(r.inst.instId)===String(instId));
     if(!row||!targetDate)return false;
+    if(targetDate===sourceDate){setError("Для отменённой пары выберите другую дату переноса.");return false;}
     const period=Number(targetPeriod);
     const effectiveFormat=newFormat||row.inst.format||"inperson";
     const effectiveRoomId=effectiveFormat==="remote"?"":(newRoomId||row.a.roomId||"");
@@ -23740,7 +23754,8 @@ function SubstitutionsPanel({ data, set, onPublish }) {
 ${warnings.join("\n")}
 
 Всё равно назначить перенос?`))return false;
-    writeSub(instId,{type:"moved",targetDate,targetPeriod:period,newFormat:effectiveFormat||undefined,newRoomId:effectiveFormat==="remote"?"":effectiveRoomId||undefined,note:`Перенос с ${formatDateDM(sourceDate)}`}, sourceDate);
+    const priorSub = (data.substitutions || []).find((s) => String(s.date) === String(sourceDate) && String(s.instId) === String(instId));
+    writeSub(instId,{type:priorSub?.type === "excursion" ? "excursion" : "moved",targetDate,targetPeriod:period,newFormat:effectiveFormat||undefined,newRoomId:effectiveFormat==="remote"?"":effectiveRoomId||undefined,note:priorSub?.type === "excursion" ? (priorSub.note || "Экскурсия") : `Перенос с ${formatDateDM(sourceDate)}`}, sourceDate);
     return true;
   };
 
@@ -24067,6 +24082,25 @@ ${warnings.join("\n")}
         <label>Примечание<input value={manualCancelled.note} onChange={e=>setManualCancelled(v=>({...v,note:e.target.value}))} placeholder="Причина отмены / перенос"/></label>
         </div><button className="btn primary sm" onClick={saveManualCancelled}>Сохранить в реестр</button></div>}
       {((data.substitutions||[]).some(x=>x.importUnresolved||x.manualCancellation))&&<div className="notice timetable-extra-panel"><h3>Неназначенные / ожидают замены — {(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).length}</h3><p>Все импортированные отмены и переносы без однозначной привязки к занятию. Сохранены исходные названия, преподаватели и даты. Эти записи не занимают аудитории и не включаются в фактические часы, пока не назначены.</p><div className="timetable-orphan-list">{(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).sort((a,b)=>String(a.date).localeCompare(String(b.date))).map(x=><div key={x.id} className="timetable-orphan-row"><span>{formatDateDM(x.date)} · {x.importOldPeriod||"?"} пара · {x.importGroup||"Группа не найдена"} · <b>{x.importSubject||"Без названия"}</b> · {x.importOldTeacher||""} · {x.type==="cancel_assignment"?"Отмена с заданием":x.type==="pending_move"?"Ожидает переноса":x.type==="cancel"?"Отмена":"Замена / перенос"}{x.note?` · ${x.note}`:""}</span><button className="btn ghost sm" onClick={()=>{setDate(x.date);setFilterGroupId(x.importGroupId||"");setFilterTeacherId(x.importOldTeacherId||"");setImportMsg(`Выбрана дата ${formatDateDM(x.date)}. Для проведения замены необходимо сопоставить исходную пару с занятиями расписания.`);}}>Открыть дату</button><button className="btn ghost sm" onClick={()=>set("substitutions")((data.substitutions||[]).filter(y=>y.id!==x.id))}>Удалить</button></div>)}</div></div>}
+      {(data.substitutions||[]).some(x=>x.type==="excursion") && <div className="notice timetable-extra-panel">
+        <h3>Неназначенные занятия после экскурсий — {(data.substitutions||[]).filter(x=>x.type==="excursion"&&!x.targetDate).length}</h3>
+        <p>Исходные учебные пары отменены в выбранные даты, не занимают аудитории и ожидают размещения. Назначение переноса сохраняет экскурсию в исходной дате.</p>
+        <div className="timetable-orphan-list">{(data.substitutions||[]).filter(x=>x.type==="excursion").map(x=>{
+          const source=resolveSourceRow(x.instId,x.date);
+          const inst=source?.inst || instanceById.get(String(x.instId));
+          const a=source?.a || scheduleAssignments[x.instId];
+          if(!inst)return null;
+          const subject=lessonLabel(inst,data).subj;
+          const group=publicParticipantGroupLabels(data,inst).join(", ")||byId(data.groups,inst.groupId)?.name||"";
+          const teacher=instanceTeacherNames(data,inst).join(", ");
+          return <div key={`exc-unplaced-${x.id}`} className="timetable-orphan-row">
+            <span>{formatDateDM(x.date)} · {a?Number(a.period)+1:"?"} пара · {group} · <b>{subject}</b> · {teacher} · {x.targetDate ? `Перенос назначен на ${formatDateDM(x.targetDate)}, ${Number(x.targetPeriod)+1} пару` : "Ожидает размещения"}</span>
+            <button className="btn ghost sm" onClick={()=>setMoveLater({instId:x.instId,sourceDate:x.date,targetDate:x.targetDate||"",targetPeriod:x.targetPeriod??a?.period??0,newFormat:x.newFormat||inst.format,newRoomId:x.newRoomId||a?.roomId||""})}>{x.targetDate?"Изменить перенос":"Разместить позже"}</button>
+            <button className="btn ghost sm" onClick={()=>{const note=window.prompt("Название / место экскурсии:",x.note||"Экскурсия");if(note!==null)writeSub(x.instId,{note:note.trim()||"Экскурсия"},x.date);}}>Изменить экскурсию</button>
+            <button className="btn ghost sm" onClick={()=>{if(window.confirm("Отменить экскурсию и восстановить исходное занятие?"))removeSub(x.instId,x.date);}}>Восстановить пару</button>
+          </div>;
+        })}</div>
+      </div>}
       {importMsg&&<div className="notice">{importMsg}</div>}
       {exportMsg&&<div className="notice">{exportMsg}</div>}
       {noOrdinaryClassesToday && subs.length>0 && <div className="notice">На этой дате отключено обычное расписание. Сохранённые ранее операции замены для регулярных пар не применяются к закрытому дню и не выводятся в список.</div>}
@@ -24076,7 +24110,7 @@ ${warnings.join("\n")}
           const {inst,a}=row; const {subj}=lessonLabel(inst,data); const groupLabels=publicParticipantGroupLabels(data,inst); const group=groupLabels.join(", ")||byId(data.groups,inst.groupId)?.name||""; const teacherNames=instanceTeacherNames(data,inst); const teacher=teacherNames.join(", ")||byId(data.teachers,inst.teacherId)?.name||""; const room=assignmentRoomLabel(data,a)||""; const sub=subFor(inst.instId); const editing=editingKey===inst.instId; const effPeriod=sub?.newPeriod??a.period; const effFormat=sub?.newFormat||inst.format; const effRoomId=sub?.newRoomId||a.roomId||""; const effRoom=sub?.type==="excursion"?"Без аудитории":effFormat==="remote"?"ДО":(byId(data.rooms,effRoomId)?.name||room||"—"); const roomChanged=effFormat==="remote"?inst.format!=="remote":(!!sub?.newRoomId&&String(sub.newRoomId)!==String(a.roomId||"")); const isStream=(streamGroups(inst)||[]).length>1;
           return <tr key={inst.instId} draggable onDragStart={()=>setDraggingId(inst.instId)} onDragEnd={()=>{setDraggingId(null);setDropId(null)}} onDragOver={(e)=>{e.preventDefault();setDropId(inst.instId)}} onDrop={(e)=>{e.preventDefault(); if(draggingId&&draggingId!==inst.instId)moveOrSwap(draggingId,effPeriod);setDraggingId(null);setDropId(null)}} className={`sub-row${draggingId===inst.instId?" dragging":""}${dropId===inst.instId?" drop-target":""}${sub?.type==="cancel"||sub?.type==="cancel_assignment"||sub?.type==="pending_move"||sub?.type==="moved"||sub?.type==="excursion"?" change-old-row":""}${sub&&!["cancel","cancel_assignment","pending_move","moved","excursion"].includes(sub.type)?" change-new-row":""}`}>
             <td className="drag-col"><span className="drag-handle" title="Перетащить">⋮⋮</span></td><td className="pair-col"><div className="sub-cell-pair"><b>{effPeriod+1}</b>{effPeriod!==a.period&&<div className="computer-hint">было: {a.period+1}</div>}</div></td><td className="group-col"><div className="sub-cell-main">{group}{authoritativeSubgroupForInstance(data, inst)?` (п/г ${authoritativeSubgroupForInstance(data, inst)})`:""}{isStream&&<div><span className="sub-badge stream">🔗 поток</span></div>}</div></td><td className="subject-col"><div className="sub-cell-main">{subj}</div></td><td className="teacher-col"><div className="sub-cell-main">{teacher}</div></td><td className="room-col"><div className="sub-cell-main">{effRoom}{roomChanged&&room&&<div className="computer-hint">было: {room}</div>}</div></td><td className="change-col">
-            {sub ? <div className="sub-edit" style={{flexWrap:"wrap"}}>{sub.type==="cancel"?<span className="sub-badge cancel">отмена</span>:sub.type==="cancel_assignment"?<><span className="sub-badge cancel">отмена</span><span className="sub-badge assignment">выдача задания</span></>:sub.type==="pending_move"?<><span className="sub-badge pending">перенос не назначен</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Назначить перенос</button></>:sub.type==="moved"?<><span className="sub-badge moved">перенос → {formatDateDM(sub.targetDate)} · {Number(sub.targetPeriod)+1} пара</span>{sub.newFormat==="remote"&&<span className="sub-badge remote-change">ДО</span>}<button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:sub.targetDate,targetPeriod:sub.targetPeriod,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>Изменить</button></>:sub.type==="excursion"?<><span className="sub-badge cancel">Пара отменена</span><span className="sub-badge replacement">🚌 Мероприятие: экскурсия · без аудитории</span>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"excursion",note:window.prompt("Название / место экскурсии (необязательно):",sub.note||"")||"Экскурсия",newRoomId:""})}>Изменить</button></>:sub.type==="join_subgroup"?<><span className="sub-badge teacher-replacement-badge">👤 преподаватель другой подгруппы</span>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>Изменить</button></>:<>
+            {sub ? <div className="sub-edit" style={{flexWrap:"wrap"}}>{sub.type==="cancel"?<span className="sub-badge cancel">отмена</span>:sub.type==="cancel_assignment"?<><span className="sub-badge cancel">отмена</span><span className="sub-badge assignment">выдача задания</span></>:sub.type==="pending_move"?<><span className="sub-badge pending">перенос не назначен</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Назначить перенос</button></>:sub.type==="moved"?<><span className="sub-badge moved">перенос → {formatDateDM(sub.targetDate)} · {Number(sub.targetPeriod)+1} пара</span>{sub.newFormat==="remote"&&<span className="sub-badge remote-change">ДО</span>}<button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:sub.targetDate,targetPeriod:sub.targetPeriod,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>Изменить</button></>:sub.type==="excursion"?<><span className="sub-badge cancel">Пара отменена</span><span className="sub-badge replacement">🚌 Мероприятие: экскурсия · без аудитории</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,sourceDate:date,targetDate:sub.targetDate||date,targetPeriod:sub.targetPeriod??a.period,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>{sub.targetDate?"Изменить перенос":"Разместить отменённую пару"}</button>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"excursion",note:window.prompt("Название / место экскурсии (необязательно):",sub.note||"")||"Экскурсия",newRoomId:""})}>Изменить</button></>:sub.type==="join_subgroup"?<><span className="sub-badge teacher-replacement-badge">👤 преподаватель другой подгруппы</span>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>Изменить</button></>:<>
               <label className="sub-period-edit-label">№ пары <select value={effPeriod} onChange={(e)=>moveOrSwap(inst.instId,Number(e.target.value))} title="Изменить порядок / номер пары на выбранную дату">{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label>
               <SearchableSelect value={sub.newTeacherId||inst.teacherId} onChange={(v)=>changeResource(row,{newTeacherId:v})} options={data.teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Преподаватель…"/>
               <select value={sub.newFormat||inst.format} onChange={(e)=>changeResource(row,{newFormat:e.target.value})} title="Формат занятия"><option value="inperson">Очно</option><option value="remote">ДО</option></select><SearchableSelect value={sub.newRoomId||a.roomId||""} onChange={(v)=>changeResource(row,{newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Аудитория…"/><span className="sub-badge replacement">замена</span>
@@ -25660,7 +25694,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
         : kind === "room"
           ? assignmentRoomIds(cell.a).map(String).includes(String(viewId))
           : true)
-      .concat((data.substitutions || []).filter((sub) => sub.type === "moved" && sub.targetDate === date).map((sub) => movedCellForSubstitution(data, sub)).filter(Boolean).filter((cell) => kind === "group" ? belongsToGroup(cell.inst, viewId) : kind === "teacher" ? String(cell.subOverride?.teacherId || cell.inst.teacherId || "") === String(viewId) : assignmentRoomIds(cell.a).map(String).includes(String(viewId))))
+      .concat((data.substitutions || []).filter((sub) => ["moved", "excursion"].includes(sub.type) && sub.targetDate === date).map((sub) => movedCellForSubstitution(data, sub)).filter(Boolean).filter((cell) => kind === "group" ? belongsToGroup(cell.inst, viewId) : kind === "teacher" ? String(cell.subOverride?.teacherId || cell.inst.teacherId || "") === String(viewId) : assignmentRoomIds(cell.a).map(String).includes(String(viewId))))
       .sort((x, y) => x.a.period - y.a.period) : [];
     const retakesToday = (data.retakes || [])
       .filter((r) => r.date === date)
@@ -26304,6 +26338,16 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                               </div>
                             );
                           }
+                          // Excursion is an independent event replacing the cancelled class.
+                          // No subject, teacher or classroom from the original lesson may leak into it.
+                          if (cell.subOverride?.excursion) {
+                            if (kind !== "group") return null;
+                            return <div key={`excursion-${cell.inst.instId}`} className="public-event excursion-event">
+                              <div className="ev-row"><span className="ev-ico">🕐</span> {periodTimeForGroupDay(data, cell.inst.groupId, day, cell.a.period, date)}</div>
+                              <div className="ev-row ev-subject"><span className="ev-ico">🚌</span> <b>Мероприятие: Экскурсия</b></div>
+                              {cell.subOverride.note && cell.subOverride.note !== "Экскурсия" && <div className="ev-row">{cell.subOverride.note}</div>}
+                            </div>;
+                          }
                           if (cell.subOverride?.cancelled) {
                             const before = publicRegular.some((x)=>!x.subOverride?.cancelled && x.a.period < cell.a.period);
                             const after = publicRegular.some((x)=>!x.subOverride?.cancelled && x.a.period > cell.a.period);
@@ -26312,7 +26356,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                             const cancelledTeacher = instanceTeacherNames(data, cell.inst).join(", ");
                             const cancelledGroups = publicParticipantGroupLabels(data, cell.inst).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
                             const targetPair = Number.isFinite(Number(cell.subOverride?.targetPeriod)) ? `${Number(cell.subOverride.targetPeriod)+1} пара` : "";
-                            const cancelText = cell.subOverride?.pendingMove ? "Отменено · перенос будет назначен позже" : cell.subOverride?.movedAway ? `Перенесено${cell.subOverride?.targetDate ? ` на ${formatDateDM(cell.subOverride.targetDate)}` : ""}${targetPair ? ` · ${targetPair}` : ""}` : cell.subOverride?.assignmentIssued ? "Отменено с выдачей задания" : "Отменено";
+                            const cancelText = cell.subOverride?.excursion ? "Отменено · у группы экскурсия" : cell.subOverride?.pendingMove ? "Отменено · перенос будет назначен позже" : cell.subOverride?.movedAway ? `Перенесено${cell.subOverride?.targetDate ? ` на ${formatDateDM(cell.subOverride.targetDate)}` : ""}${targetPair ? ` · ${targetPair}` : ""}` : cell.subOverride?.assignmentIssued ? "Отменено с выдачей задания" : "Отменено";
                             return (
                               <div key={cell.inst.instId} className={`public-event cancelled${internalGap ? " cancelled-gap-highlight" : ""}${cell.subOverride?.pendingMove ? " pending-move" : ""}`}>
                                 <div className="ev-row"><span className="ev-ico">🕐</span> <b>{cell.a.period+1} пара</b> · {periodTimeForGroupDay(data, cell.inst.groupId, day, cell.a.period, date)}</div>
@@ -26320,8 +26364,8 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                                 <div className="ev-row ev-cancel-text"><b>{cancelText}</b></div>
                                 <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" ? cancelledTeacher : cancelledGroups}</div>
                                 {kind === "room" && cancelledTeacher && <div className="ev-row"><span className="ev-ico">👤</span> {cancelledTeacher}</div>}
-                                {cell.subOverride.note && !["Занятие отменено","Занятие отменено · выдача задания","Занятие отменено; требуется назначить перенос"].includes(cell.subOverride.note) && <div className="ev-row ev-subgroup">{cell.subOverride.note}</div>}
-                                <span className="sub-badge cancel">{cell.subOverride?.movedAway?"перенос":cell.subOverride?.pendingMove?"перенос":cell.subOverride?.assignmentIssued?"выдача задания":"отмена"}</span>
+                                {cell.subOverride.note && !["Экскурсия","Занятие отменено","Занятие отменено · выдача задания","Занятие отменено; требуется назначить перенос"].includes(cell.subOverride.note) && <div className="ev-row ev-subgroup">{cell.subOverride.note}</div>}
+                                <span className="sub-badge cancel">{cell.subOverride?.excursion?"экскурсия · отмена":cell.subOverride?.movedAway?"перенос":cell.subOverride?.pendingMove?"перенос":cell.subOverride?.assignmentIssued?"выдача задания":"отмена"}</span>
                               </div>
                             );
                           }
