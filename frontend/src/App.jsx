@@ -23881,6 +23881,16 @@ ${warnings.join("\n")}
     })
     .sort((a, b) => String(a.sub?.date || "").localeCompare(String(b.sub?.date || "")) || String(a.groupLabel || "").localeCompare(String(b.groupLabel || ""), "ru"));
 
+  const excursionItems = (data.substitutions || [])
+    .filter((x) => x.type === "excursion")
+    .map((x) => {
+      const source = resolveSourceRow(x.instId, x.date);
+      const inst = source?.inst || instanceById.get(String(x.instId));
+      const assignment = source?.a || scheduleAssignments?.[x.instId] || scheduleAssignments?.[String(x.instId)] || null;
+      return { sub: x, inst, assignment };
+    })
+    .filter((x) => x.inst && x.assignment);
+
   const excelDateFull = (value) => {
     const m = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
     return m ? `${m[3]}.${m[2]}.${m[1]}` : String(value || "");
@@ -24082,24 +24092,28 @@ ${warnings.join("\n")}
         <label>Примечание<input value={manualCancelled.note} onChange={e=>setManualCancelled(v=>({...v,note:e.target.value}))} placeholder="Причина отмены / перенос"/></label>
         </div><button className="btn primary sm" onClick={saveManualCancelled}>Сохранить в реестр</button></div>}
       {((data.substitutions||[]).some(x=>x.importUnresolved||x.manualCancellation))&&<div className="notice timetable-extra-panel"><h3>Неназначенные / ожидают замены — {(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).length}</h3><p>Все импортированные отмены и переносы без однозначной привязки к занятию. Сохранены исходные названия, преподаватели и даты. Эти записи не занимают аудитории и не включаются в фактические часы, пока не назначены.</p><div className="timetable-orphan-list">{(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).sort((a,b)=>String(a.date).localeCompare(String(b.date))).map(x=><div key={x.id} className="timetable-orphan-row"><span>{formatDateDM(x.date)} · {x.importOldPeriod||"?"} пара · {x.importGroup||"Группа не найдена"} · <b>{x.importSubject||"Без названия"}</b> · {x.importOldTeacher||""} · {x.type==="cancel_assignment"?"Отмена с заданием":x.type==="pending_move"?"Ожидает переноса":x.type==="cancel"?"Отмена":"Замена / перенос"}{x.note?` · ${x.note}`:""}</span><button className="btn ghost sm" onClick={()=>{setDate(x.date);setFilterGroupId(x.importGroupId||"");setFilterTeacherId(x.importOldTeacherId||"");setImportMsg(`Выбрана дата ${formatDateDM(x.date)}. Для проведения замены необходимо сопоставить исходную пару с занятиями расписания.`);}}>Открыть дату</button><button className="btn ghost sm" onClick={()=>set("substitutions")((data.substitutions||[]).filter(y=>y.id!==x.id))}>Удалить</button></div>)}</div></div>}
-      {(data.substitutions||[]).some(x=>x.type==="excursion") && <div className="notice timetable-extra-panel">
-        <h3>Неназначенные занятия после экскурсий — {(data.substitutions||[]).filter(x=>x.type==="excursion"&&!x.targetDate).length}</h3>
-        <p>Исходные учебные пары отменены в выбранные даты, не занимают аудитории и ожидают размещения. Назначение переноса сохраняет экскурсию в исходной дате.</p>
-        <div className="timetable-orphan-list">{(data.substitutions||[]).filter(x=>x.type==="excursion").map(x=>{
-          const source=resolveSourceRow(x.instId,x.date);
-          const inst=source?.inst || instanceById.get(String(x.instId));
-          const a=source?.a || scheduleAssignments[x.instId];
-          if(!inst)return null;
-          const subject=lessonLabel(inst,data).subj;
-          const group=publicParticipantGroupLabels(data,inst).join(", ")||byId(data.groups,inst.groupId)?.name||"";
-          const teacher=instanceTeacherNames(data,inst).join(", ");
-          return <div key={`exc-unplaced-${x.id}`} className="timetable-orphan-row">
-            <span>{formatDateDM(x.date)} · {a?Number(a.period)+1:"?"} пара · {group} · <b>{subject}</b> · {teacher} · {x.targetDate ? `Перенос назначен на ${formatDateDM(x.targetDate)}, ${Number(x.targetPeriod)+1} пару` : "Ожидает размещения"}</span>
-            <button className="btn ghost sm" onClick={()=>setMoveLater({instId:x.instId,sourceDate:x.date,targetDate:x.targetDate||"",targetPeriod:x.targetPeriod??a?.period??0,newFormat:x.newFormat||inst.format,newRoomId:x.newRoomId||a?.roomId||""})}>{x.targetDate?"Изменить перенос":"Разместить позже"}</button>
-            <button className="btn ghost sm" onClick={()=>{const note=window.prompt("Название / место экскурсии:",x.note||"Экскурсия");if(note!==null)writeSub(x.instId,{note:note.trim()||"Экскурсия"},x.date);}}>Изменить экскурсию</button>
-            <button className="btn ghost sm" onClick={()=>{if(window.confirm("Отменить экскурсию и восстановить исходное занятие?"))removeSub(x.instId,x.date);}}>Восстановить пару</button>
-          </div>;
-        })}</div>
+      {(excursionItems.length > 0 || pendingItems.length > 0) && <div className="notice timetable-extra-panel">
+        <h3>Неназначенные занятия и переносы — {excursionItems.filter(({ sub })=>!sub.targetDate).length + pendingItems.length}</h3>
+        <p>Все отменённые пары, которые ещё требуют размещения, собраны в одном блоке. Экскурсия остаётся в исходной дате, а обычные отменённые занятия можно назначить на новую дату.</p>
+        {excursionItems.length > 0 && <>
+          <h4 className="sub-heading" style={{marginTop:0}}>Неназначенные занятия после экскурсий — {excursionItems.filter(({ sub })=>!sub.targetDate).length}</h4>
+          <div className="timetable-orphan-list">{excursionItems.map(({ sub:x, inst, assignment:a })=>{
+            const subject=lessonLabel(inst,data).subj;
+            const group=publicParticipantGroupLabels(data,inst).join(", ")||byId(data.groups,inst.groupId)?.name||"";
+            const teacher=instanceTeacherNames(data,inst).join(", ");
+            return <div key={`exc-unplaced-${x.id}`} className="timetable-orphan-row">
+              <span>{formatDateDM(x.date)} · {a?Number(a.period)+1:"?"} пара · {group} · <b>{subject}</b> · {teacher} · {x.targetDate ? `Перенос назначен на ${formatDateDM(x.targetDate)}, ${Number(x.targetPeriod)+1} пару` : "Ожидает размещения"}</span>
+              <button className="btn ghost sm" onClick={()=>setMoveLater({instId:x.instId,sourceDate:x.date,targetDate:x.targetDate||"",targetPeriod:x.targetPeriod??a?.period??0,newFormat:x.newFormat||inst.format,newRoomId:x.newRoomId||a?.roomId||""})}>{x.targetDate?"Изменить перенос":"Разместить позже"}</button>
+              <button className="btn ghost sm" onClick={()=>{const note=window.prompt("Название / место экскурсии:",x.note||"Экскурсия");if(note!==null)writeSub(x.instId,{note:note.trim()||"Экскурсия"},x.date);}}>Изменить экскурсию</button>
+              <button className="btn ghost sm" onClick={()=>{if(window.confirm("Отменить экскурсию и восстановить исходное занятие?"))removeSub(x.instId,x.date);}}>Восстановить пару</button>
+            </div>;
+          })}</div>
+        </>}
+        {pendingItems.length > 0 && <>
+          <h4 className="sub-heading" style={{marginTop:excursionItems.length > 0 ? 18 : 0}}>Нужно назначить перенос — {pendingItems.length}</h4>
+          <p className="avail-hint">Сюда перенесён общий список отменённых занятий, для которых дата переноса ещё не выбрана. Импортированные записи без привязки тоже показываются здесь.</p>
+          <div className="pending-transfers-list">{pendingItems.map(({ sub, inst, assignment, groupLabel, subjectLabel, teacherLabel, periodLabel, canAssign }) => <div key={sub.id} className={`pending-transfer-row${canAssign ? "" : " unresolved"}`}><div className="pending-transfer-main"><div className="pending-transfer-title"><b>{formatDateDM(sub.date)}</b><span>{groupLabel}</span><span>{subjectLabel}</span></div><div className="pending-transfer-meta"><span>{teacherLabel || "Преподаватель не указан"}</span><span>{periodLabel}</span>{sub.note && <span>{sub.note}</span>}{!canAssign && <span className="pending-warning">Не привязано к текущему расписанию</span>}</div></div><div className="pending-transfer-actions">{canAssign ? <button className="btn ghost sm" onClick={()=>setMoveLater({instId:sub.instId,sourceDate:sub.date,targetDate:"",targetPeriod:Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) : 0,newFormat:inst?.format||"inperson",newRoomId:assignment?.roomId||""})}>Назначить перенос</button> : <button className="btn primary sm" onClick={()=>{setError("");setOrphanMove({id:sub.id,date:sub.date,targetDate:"",period:Math.max(0,(Number(sub.importOldPeriod)||1)-1),groupId:sub.importGroupId||"",teacherId:sub.importOldTeacherId||"",subject:sub.importSubject||"",format:"inperson",roomId:"",hours:2});}}>Назначить перенос</button>}</div></div>)}</div>
+        </>}
       </div>}
       {importMsg&&<div className="notice">{importMsg}</div>}
       {exportMsg&&<div className="notice">{exportMsg}</div>}
@@ -24121,7 +24135,6 @@ ${warnings.join("\n")}
         })}
         {rows.length===0&&<tr><td colSpan={7} className="empty-row">По выбранным фильтрам занятий нет</td></tr>}
       </tbody></table></div>
-      {pendingItems.length > 0 && <div className="pending-transfers"><div className="pending-transfers-head"><div><h2 className="sub-heading">Нужно назначить перенос</h2><p className="avail-hint">Отменены конкретные занятия, для которых дата переноса ещё не выбрана. Здесь показываются и импортированные записи, даже если они пока не привязаны к текущему расписанию.</p></div><div className="pending-count">{pendingItems.length}</div></div><div className="pending-transfers-list">{pendingItems.map(({ sub, inst, assignment, groupLabel, subjectLabel, teacherLabel, periodLabel, canAssign }) => <div key={sub.id} className={`pending-transfer-row${canAssign ? "" : " unresolved"}`}><div className="pending-transfer-main"><div className="pending-transfer-title"><b>{formatDateDM(sub.date)}</b><span>{groupLabel}</span><span>{subjectLabel}</span></div><div className="pending-transfer-meta"><span>{teacherLabel || "Преподаватель не указан"}</span><span>{periodLabel}</span>{sub.note && <span>{sub.note}</span>}{!canAssign && <span className="pending-warning">Не привязано к текущему расписанию</span>}</div></div><div className="pending-transfer-actions">{canAssign ? <button className="btn ghost sm" onClick={()=>setMoveLater({instId:sub.instId,sourceDate:sub.date,targetDate:"",targetPeriod:Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) : 0,newFormat:inst?.format||"inperson",newRoomId:assignment?.roomId||""})}>Назначить перенос</button> : <button className="btn primary sm" onClick={()=>{setError("");setOrphanMove({id:sub.id,date:sub.date,targetDate:"",period:Math.max(0,(Number(sub.importOldPeriod)||1)-1),groupId:sub.importGroupId||"",teacherId:sub.importOldTeacherId||"",subject:sub.importSubject||"",format:"inperson",roomId:"",hours:2});}}>Назначить перенос</button>}</div></div>)}</div></div>}
       {joinSubgroup && (()=>{
         const source=baseRows.find((r)=>String(r.inst.instId)===String(joinSubgroup.sourceInstId));
         if(!source) return <Modal title="Объединить подгруппы" onClose={()=>setJoinSubgroup(null)}><div className="notice">Исходная подгруппа не найдена на выбранную дату.</div></Modal>;
@@ -26340,14 +26353,17 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                           }
                           // Excursion is an independent event replacing the cancelled class.
                           // No subject, teacher or classroom from the original lesson may leak into it.
-                          if (cell.subOverride?.excursion) {
-                            if (kind !== "group") return null;
+                          if (cell.subOverride?.excursion && kind === "group") {
                             return <div key={`excursion-${cell.inst.instId}`} className="public-event excursion-event">
                               <div className="ev-row"><span className="ev-ico">🕐</span> {periodTimeForGroupDay(data, cell.inst.groupId, day, cell.a.period, date)}</div>
                               <div className="ev-row ev-subject"><span className="ev-ico">🚌</span> <b>Мероприятие: Экскурсия</b></div>
                               {cell.subOverride.note && cell.subOverride.note !== "Экскурсия" && <div className="ev-row">{cell.subOverride.note}</div>}
                             </div>;
                           }
+                          // In the teacher view the original excursion-replaced lesson is
+                          // deliberately retained and rendered as a cancelled class below.
+                          // Previously an unconditional `kind !== "group"` return above
+                          // suppressed the card before the cancellation branch could run.
                           if (cell.subOverride?.cancelled) {
                             const before = publicRegular.some((x)=>!x.subOverride?.cancelled && x.a.period < cell.a.period);
                             const after = publicRegular.some((x)=>!x.subOverride?.cancelled && x.a.period > cell.a.period);

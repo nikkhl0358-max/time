@@ -23384,7 +23384,7 @@ ${warnings.join("\n")}
   };
 
   const pendingItems = (data.substitutions || [])
-    .filter((x) => x.type === "pending_move")
+    .filter((x) => x.type === "pending_move" || (x.importUnresolved && x.pendingForReplacement && ["cancel","cancel_assignment"].includes(x.type)))
     .map((x) => {
       const source = resolveSourceRow(x.instId, x.date);
       const inst = source?.inst || instanceById.get(String(x.instId));
@@ -23412,6 +23412,16 @@ ${warnings.join("\n")}
       };
     })
     .sort((a, b) => String(a.sub?.date || "").localeCompare(String(b.sub?.date || "")) || String(a.groupLabel || "").localeCompare(String(b.groupLabel || ""), "ru"));
+
+  const excursionItems = (data.substitutions || [])
+    .filter((x) => x.type === "excursion")
+    .map((x) => {
+      const source = resolveSourceRow(x.instId, x.date);
+      const inst = source?.inst || instanceById.get(String(x.instId));
+      const assignment = source?.a || scheduleAssignments?.[x.instId] || scheduleAssignments?.[String(x.instId)] || null;
+      return { sub: x, inst, assignment };
+    })
+    .filter((x) => x.inst && x.assignment);
 
   const excelDateFull = (value) => {
     const m = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
@@ -23622,7 +23632,6 @@ ${warnings.join("\n")}
         })}
         {rows.length===0&&<tr><td colSpan={7} className="empty-row">По выбранным фильтрам занятий нет</td></tr>}
       </tbody></table></div>
-      {pendingItems.length > 0 && <div className="pending-transfers"><div className="pending-transfers-head"><div><h2 className="sub-heading">Нужно назначить перенос</h2><p className="avail-hint">Отменены конкретные занятия, для которых дата переноса ещё не выбрана. Здесь показываются и импортированные записи, даже если они пока не привязаны к текущему расписанию.</p></div><div className="pending-count">{pendingItems.length}</div></div><div className="pending-transfers-list">{pendingItems.map(({ sub, inst, assignment, groupLabel, subjectLabel, teacherLabel, periodLabel, canAssign }) => <div key={sub.id} className={`pending-transfer-row${canAssign ? "" : " unresolved"}`}><div className="pending-transfer-main"><div className="pending-transfer-title"><b>{formatDateDM(sub.date)}</b><span>{groupLabel}</span><span>{subjectLabel}</span></div><div className="pending-transfer-meta"><span>{teacherLabel || "Преподаватель не указан"}</span><span>{periodLabel}</span>{sub.note && <span>{sub.note}</span>}{!canAssign && <span className="pending-warning">Не привязано к текущему расписанию</span>}</div></div><div className="pending-transfer-actions">{canAssign ? <button className="btn ghost sm" onClick={()=>setMoveLater({instId:sub.instId,sourceDate:sub.date,targetDate:"",targetPeriod:Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) : 0,newFormat:inst?.format||"inperson",newRoomId:assignment?.roomId||""})}>Назначить перенос</button> : <button className="btn ghost sm" disabled title="Сначала нужно привязать запись к занятию текущего расписания">Нет связи с занятием</button>}</div></div>)}</div></div>}
       {joinSubgroup && (()=>{
         const source=baseRows.find((r)=>String(r.inst.instId)===String(joinSubgroup.sourceInstId));
         if(!source) return <Modal title="Объединить подгруппы" onClose={()=>setJoinSubgroup(null)}><div className="notice">Исходная подгруппа не найдена на выбранную дату.</div></Modal>;
