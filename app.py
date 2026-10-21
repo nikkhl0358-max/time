@@ -2981,7 +2981,7 @@ def public_room_availability():
             continue
         matching = next((sub for sub in substitutions if isinstance(sub, dict) and str(sub.get("date") or "") == date_str
                         and bool(_public_instance_identity_ids(inst).intersection(_public_substitution_source_ids(sub)))), None)
-        if matching and matching.get("type") in {"cancel", "cancel_assignment", "pending_move", "moved"}:
+        if matching and matching.get("type") in {"cancel", "cancel_assignment", "pending_move", "moved", "excursion"}:
             continue
         actual_period = int(matching.get("newPeriod") if matching and matching.get("newPeriod") is not None else period)
         if actual_period != period:
