@@ -1073,7 +1073,9 @@ function enrichInstanceStreamGroups(data, inst) {
 function instanceGroupNames(data, inst) {
   const enriched = enrichInstanceStreamGroups(data, inst);
   const ids = [...new Set([enriched?.groupId, ...(enriched?.groupIds || []), ...(enriched?.streamGroupIds || [])].filter(Boolean))];
-  return ids.map((id) => data.groups.find((g) => g.id === id)?.name).filter(Boolean);
+  const names = ids.map((id) => data.groups.find((g) => g.id === id)?.name).filter(Boolean);
+  if (enriched?.externalGroupName && !names.includes(enriched.externalGroupName)) names.push(enriched.externalGroupName);
+  return names;
 }
 function instanceTeacherIds(inst) {
   if (!inst) return [];
@@ -10663,11 +10665,11 @@ function HoursPlanPanel({ data, set }) {
 
 function scheduleEventKind(inst) {
   const raw = String(inst?.eventKind || inst?.eventType || "event").toLowerCase();
-  return raw === "courses" || raw === "course" || raw === "курсы" ? "courses" : "event";
+  return raw === "external_class" ? "external_class" : raw === "courses" || raw === "course" || raw === "курсы" ? "courses" : "event";
 }
 
 function scheduleEventLabel(inst) {
-  return scheduleEventKind(inst) === "courses" ? "Курсы" : "Мероприятие";
+  return scheduleEventKind(inst) === "external_class" ? "Занятие заочников" : scheduleEventKind(inst) === "courses" ? "Курсы" : "Мероприятие";
 }
 
 function lessonLabel(inst, data) {
@@ -16234,6 +16236,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         instId: first.instId,
         seriesId,
         title: first.eventTitle || "",
+        externalGroupName: first.externalGroupName || "",
         eventKind: scheduleEventKind(first),
         groupIds: [...new Set(streamGroups(first).map(String))],
         teacherIds: instanceTeacherIds(first),
@@ -16252,6 +16255,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       instId: "",
       seriesId: "",
       title: "",
+      externalGroupName: "",
       eventKind: "event",
       groupIds: groupId ? [String(groupId)] : [],
       teacherIds: [],
@@ -16274,7 +16278,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const startM = clockMinutes(d.startTime), endM = clockMinutes(d.endTime);
 
     if (!title) { setManualError("Укажите название."); return; }
-    if (!groupIds.length) { setManualError("Выберите хотя бы одну группу."); return; }
+    if (!groupIds.length && !(d.eventKind === "external_class" && String(d.externalGroupName||"").trim())) { setManualError("Выберите группу или впишите группу заочников."); return; }
     if (!teacherIds.length) { setManualError("Выберите хотя бы одного преподавателя."); return; }
     if (!roomId) { setManualError("Выберите аудиторию."); return; }
     if (startM == null || endM == null || endM <= startM) { setManualError("Проверьте время начала и окончания мероприятия."); return; }
@@ -16293,7 +16297,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       .filter((x)=>x?.isScheduleEvent && String(x.eventSeriesId || x.instId)===seriesId)
       .map((x)=>String(x.instId));
 
-    const primaryGroupId = groupIds[0];
+    const primaryGroupId = groupIds[0] || "";
     const primaryTeacherId = teacherIds[0];
     const newInstances = [];
     const newAssignments = {};
@@ -16305,8 +16309,9 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         instId,
         eventSeriesId: seriesId,
         isScheduleEvent: true,
-        nonEducational: true,
+        nonEducational: true, // Записи заочников пока не являются записью учебной нагрузки
         eventTitle: title,
+        externalGroupName: d.eventKind === "external_class" ? String(d.externalGroupName||"").trim() : "",
         eventKind: String(d.eventKind || "event"),
         eventStartTime: String(d.startTime),
         eventEndTime: String(d.endTime),
@@ -22291,10 +22296,11 @@ th{background:#1E3A5F;color:#ffffff;}
       {scheduleEventEditor && <Modal title={scheduleEventEditor.instId ? "Редактировать мероприятие" : "Новое мероприятие"} modalClass="schedule-event-modal" onClose={()=>setScheduleEventEditor(null)}>
         <div className="event-editor-body">
           <div className="event-editor-grid event-editor-kind-grid">
-            <label className="field"><span>Тип</span><select value={scheduleEventEditor.eventKind||"event"} onChange={(e)=>setScheduleEventEditor((x)=>({...x,eventKind:e.target.value}))}><option value="event">Мероприятие</option><option value="courses">Курсы</option></select></label>
+            <label className="field"><span>Тип</span><select value={scheduleEventEditor.eventKind||"event"} onChange={(e)=>setScheduleEventEditor((x)=>({...x,eventKind:e.target.value}))}><option value="event">Мероприятие</option><option value="courses">Курсы</option><option value="external_class">Пара для заочников</option></select></label>
             <label className="field"><span>Название</span><input value={scheduleEventEditor.title||""} onChange={(e)=>setScheduleEventEditor((x)=>({...x,title:e.target.value}))} placeholder={scheduleEventEditor.eventKind==="courses"?"Например: Курсы повышения квалификации":"Например: День открытых дверей"}/></label>
           </div>
 
+          {scheduleEventEditor.eventKind==="external_class" && <label className="field"><span>Группа заочников (ввод вручную, если нет в списке)</span><input value={scheduleEventEditor.externalGroupName||""} onChange={(e)=>setScheduleEventEditor((x)=>({...x,externalGroupName:e.target.value}))} placeholder="Например: 2-КТЗ-1"/></label>}
           <div className="event-editor-grid">
             <label className="field"><span>Неделя</span><select value={scheduleEventEditor.week} onChange={(e)=>setScheduleEventEditor((x)=>({...x,week:Number(e.target.value)}))}>
               {Array.from({length:totalWeeksInSchedule||0},(_,i)=>i+1).filter((w)=>w>=Number(currentWeekGuess||1)).map((w)=><option key={w} value={w}>Неделя {w}</option>)}
@@ -22308,7 +22314,7 @@ th{background:#1E3A5F;color:#ffffff;}
           </div>
 
           <div className="event-multi-block">
-            <b>Группы</b>
+            <b>Группы из справочника (для заочников можно вместо этого вписать группу выше)</b>
             <div className="event-check-list">
               {(data.groups||[]).map((g)=>{
                 const checked=(scheduleEventEditor.groupIds||[]).includes(String(g.id));
@@ -22327,7 +22333,7 @@ th{background:#1E3A5F;color:#ffffff;}
             </div>
           </div>
 
-          <div className="notice event-notice">Время может быть любым. Система сама определит, какие строки учебных пар пересекаются с интервалом, и займёт их у всех выбранных групп, преподавателей и аудитории. В образовательную нагрузку мероприятие не входит.</div>
+          <div className="notice event-notice">Время может быть любым. Система сама определит, какие строки учебных пар пересекаются с интервалом, и займёт их у всех выбранных групп, преподавателей и аудитории. В образовательную нагрузку мероприятие не входит. Пары заочников сохраняются как отдельные записи и также пока не учитываются в отчёте фактических часов.</div>
           <div className="modal-actions">
             {scheduleEventEditor.instId && <button className="btn danger" onClick={()=>{if(window.confirm("Удалить мероприятие из расписания?"))deleteScheduleEvent(scheduleEventEditor.instId);}}>Удалить</button>}
             <span className="spacer"/>
@@ -24092,6 +24098,26 @@ ${warnings.join("\n")}
         <label>Примечание<input value={manualCancelled.note} onChange={e=>setManualCancelled(v=>({...v,note:e.target.value}))} placeholder="Причина отмены / перенос"/></label>
         </div><button className="btn primary sm" onClick={saveManualCancelled}>Сохранить в реестр</button></div>}
       {((data.substitutions||[]).some(x=>x.importUnresolved||x.manualCancellation))&&<div className="notice timetable-extra-panel"><h3>Неназначенные / ожидают замены — {(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).length}</h3><p>Все импортированные отмены и переносы без однозначной привязки к занятию. Сохранены исходные названия, преподаватели и даты. Эти записи не занимают аудитории и не включаются в фактические часы, пока не назначены.</p><div className="timetable-orphan-list">{(data.substitutions||[]).filter(x=>x.importUnresolved||x.manualCancellation).sort((a,b)=>String(a.date).localeCompare(String(b.date))).map(x=><div key={x.id} className="timetable-orphan-row"><span>{formatDateDM(x.date)} · {x.importOldPeriod||"?"} пара · {x.importGroup||"Группа не найдена"} · <b>{x.importSubject||"Без названия"}</b> · {x.importOldTeacher||""} · {x.type==="cancel_assignment"?"Отмена с заданием":x.type==="pending_move"?"Ожидает переноса":x.type==="cancel"?"Отмена":"Замена / перенос"}{x.note?` · ${x.note}`:""}</span><button className="btn ghost sm" onClick={()=>{setDate(x.date);setFilterGroupId(x.importGroupId||"");setFilterTeacherId(x.importOldTeacherId||"");setImportMsg(`Выбрана дата ${formatDateDM(x.date)}. Для проведения замены необходимо сопоставить исходную пару с занятиями расписания.`);}}>Открыть дату</button><button className="btn ghost sm" onClick={()=>set("substitutions")((data.substitutions||[]).filter(y=>y.id!==x.id))}>Удалить</button></div>)}</div></div>}
+      {importMsg&&<div className="notice">{importMsg}</div>}
+      {exportMsg&&<div className="notice">{exportMsg}</div>}
+      {noOrdinaryClassesToday && subs.length>0 && <div className="notice">На этой дате отключено обычное расписание. Сохранённые ранее операции замены для регулярных пар не применяются к закрытому дню и не выводятся в список.</div>}
+      {error&&<div className="notice conflict-notice"><AlertTriangle size={15}/>{error}</div>}
+      <div className="table-wrap substitutions-table-wrap"><table className="substitutions-table"><thead><tr><th className="drag-col"></th><th className="pair-col">Пара</th><th className="group-col">Группа</th><th className="subject-col">Дисциплина</th><th className="teacher-col">Преподаватель</th><th className="room-col">Ауд.</th><th className="change-col">Замена</th></tr></thead><tbody>
+        {rows.map((row)=>{
+          const {inst,a}=row; const {subj}=lessonLabel(inst,data); const groupLabels=publicParticipantGroupLabels(data,inst); const group=groupLabels.join(", ")||byId(data.groups,inst.groupId)?.name||""; const teacherNames=instanceTeacherNames(data,inst); const teacher=teacherNames.join(", ")||byId(data.teachers,inst.teacherId)?.name||""; const room=assignmentRoomLabel(data,a)||""; const sub=subFor(inst.instId); const editing=editingKey===inst.instId; const effPeriod=sub?.newPeriod??a.period; const effFormat=sub?.newFormat||inst.format; const effRoomId=sub?.newRoomId||a.roomId||""; const effRoom=sub?.type==="excursion"?"Без аудитории":effFormat==="remote"?"ДО":(byId(data.rooms,effRoomId)?.name||room||"—"); const roomChanged=effFormat==="remote"?inst.format!=="remote":(!!sub?.newRoomId&&String(sub.newRoomId)!==String(a.roomId||"")); const teacherChanged=!!sub?.newTeacherId&&String(sub.newTeacherId)!==String(inst.teacherId||""); const effTeacher=teacherChanged?(byId(data.teachers,sub.newTeacherId)?.name||teacher):teacher; const periodChanged=Number(effPeriod)!==Number(a.period); const isStream=(streamGroups(inst)||[]).length>1;
+          return <tr key={inst.instId} draggable onDragStart={()=>setDraggingId(inst.instId)} onDragEnd={()=>{setDraggingId(null);setDropId(null)}} onDragOver={(e)=>{e.preventDefault();setDropId(inst.instId)}} onDrop={(e)=>{e.preventDefault(); if(draggingId&&draggingId!==inst.instId)moveOrSwap(draggingId,effPeriod);setDraggingId(null);setDropId(null)}} className={`sub-row${draggingId===inst.instId?" dragging":""}${dropId===inst.instId?" drop-target":""}${sub?.type==="cancel"||sub?.type==="cancel_assignment"||sub?.type==="pending_move"||sub?.type==="moved"||sub?.type==="excursion"?" change-old-row":""}`}>
+            <td className="drag-col"><span className="drag-handle" title="Перетащить">⋮⋮</span></td><td className={`pair-col${periodChanged?" changed-field":""}`}><div className="sub-cell-pair"><b>{effPeriod+1}</b>{effPeriod!==a.period&&<div className="computer-hint">было: {a.period+1}</div>}</div></td><td className="group-col"><div className="sub-cell-main">{group}{authoritativeSubgroupForInstance(data, inst)?` (п/г ${authoritativeSubgroupForInstance(data, inst)})`:""}{isStream&&<div><span className="sub-badge stream">🔗 поток</span></div>}</div></td><td className="subject-col"><div className="sub-cell-main">{subj}</div></td><td className={`teacher-col${teacherChanged?" changed-field":""}`}><div className="sub-cell-main">{effTeacher}{teacherChanged&&<div className="computer-hint">было: {teacher}</div>}</div></td><td className={`room-col${roomChanged?" changed-field":""}`}><div className="sub-cell-main">{effRoom}{roomChanged&&room&&<div className="computer-hint">было: {room}</div>}</div></td><td className="change-col">
+            {sub ? <div className="sub-edit" style={{flexWrap:"wrap"}}>{sub.type==="cancel"?<span className="sub-badge cancel">отмена</span>:sub.type==="cancel_assignment"?<><span className="sub-badge cancel">отмена</span><span className="sub-badge assignment">выдача задания</span></>:sub.type==="pending_move"?<><span className="sub-badge pending">перенос не назначен</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Назначить перенос</button></>:sub.type==="moved"?<><span className="sub-badge moved">перенос → {formatDateDM(sub.targetDate)} · {Number(sub.targetPeriod)+1} пара</span>{sub.newFormat==="remote"&&<span className="sub-badge remote-change">ДО</span>}<button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:sub.targetDate,targetPeriod:sub.targetPeriod,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>Изменить</button></>:sub.type==="excursion"?<><span className="sub-badge cancel">Пара отменена</span><span className="sub-badge replacement">🚌 Мероприятие: экскурсия · без аудитории</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,sourceDate:date,targetDate:sub.targetDate||date,targetPeriod:sub.targetPeriod??a.period,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>{sub.targetDate?"Изменить перенос":"Разместить отменённую пару"}</button>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"excursion",note:window.prompt("Название / место экскурсии (необязательно):",sub.note||"")||"Экскурсия",newRoomId:""})}>Изменить</button></>:sub.type==="join_subgroup"?<><span className="sub-badge teacher-replacement-badge">👤 преподаватель другой подгруппы</span>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>Изменить</button></>:<>
+              <label className="sub-period-edit-label">№ пары <select value={effPeriod} onChange={(e)=>moveOrSwap(inst.instId,Number(e.target.value))} title="Изменить порядок / номер пары на выбранную дату">{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label>
+              <SearchableSelect value={sub.newTeacherId||inst.teacherId} onChange={(v)=>changeResource(row,{newTeacherId:v})} options={data.teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Преподаватель…"/>
+              <select value={sub.newFormat||inst.format} onChange={(e)=>changeResource(row,{newFormat:e.target.value})} title="Формат занятия"><option value="inperson">Очно</option><option value="remote">ДО</option></select><SearchableSelect value={sub.newRoomId||a.roomId||""} onChange={(v)=>changeResource(row,{newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Аудитория…"/><span className="sub-badge replacement">замена</span>
+            </>}<button className="icon-btn" onClick={()=>removeSub(inst.instId, date)} title="Удалить изменение"><X size={14}/></button></div>
+            : editing ? <div className="sub-edit" style={{flexWrap:"wrap"}}><label className="sub-period-edit-label">№ пары <select defaultValue={a.period} onChange={(e)=>moveOrSwap(inst.instId,Number(e.target.value))} title="Изменить порядок / номер пары на выбранную дату">{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label><SearchableSelect value="" onChange={(v)=>changeResource(row,{newTeacherId:v})} options={data.teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Новый преподаватель…"/><select defaultValue={inst.format} onChange={(e)=>changeResource(row,{newFormat:e.target.value})}><option value="inperson">Очно</option><option value="remote">ДО</option></select><SearchableSelect value={a.roomId||""} onChange={(v)=>changeResource(row,{newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Новый кабинет…"/>{Number(authoritativeSubgroupForInstance(data,inst)||inst.subgroup||0)>0&&<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>↔ К другой подгруппе…</button>}<button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"excursion",newRoomId:"",newFormat:"",newPeriod:null,note:"Экскурсия"})}>🚌 Отменить пару + экскурсия</button><button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"cancel",note:"Занятие отменено"})}>Отменить</button><button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"cancel_assignment",note:"Занятие отменено · выдача задания"})}>Отменить · выдача задания</button><button className="btn ghost sm" onClick={()=>markPendingMove(inst.instId)}>Отменить · перенос позже</button><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Перенести на дату…</button><button className="icon-btn" onClick={()=>setEditingKey(null)}><X size={14}/></button></div>
+            : <button className="btn ghost sm" onClick={()=>setEditingKey(inst.instId)}><Repeat size={13}/> Заменить</button>}
+          </td></tr>;
+        })}
+        {rows.length===0&&<tr><td colSpan={7} className="empty-row">По выбранным фильтрам занятий нет</td></tr>}
+      </tbody></table></div>
       {(excursionItems.length > 0 || pendingItems.length > 0) && <div className="notice timetable-extra-panel">
         <h3>Неназначенные занятия и переносы — {excursionItems.filter(({ sub })=>!sub.targetDate).length + pendingItems.length}</h3>
         <p>Все отменённые пары, которые ещё требуют размещения, собраны в одном блоке. Экскурсия остаётся в исходной дате, а обычные отменённые занятия можно назначить на новую дату.</p>
@@ -24115,26 +24141,6 @@ ${warnings.join("\n")}
           <div className="pending-transfers-list">{pendingItems.map(({ sub, inst, assignment, groupLabel, subjectLabel, teacherLabel, periodLabel, canAssign }) => <div key={sub.id} className={`pending-transfer-row${canAssign ? "" : " unresolved"}`}><div className="pending-transfer-main"><div className="pending-transfer-title"><b>{formatDateDM(sub.date)}</b><span>{groupLabel}</span><span>{subjectLabel}</span></div><div className="pending-transfer-meta"><span>{teacherLabel || "Преподаватель не указан"}</span><span>{periodLabel}</span>{sub.note && <span>{sub.note}</span>}{!canAssign && <span className="pending-warning">Не привязано к текущему расписанию</span>}</div></div><div className="pending-transfer-actions">{canAssign ? <button className="btn ghost sm" onClick={()=>setMoveLater({instId:sub.instId,sourceDate:sub.date,targetDate:"",targetPeriod:Number.isFinite(Number(assignment?.period)) ? Number(assignment.period) : 0,newFormat:inst?.format||"inperson",newRoomId:assignment?.roomId||""})}>Назначить перенос</button> : <button className="btn primary sm" onClick={()=>{setError("");setOrphanMove({id:sub.id,date:sub.date,targetDate:"",period:Math.max(0,(Number(sub.importOldPeriod)||1)-1),groupId:sub.importGroupId||"",teacherId:sub.importOldTeacherId||"",subject:sub.importSubject||"",format:"inperson",roomId:"",hours:2});}}>Назначить перенос</button>}</div></div>)}</div>
         </>}
       </div>}
-      {importMsg&&<div className="notice">{importMsg}</div>}
-      {exportMsg&&<div className="notice">{exportMsg}</div>}
-      {noOrdinaryClassesToday && subs.length>0 && <div className="notice">На этой дате отключено обычное расписание. Сохранённые ранее операции замены для регулярных пар не применяются к закрытому дню и не выводятся в список.</div>}
-      {error&&<div className="notice conflict-notice"><AlertTriangle size={15}/>{error}</div>}
-      <div className="table-wrap substitutions-table-wrap"><table className="substitutions-table"><thead><tr><th className="drag-col"></th><th className="pair-col">Пара</th><th className="group-col">Группа</th><th className="subject-col">Дисциплина</th><th className="teacher-col">Преподаватель</th><th className="room-col">Ауд.</th><th className="change-col">Замена</th></tr></thead><tbody>
-        {rows.map((row)=>{
-          const {inst,a}=row; const {subj}=lessonLabel(inst,data); const groupLabels=publicParticipantGroupLabels(data,inst); const group=groupLabels.join(", ")||byId(data.groups,inst.groupId)?.name||""; const teacherNames=instanceTeacherNames(data,inst); const teacher=teacherNames.join(", ")||byId(data.teachers,inst.teacherId)?.name||""; const room=assignmentRoomLabel(data,a)||""; const sub=subFor(inst.instId); const editing=editingKey===inst.instId; const effPeriod=sub?.newPeriod??a.period; const effFormat=sub?.newFormat||inst.format; const effRoomId=sub?.newRoomId||a.roomId||""; const effRoom=sub?.type==="excursion"?"Без аудитории":effFormat==="remote"?"ДО":(byId(data.rooms,effRoomId)?.name||room||"—"); const roomChanged=effFormat==="remote"?inst.format!=="remote":(!!sub?.newRoomId&&String(sub.newRoomId)!==String(a.roomId||"")); const isStream=(streamGroups(inst)||[]).length>1;
-          return <tr key={inst.instId} draggable onDragStart={()=>setDraggingId(inst.instId)} onDragEnd={()=>{setDraggingId(null);setDropId(null)}} onDragOver={(e)=>{e.preventDefault();setDropId(inst.instId)}} onDrop={(e)=>{e.preventDefault(); if(draggingId&&draggingId!==inst.instId)moveOrSwap(draggingId,effPeriod);setDraggingId(null);setDropId(null)}} className={`sub-row${draggingId===inst.instId?" dragging":""}${dropId===inst.instId?" drop-target":""}${sub?.type==="cancel"||sub?.type==="cancel_assignment"||sub?.type==="pending_move"||sub?.type==="moved"||sub?.type==="excursion"?" change-old-row":""}${sub&&!["cancel","cancel_assignment","pending_move","moved","excursion"].includes(sub.type)?" change-new-row":""}`}>
-            <td className="drag-col"><span className="drag-handle" title="Перетащить">⋮⋮</span></td><td className="pair-col"><div className="sub-cell-pair"><b>{effPeriod+1}</b>{effPeriod!==a.period&&<div className="computer-hint">было: {a.period+1}</div>}</div></td><td className="group-col"><div className="sub-cell-main">{group}{authoritativeSubgroupForInstance(data, inst)?` (п/г ${authoritativeSubgroupForInstance(data, inst)})`:""}{isStream&&<div><span className="sub-badge stream">🔗 поток</span></div>}</div></td><td className="subject-col"><div className="sub-cell-main">{subj}</div></td><td className="teacher-col"><div className="sub-cell-main">{teacher}</div></td><td className="room-col"><div className="sub-cell-main">{effRoom}{roomChanged&&room&&<div className="computer-hint">было: {room}</div>}</div></td><td className="change-col">
-            {sub ? <div className="sub-edit" style={{flexWrap:"wrap"}}>{sub.type==="cancel"?<span className="sub-badge cancel">отмена</span>:sub.type==="cancel_assignment"?<><span className="sub-badge cancel">отмена</span><span className="sub-badge assignment">выдача задания</span></>:sub.type==="pending_move"?<><span className="sub-badge pending">перенос не назначен</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Назначить перенос</button></>:sub.type==="moved"?<><span className="sub-badge moved">перенос → {formatDateDM(sub.targetDate)} · {Number(sub.targetPeriod)+1} пара</span>{sub.newFormat==="remote"&&<span className="sub-badge remote-change">ДО</span>}<button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:sub.targetDate,targetPeriod:sub.targetPeriod,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>Изменить</button></>:sub.type==="excursion"?<><span className="sub-badge cancel">Пара отменена</span><span className="sub-badge replacement">🚌 Мероприятие: экскурсия · без аудитории</span><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,sourceDate:date,targetDate:sub.targetDate||date,targetPeriod:sub.targetPeriod??a.period,newFormat:sub.newFormat||inst.format,newRoomId:sub.newRoomId||a.roomId||""})}>{sub.targetDate?"Изменить перенос":"Разместить отменённую пару"}</button>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"excursion",note:window.prompt("Название / место экскурсии (необязательно):",sub.note||"")||"Экскурсия",newRoomId:""})}>Изменить</button></>:sub.type==="join_subgroup"?<><span className="sub-badge teacher-replacement-badge">👤 преподаватель другой подгруппы</span>{sub.note&&<span className="computer-hint">{sub.note}</span>}<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>Изменить</button></>:<>
-              <label className="sub-period-edit-label">№ пары <select value={effPeriod} onChange={(e)=>moveOrSwap(inst.instId,Number(e.target.value))} title="Изменить порядок / номер пары на выбранную дату">{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label>
-              <SearchableSelect value={sub.newTeacherId||inst.teacherId} onChange={(v)=>changeResource(row,{newTeacherId:v})} options={data.teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Преподаватель…"/>
-              <select value={sub.newFormat||inst.format} onChange={(e)=>changeResource(row,{newFormat:e.target.value})} title="Формат занятия"><option value="inperson">Очно</option><option value="remote">ДО</option></select><SearchableSelect value={sub.newRoomId||a.roomId||""} onChange={(v)=>changeResource(row,{newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Аудитория…"/><span className="sub-badge replacement">замена</span>
-            </>}<button className="icon-btn" onClick={()=>removeSub(inst.instId, date)} title="Удалить изменение"><X size={14}/></button></div>
-            : editing ? <div className="sub-edit" style={{flexWrap:"wrap"}}><label className="sub-period-edit-label">№ пары <select defaultValue={a.period} onChange={(e)=>moveOrSwap(inst.instId,Number(e.target.value))} title="Изменить порядок / номер пары на выбранную дату">{Array.from({length:data.config.periodsPerDay}).map((_,p)=><option key={p} value={p}>{p+1} пара</option>)}</select></label><SearchableSelect value="" onChange={(v)=>changeResource(row,{newTeacherId:v})} options={data.teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Новый преподаватель…"/><select defaultValue={inst.format} onChange={(e)=>changeResource(row,{newFormat:e.target.value})}><option value="inperson">Очно</option><option value="remote">ДО</option></select><SearchableSelect value={a.roomId||""} onChange={(v)=>changeResource(row,{newRoomId:v})} options={data.rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Новый кабинет…"/>{Number(authoritativeSubgroupForInstance(data,inst)||inst.subgroup||0)>0&&<button className="btn ghost sm" onClick={()=>setJoinSubgroup({sourceInstId:inst.instId})}>↔ К другой подгруппе…</button>}<button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"excursion",newRoomId:"",newFormat:"",newPeriod:null,note:"Экскурсия"})}>🚌 Отменить пару + экскурсия</button><button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"cancel",note:"Занятие отменено"})}>Отменить</button><button className="btn ghost sm" onClick={()=>writeSub(inst.instId,{type:"cancel_assignment",note:"Занятие отменено · выдача задания"})}>Отменить · выдача задания</button><button className="btn ghost sm" onClick={()=>markPendingMove(inst.instId)}>Отменить · перенос позже</button><button className="btn ghost sm" onClick={()=>setMoveLater({instId:inst.instId,targetDate:date,targetPeriod:a.period,newFormat:inst.format,newRoomId:a.roomId||""})}>Перенести на дату…</button><button className="icon-btn" onClick={()=>setEditingKey(null)}><X size={14}/></button></div>
-            : <button className="btn ghost sm" onClick={()=>setEditingKey(inst.instId)}><Repeat size={13}/> Заменить</button>}
-          </td></tr>;
-        })}
-        {rows.length===0&&<tr><td colSpan={7} className="empty-row">По выбранным фильтрам занятий нет</td></tr>}
-      </tbody></table></div>
       {joinSubgroup && (()=>{
         const source=baseRows.find((r)=>String(r.inst.instId)===String(joinSubgroup.sourceInstId));
         if(!source) return <Modal title="Объединить подгруппы" onClose={()=>setJoinSubgroup(null)}><div className="notice">Исходная подгруппа не найдена на выбранную дату.</div></Modal>;
@@ -31763,6 +31769,8 @@ input[type="text"], select { width: 100%; }
 .public-schedule-event-item.public-course-event-item .semester-public-item-title,.public-schedule-event-item.public-course-event-item .semester-public-item-time b{color:#7B3D1C!important}
 .public-schedule-event-item.public-course-event-item .event-badge{background:#C96F3A!important}
 .event-editor-kind-grid{grid-template-columns:minmax(180px,.45fr) minmax(260px,1.55fr)!important}
+.substitutions-table tbody td.changed-field,.substitutions-table tbody tr:hover td.changed-field{background:#fff0b8!important;box-shadow:inset 4px 0 0 #d79d00;color:#423110;font-weight:700}
+.substitutions-table td.changed-field .computer-hint{font-weight:400;color:#815c18}
 `;
 
 /* v1554 visual language: mixed bell schedule and substitutions. */
