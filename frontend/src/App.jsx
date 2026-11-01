@@ -10704,6 +10704,7 @@ function publicChangeDetails(cell, data) {
   const sub = cell?.subOverride;
   if (!sub?.substituted) return [];
   const details = [];
+  const byId = (items, id) => (items || []).find((item) => String(item.id) === String(id));
   if (sub.moved) details.push({type:"move", label:"Перенос занятия"});
   const oldTeacher = String(sub.originalTeacherId || "");
   const newTeacher = String(sub.teacherId || cell.inst?.teacherId || "");
@@ -23890,9 +23891,17 @@ ${warnings.join("\n")}
     let w2=[];
     if(target)w2=validateRow(target,{newPeriod:sourcePeriod},[source.inst.instId]);
     const warnings=[...new Set([...w1,...w2])];
-    if(warnings.length){setError(`Перестановка невозможна: ${warnings.join("; ")}`);return;}
-    if(target) writeMany([{instId:source.inst.instId,patch:{type:"sub",newPeriod:targetPeriod}},{instId:target.inst.instId,patch:{type:"sub",newPeriod:sourcePeriod}}]);
-    else writeSub(source.inst.instId,{type:"sub",newPeriod:targetPeriod});
+    // A date-specific change in pair order may intentionally overlap another
+    // teacher's lesson. Do not block the administrator; require confirmation
+    // and preserve the original lessons (including both sides of a swap).
+    if (warnings.length && !window.confirm(
+      `На ${formatDateDM(date)} перестановка ${Number(sourcePeriod)+1}-й и ${Number(targetPeriod)+1}-й пар вызывает пересечения:\n\n${warnings.map(w=>`• ${w}`).join("\n")}\n\nВсё равно изменить порядок пар? Уже назначенные занятия не будут автоматически отменены или перенесены.`
+    )) {
+      setError(`Перестановка не выполнена: ${warnings.join("; ")}`);
+      return;
+    }
+    if(target) writeMany([{instId:source.inst.instId,patch:{type:"sub",newPeriod:targetPeriod,conflictAcknowledged:warnings.length>0}},{instId:target.inst.instId,patch:{type:"sub",newPeriod:sourcePeriod,conflictAcknowledged:warnings.length>0}}]);
+    else writeSub(source.inst.instId,{type:"sub",newPeriod:targetPeriod,conflictAcknowledged:warnings.length>0});
   };
 
   const pendingItems = (data.substitutions || [])
