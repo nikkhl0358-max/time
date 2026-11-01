@@ -717,3 +717,7 @@
 .lesson-chip.excursion-teacher-cancelled { background:#fbe8e8!important; border-left:4px solid #c94a4a!important; color:#9d3131!important; }
 .excursion-teacher-cancelled .excursion-cancelled-title { text-decoration:line-through; text-decoration-thickness:1px; }
 .excursion-teacher-cancelled .sub-badge { text-decoration:none; display:inline-block; margin-top:5px; }
+
+/* Specific change descriptions in the public timetable (week and semester). */
+.public-change-description { color: #9b3b32; font-weight: 600; }
+.semester-public-item-meta .public-change-description { display: inline-block; }

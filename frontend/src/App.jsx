@@ -10700,6 +10700,35 @@ function publicInstMatchesSubstitution(inst, sub) {
   return instIds.some((id) => subIds.includes(id));
 }
 
+function publicChangeDetails(cell, data) {
+  const sub = cell?.subOverride;
+  if (!sub?.substituted) return [];
+  const details = [];
+  if (sub.moved) details.push({type:"move", label:"Перенос занятия"});
+  const oldTeacher = String(sub.originalTeacherId || "");
+  const newTeacher = String(sub.teacherId || cell.inst?.teacherId || "");
+  if (oldTeacher && newTeacher && oldTeacher !== newTeacher) {
+    const from = byId(data.teachers, oldTeacher)?.name || "прежний преподаватель";
+    const to = byId(data.teachers, newTeacher)?.name || "новый преподаватель";
+    details.push({type:"teacher", label:`Замена преподавателя: ${from} → ${to}`});
+  }
+  const oldRoom = String(sub.originalRoomId || "");
+  const newRoom = String(cell.a?.roomId || "");
+  if (oldRoom !== newRoom && (oldRoom || newRoom) && !sub.joinedSubgroup) {
+    const from = byId(data.rooms, oldRoom)?.name || (oldRoom ? oldRoom : "без аудитории");
+    const to = byId(data.rooms, newRoom)?.name || (newRoom ? newRoom : "без аудитории");
+    details.push({type:"room", label:`Смена кабинета: ${from} → ${to}`});
+  }
+  if (sub.originalPeriod != null && Number(sub.originalPeriod) !== Number(cell.a?.period) && !sub.moved) {
+    details.push({type:"period", label:`Изменение порядка пар: ${Number(sub.originalPeriod)+1} → ${Number(cell.a.period)+1} пара`});
+  }
+  if (sub.originalFormat && sub.originalFormat !== cell.inst?.format) {
+    details.push({type:"format", label:`Изменение формата: ${cell.inst?.format === "remote" ? "дистанционно" : "очно"}`});
+  }
+  if (!details.length && sub.joinedSubgroup) details.push({type:"teacher",label:"Замена преподавателя · объединение подгрупп"});
+  return details;
+}
+
 function overlayForCell(inst, a, date, substitutions) {
   if (!date) return { inst, a, subOverride: null };
   // v1863: week-scoped publication splits recurring lessons into ids like
@@ -10732,7 +10761,7 @@ function overlayForCell(inst, a, date, substitutions) {
   return {
     inst: effInst,
     a: effectiveAssignment,
-    subOverride: { substituted: true, teacherId: sub.newTeacherId || inst.teacherId, note: sub.note, format: isSubgroupTeacherJoin ? inst.format : (sub.newFormat || inst.format), changeType: isSubgroupTeacherJoin ? "join_subgroup" : "sub", joinedSubgroup: isSubgroupTeacherJoin, joinedToInstId: sub.targetInstId || "" },
+    subOverride: { substituted: true, teacherId: sub.newTeacherId || inst.teacherId, note: sub.note, format: isSubgroupTeacherJoin ? inst.format : (sub.newFormat || inst.format), changeType: isSubgroupTeacherJoin ? "join_subgroup" : "sub", joinedSubgroup: isSubgroupTeacherJoin, joinedToInstId: sub.targetInstId || "", originalTeacherId: inst.teacherId, originalRoomId: a.roomId, originalPeriod: a.period, originalFormat: inst.format },
   };
 }
 
@@ -10757,7 +10786,7 @@ function movedCellForSubstitution(data, sub) {
   return {
     inst,
     a: { day: weekdayOf(sub.targetDate), period: Number.isFinite(Number(sub.targetPeriod)) ? Number(sub.targetPeriod) : base.period, roomId: sub.newFormat === "remote" ? null : (sub.newRoomId || base.roomId), extraRoomId: sub.newFormat === "remote" ? null : (base.extraRoomId || null) },
-    subOverride: { substituted: true, moved: true, teacherId: sub.newTeacherId || rawInst.teacherId, note: sub.note, sourceDate: sub.date, sourcePeriod: base.period, format: sub.newFormat || rawInst.format, changeType: "moved" },
+    subOverride: { substituted: true, moved: true, teacherId: sub.newTeacherId || rawInst.teacherId, note: sub.note, sourceDate: sub.date, sourcePeriod: base.period, format: sub.newFormat || rawInst.format, changeType: "moved", originalTeacherId: rawInst.teacherId, originalRoomId: base.roomId, originalPeriod: base.period, originalFormat: rawInst.format },
   };
 }
 
@@ -25826,6 +25855,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
         const { subj, type } = lessonLabel(cell.inst,data);
         const effectiveTeacherId = cell.subOverride?.teacherId || cell.inst.teacherId;
         const teacher = byId(data.teachers, effectiveTeacherId)?.name || "";
+        const publicChanges = publicChangeDetails(cell,data);
         const teacherChangedBySubstitution = !!cell.subOverride?.substituted && !!effectiveTeacherId && String(effectiveTeacherId) !== String(cell.inst.teacherId || "");
         const group = publicParticipantGroupLabels(data, cell.inst, cell._publicCombinedSubgroups).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
         const duplicateRoomNames = (cell._publicDuplicateRoomIds || []).map((rid)=>rid === "__REMOTE__" ? "ДО" : (byId(data.rooms,rid)?.name || rid)).filter(Boolean);
@@ -25852,6 +25882,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
           teacher:eventTeachers,
           group,
           teacherChangedBySubstitution,
+          publicChanges,
           joinedSubgroupSubstitution: !!cell.subOverride?.joinedSubgroup,
           isScheduleEvent,
           eventKind: isScheduleEvent ? scheduleEventKind(cell.inst) : "",
@@ -25864,7 +25895,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
     }
     const map = new Map();
     for (const r of records) {
-      const key=[r.day,r.period,r.title,r.room,r.teacher,r.group,r.teacherChangedBySubstitution?"teacher-change":"",r.joinedSubgroupSubstitution?"subgroup-replacement":"",r.isScheduleEvent?`event:${r.eventKind||"event"}`:"lesson",r.eventTime||""].join("|");
+      const key=[r.day,r.period,r.title,r.room,r.teacher,r.group,r.teacherChangedBySubstitution?"teacher-change":"",(r.publicChanges||[]).map(x=>x.label).join(";"),r.joinedSubgroupSubstitution?"subgroup-replacement":"",r.isScheduleEvent?`event:${r.eventKind||"event"}`:"lesson",r.eventTime||""].join("|");
       if (!map.has(key)) map.set(key,{...r,dates:[]});
       map.get(key).dates.push(r.date);
     }
@@ -26214,7 +26245,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                                       {r.room && <span>{isRemote ? "💻" : "📍"} {r.room}</span>}
                                       {counterpart && <span className={kind === "group" && r.teacherChangedBySubstitution ? "public-teacher-replacement" : ""}>{kind === "group" ? "👤" : "👥"} {counterpart}</span>}
                                       {kind === "room" && r.teacher && <span>👤 {r.teacher}</span>}
-                                      {kind === "teacher" && r.teacherChangedBySubstitution && r.teacher && <span className="public-teacher-replacement">👤 {r.teacher} · замена</span>}
+                                      {(r.publicChanges||[]).map((change,i)=><span key={i} className="public-change-description">↪ {change.label}</span>)}
                                     </div>
                                   </div>
                                   <div className="semester-public-item-dates">
@@ -26403,6 +26434,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                           const { subj, type } = lessonLabel(cell.inst, data);
                           const teacherId = cell.subOverride?.teacherId || cell.inst.teacherId;
                           const teacher = byId(data.teachers, teacherId)?.name || "";
+                          const publicChanges = publicChangeDetails(cell,data);
                           const teacherChangedBySubstitution = !!cell.subOverride?.substituted && !!teacherId && String(teacherId) !== String(cell.inst.teacherId || "");
                           const joinedSubgroupTeacherSubstitution = !!cell.subOverride?.joinedSubgroup;
                           const group = publicParticipantGroupLabels(data, cell.inst, cell._publicCombinedSubgroups).join(", ") || byId(data.groups, cell.inst.groupId)?.name || "";
@@ -26436,9 +26468,9 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                               <div className={`ev-row${duplicateRoomConflictText ? " public-room-conflict" : ""}`}><span className="ev-ico">📍</span> {duplicateRoomConflictText ? <>⚠ <b>Конфликт кабинетов:</b> {duplicateRoomConflictText}</> : (cell.inst.format === "remote" ? "дистанционно" : `ауд. ${room}`)}</div>
                               <div className="ev-row"><span className="ev-ico">{kind === "group" ? "👤" : "👥"}</span> {kind === "group" && teacherId ? <button type="button" className={`public-teacher-link${teacherChangedBySubstitution ? " public-teacher-replacement" : ""}`} onClick={() => onOpenTeacher?.(teacherId, viewId)} title="Открыть расписание преподавателя">{teacher}</button> : kind === "teacher" ? <span className="public-stream-group-links">{streamGroups(cell.inst).map((gid, index) => { const found=(data.groups||[]).find(g=>String(g.id)===String(gid)); return <Fragment key={gid}>{index > 0 && <span className="public-stream-group-separator" aria-hidden="true">, </span>}<button type="button" className="public-teacher-link" onClick={() => onOpenGroup?.(gid)} title={`Открыть расписание группы ${found?.name||gid}`}>{found?.name||gid}</button></Fragment>; })}</span> : group}</div>
                               {kind === "room" && teacher && <div className="ev-row"><span className="ev-ico">👤</span> {teacher}</div>}
-                              {kind === "teacher" && teacherChangedBySubstitution && <div className="ev-row public-teacher-replacement-row"><span className="ev-ico">👤</span> <span className="public-teacher-replacement">{teacher} · замена</span></div>}
+                              {publicChanges.map((change,i)=><div className="ev-row public-change-description" key={i}><span className="ev-ico">↪</span> <b>{change.label}</b></div>)}
                               {cell.subOverride?.moved && <div className="ev-row ev-subgroup">↪ Перенесено с {formatDateDM(cell.subOverride.sourceDate)}{Number.isFinite(Number(cell.subOverride.sourcePeriod)) ? ` · ${Number(cell.subOverride.sourcePeriod)+1} пары` : ""}</div>}
-                              {cell.subOverride?.substituted && <><span className={`sub-badge${cell.subOverride?.moved ? " moved" : ""}${joinedSubgroupTeacherSubstitution ? " teacher-replacement-badge" : ""}`}>{cell.subOverride?.moved ? "перенос" : cell.subOverride?.excursion ? "экскурсия" : "замена"}</span>{cell.subOverride?.format==="remote"&&<span className="sub-badge remote-change">ДО</span>}</>}
+                              {cell.subOverride?.substituted && <><span className={`sub-badge${cell.subOverride?.moved ? " moved" : ""}${joinedSubgroupTeacherSubstitution ? " teacher-replacement-badge" : ""}`}>{cell.subOverride?.moved ? "перенос" : cell.subOverride?.excursion ? "экскурсия" : publicChanges.length === 1 ? ({teacher:"замена преподавателя",room:"смена кабинета",period:"изменение порядка пар",format:"изменение формата"}[publicChanges[0].type] || "изменение") : "изменения в расписании"}</span>{cell.subOverride?.format==="remote"&&<span className="sub-badge remote-change">ДО</span>}</>}
                             </div>
                           );
                         })}
