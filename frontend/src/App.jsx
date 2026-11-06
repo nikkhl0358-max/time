@@ -26975,6 +26975,9 @@ export default function App() {
   const latestDataRef = useRef(null);
   const [passwordModal, setPasswordModal] = useState(null); // 'set' | 'enter' | 'change' | null
   const [pwError, setPwError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginStage, setLoginStage] = useState("");
+  const loginInFlightRef = useRef(false);
   const [currentUser, setCurrentUser] = useState(null); // { id, name, login, role } — без хеша пароля
   const [activeUsers, setActiveUsers] = useState([]);
   // v1675: while a browser Back/Forward route is being applied, URL-sync
@@ -28184,13 +28187,30 @@ export default function App() {
     finishServerLogin(sessionUser);
   };
   const submitLogin = async (login, pw) => {
-    let sessionUser;
+    // Prevent parallel password checks and editor bootstrap requests from
+    // repeated clicks/Enter. Keep the loading state visible until BOTH finish.
+    if (loginInFlightRef.current) return;
+    if (!login.trim() || !pw) {
+      setPwError("Введите логин и пароль");
+      return;
+    }
+    loginInFlightRef.current = true;
+    setLoginBusy(true);
+    setPwError("");
+    setLoginStage("Проверяем учётные данные…");
     try {
       const result = await authRequest("login", { login, password: pw });
-      sessionUser = result.user;
+      if (!result?.user) throw new Error("Сервер не вернул данные сотрудника");
+      setLoginStage("Вход подтверждён. Загружаем рабочее расписание…");
       await ensureEditorLoaded();
-    } catch (error) { setPwError(error.message); return; }
-    finishServerLogin(sessionUser);
+      finishServerLogin(result.user);
+    } catch (error) {
+      setPwError(error?.message || "Не удалось выполнить вход");
+    } finally {
+      loginInFlightRef.current = false;
+      setLoginBusy(false);
+      setLoginStage("");
+    }
   };
   const finishServerLogin = (user) => {
     setCurrentUser(user);
@@ -30456,7 +30476,10 @@ export default function App() {
         <PasswordGateModal
           mode={passwordModal}
           error={pwError}
+          busy={loginBusy}
+          stage={loginStage}
           onClose={() => {
+            if (loginInFlightRef.current) return;
             setPasswordModal(null);
             setPwError("");
             if (typeof window !== "undefined" && role !== "admin") {
@@ -30528,7 +30551,7 @@ function SmartFormatPanel({ data, set }) {
   </div>;
 }
 
-function PasswordGateModal({ mode, error, onClose, onSet, onEnter, onChange }) {
+function PasswordGateModal({ mode, error, busy = false, stage = "", onClose, onSet, onEnter, onChange }) {
   const [name, setName] = useState("");
   const [login, setLogin] = useState("");
   const [pw, setPw] = useState("");
@@ -30542,10 +30565,11 @@ function PasswordGateModal({ mode, error, onClose, onSet, onEnter, onChange }) {
       <div className="pw-form">
         {mode === "enter" && (
           <>
-            <input autoFocus placeholder="Логин" value={login} onChange={(e) => setLogin(e.target.value)} />
-            <input type="password" placeholder="Пароль" value={pw} onChange={(e) => setPw(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && onEnter(login, pw)} />
-            <button className="btn primary sm" onClick={() => onEnter(login, pw)}>Войти</button>
+            <input autoFocus placeholder="Логин" value={login} disabled={busy} onChange={(e) => setLogin(e.target.value)} />
+            <input type="password" placeholder="Пароль" value={pw} disabled={busy} onChange={(e) => setPw(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !busy && onEnter(login, pw)} />
+            <button className="btn primary sm" disabled={busy} onClick={() => onEnter(login, pw)}>{busy ? "Выполняется вход…" : "Войти"}</button>
+            {busy && <div role="status" aria-live="polite" className="avail-hint">{stage}</div>}
           </>
         )}
         {mode === "set" && (

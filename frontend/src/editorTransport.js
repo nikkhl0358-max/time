@@ -55,15 +55,48 @@ export function storageFetch(url, options = {}) {
   return fetch(url, { ...options, headers: editorRequestHeaders(options.headers) });
 }
 
+// Только GET-запросы чтения: при кратковременном обрыве соединения можно
+// безопасно повторить загрузку. POST/сохранение здесь не затрагиваются.
+const RETRYABLE_EDITOR_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+const waitForEditorRetry = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function editorResponse(url) {
-  const response = await storageFetch(url, { cache: 'no-cache' });
-  const result = await response.json();
-  if (!response.ok) {
-    const error = new Error(result.error || `Ошибка загрузки раздела: HTTP ${response.status}`);
-    error.status = response.status;
-    throw error;
+  const attempts = 3;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    let response;
+    try {
+      response = await storageFetch(url, { cache: 'no-store' });
+    } catch (error) {
+      if (attempt < attempts) {
+        await waitForEditorRetry(350 * attempt);
+        continue;
+      }
+      throw new Error(`Нет соединения с сервером при загрузке редактора (${url}). ${error?.message || ''}`.trim());
+    }
+
+    // При 304 тело намеренно пустое. Для данных редактора всегда требуется
+    // полноценный JSON — повторяем запрос без условного кеширования.
+    const body = await response.text().catch(() => '');
+    let result = null;
+    try { if (body.trim()) result = JSON.parse(body); } catch { /* неполный ответ */ }
+
+    if (!response.ok) {
+      const retryable = response.status === 304 || RETRYABLE_EDITOR_STATUS.has(response.status);
+      if (retryable && attempt < attempts) {
+        await waitForEditorRetry(350 * attempt);
+        continue;
+      }
+      const error = new Error(result?.error || `Сервер не смог загрузить раздел редактора (HTTP ${response.status}, ${url}).`);
+      error.status = response.status;
+      throw error;
+    }
+    if (result && typeof result === 'object') return result;
+    if (attempt < attempts) {
+      await waitForEditorRetry(350 * attempt);
+      continue;
+    }
+    throw new Error(`Сервер вернул пустой или неполный JSON при загрузке редактора (${url}, HTTP ${response.status}). Проверьте журнал сервера и ответ запроса в Network.`);
   }
-  return result;
 }
 
 export function editorBootstrapGet(key = 'schedule-data-v2') {
