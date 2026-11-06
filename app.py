@@ -2624,8 +2624,10 @@ app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 # Keep authentication/API responses machine-readable and never expose DB secrets.
 @app.errorhandler(sqlite3.OperationalError)
 def _sqlite_unavailable(exc):
-    app.logger.error("storage operation failed: %s", type(exc).__name__)
-    return jsonify(error="Хранилище временно недоступно. Повторите вход позже."), 503
+    app.logger.error("storage operation failed for %s: %s", request.path, type(exc).__name__)
+    response = jsonify(error="Не удалось подключиться к хранилищу PostgreSQL/SQLite. Проверьте доступность базы в Timeweb; существующие данные не изменены.", code="STORAGE_UNAVAILABLE", retryable=True)
+    response.headers["Retry-After"] = "5"
+    return response, 503
 
 try:
     from psycopg import OperationalError as _PgOperationalError

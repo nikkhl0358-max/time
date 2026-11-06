@@ -25021,7 +25021,7 @@ function VersionsPanel({data,onRestore,currentUser}){
       </div>
     </div>
 
-    <div className="card" style={{padding:16,marginBottom:18}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><div><b>Серверные резервные копии</b><div className="muted" style={{marginTop:4}}>Скачивание идёт напрямую из <code>/data/backups</code> рабочего контейнера и не использует загрузчик файлов Amvera.</div></div><button className="btn ghost sm" onClick={refreshBackups}>Обновить список</button></div>
+    <div className="card" style={{padding:16,marginBottom:18}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><div><b>Серверные резервные копии</b><div className="muted" style={{marginTop:4}}>Скачивание идёт напрямую из <code>/data/backups</code> рабочего контейнера и не зависит от загрузчика файлов хостинга.</div></div><button className="btn ghost sm" onClick={refreshBackups}>Обновить список</button></div>
       {backupLoadError&&<div className="notice danger" style={{marginTop:10}}>{backupLoadError}</div>}
       <div style={{display:"grid",gap:6,marginTop:12,maxHeight:360,overflow:"auto"}}>{serverBackups.map((b)=><div key={b.name} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"8px 10px",border:"1px solid #e5e7eb",borderRadius:8}}><span><b>{b.name}</b>{b.size?` · ${Math.round(b.size/1024)} КБ`:""}{b.valid===false?<span style={{marginLeft:8,color:"#b91c1c"}}>повреждён</span>:""}</span><button className="btn ghost sm" disabled={backupDownloadBusy===b.name||b.valid===false} onClick={()=>downloadBackup(b.name)}>{backupDownloadBusy===b.name?"Скачивание…":"Скачать backup"}</button></div>)}{!serverBackups.length&&!backupLoadError&&<div className="muted">Резервных копий не найдено.</div>}</div>
     </div>
@@ -28470,7 +28470,7 @@ export default function App() {
     return <div className="app-root loading-root"><style>{CSS}</style><div className="card" style={{maxWidth:760,padding:24}}>
       <h2 style={{marginTop:0}}>Не удалось загрузить рабочие данные</h2>
       <p className="muted">{loadError || storageProblem?.message}</p>
-      <p><b>Ничего не создано и не перезаписано.</b> Загрузка автоматически повторялась несколько раз, чтобы переждать перезапуск Amvera.</p>
+      <p><b>Рабочие данные не создавались и не перезаписывались.</b> Сайт повторил запросы чтения. Если ошибка сохраняется, проверьте доступ приложения Timeweb к PostgreSQL и переменную DATABASE_URL. Не создавайте новое хранилище и не сбрасывайте пользователей.</p>
       <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:14}}>
         <button className="btn primary" onClick={()=>location.reload()}>Повторить загрузку</button>
         {latestBackup && <button className="btn ghost" disabled={backupBusy} onClick={()=>restoreLatestBackup(latestBackup.name)}>
@@ -28486,13 +28486,13 @@ export default function App() {
           </div>)}
         </div>
       </details>}
-      {backupOptions.length === 0 && <p className="muted" style={{marginTop:14}}>Сервер не сообщил о доступных резервных копиях. Если деплой ещё идёт, повторите загрузку через несколько секунд.</p>}
+      {backupOptions.length === 0 && <p className="muted" style={{marginTop:14}}>Сервер не сообщил о доступных локальных резервных копиях. Это не означает, что резервных копий PostgreSQL в Timeweb нет.</p>}
     </div></div>;
   }
   if (storageMissing) {
     return <div className="app-root loading-root"><style>{CSS}</style><div className="card" style={{maxWidth:680,padding:24}}>
       <h2 style={{marginTop:0}}>Хранилище данных не найдено</h2>
-      <p><b>Данные автоматически не создаются и не перезаписываются.</b> Если это произошло после пересборки существующего сайта, не создавайте новое хранилище — проверьте подключение постоянного диска <code>/data</code> в Amvera.</p>
+      <p><b>Данные автоматически не создаются и не перезаписываются.</b> Если это произошло после пересборки существующего сайта, не создавайте новое хранилище — проверьте подключение базы данных PostgreSQL или постоянного хранилища <code>/data</code> у провайдера.</p>
       <p className="muted">Кнопка ниже нужна только при самом первом запуске нового проекта.</p>
       <button className="btn primary" onClick={initializeEmptyStorage}>Создать новое хранилище вручную</button>
       <button className="btn ghost" style={{marginLeft:8}} onClick={()=>location.reload()}>Повторить загрузку</button>
