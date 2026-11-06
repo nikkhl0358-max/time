@@ -67,6 +67,24 @@ class _CopyBinaryField:
         self.remaining -= len(result)
         return result
 
+    def finish(self):
+        """Finish the *entire* COPY OUT protocol before any subsequent SQL.
+
+        Reading the field alone is not enough: PostgreSQL's binary COPY also
+        sends a row terminator. Psycopg requires the COPY stream to be read
+        through EOF; otherwise conn.execute() fails with ``another command is
+        already in progress`` and the migration never commits.
+        """
+        while self.remaining:
+            self.read(65536)
+        if self._exact(2) != b'\xff\xff':
+            raise AuthDataError('Unexpected PostgreSQL COPY row trailer')
+        if self.pending:
+            raise AuthDataError('Unexpected bytes after PostgreSQL COPY trailer')
+        # This final EOF read is essential to release psycopg's COPY state.
+        if self.copy.read():
+            raise AuthDataError('Unexpected second PostgreSQL COPY row')
+
 
 class _JSONByteReader:
     """Small lookahead reader; UTF-8 JSON delimiters are plain ASCII bytes."""
@@ -232,13 +250,13 @@ def _legacy_users(conn):
                 users = project.get('users', [])
                 if not isinstance(users, list) or any(not isinstance(u, dict) for u in users):
                     raise AuthDataError('Invalid legacy users')
+                field.finish()
                 return users
             if first != b'{':
                 raise AuthDataError('Invalid legacy project root')
             result = _extract_users_from_stream(_PrefixReader(first, field))
-            # Complete the COPY protocol even when `users` was an early key.
-            while field.read(65536):
-                pass
+            # Complete COPY including its binary trailer and final EOF read.
+            field.finish()
             return result
 
 
