@@ -1,3 +1,4 @@
+"""Сохраняет расписание атомарно и отделяет публичные публикации от редакторского API."""
 import os
 import json
 import threading
@@ -7,6 +8,7 @@ import subprocess
 import uuid
 import time
 import gzip
+import io
 import hashlib
 import tempfile
 import select
@@ -15,7 +17,17 @@ from pg_compat import pg_connect, pg_storage_exists
 import re
 from collections import OrderedDict
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, Response
+from flask import Flask, request, jsonify, send_from_directory, Response, g, has_request_context, redirect
+from werkzeug.exceptions import Forbidden
+from auth import install_auth
+from editor_state import (
+    complete_project,
+    merge_users_preserve_hashes,
+    partial_write_error,
+    preserve_deferred_sections,
+    project_for_editor,
+)
+from editor_transport import install_editor_transport, sanitize_users
 
 # В контейнере путь задаётся явно через DATA_DIR=/data. Локально без переменной
 # сохраняем данные рядом с приложением.
@@ -247,9 +259,8 @@ class _PersistentSchedulerWorker:
                 self.loaded_cache_key = cache_key
                 return response
 
-_scheduler_shared_worker = _PersistentSchedulerWorker(SCHEDULER_SCRIPT, "scheduler-shared")
-_scheduler_generate_worker = _scheduler_shared_worker
-_scheduler_options_worker = _scheduler_shared_worker
+_scheduler_generate_worker = _PersistentSchedulerWorker(SCHEDULER_SCRIPT, "scheduler-generate")
+_scheduler_options_worker = _PersistentSchedulerWorker(SCHEDULER_SCRIPT, "scheduler-options")
 
 # v1564: маленький LRU-кэш серверных вариантов ручной постановки.
 # Ключ содержит отпечаток актуального storage, поэтому любое реальное изменение
@@ -420,7 +431,11 @@ def _public_source_project(project):
         if recovery and isinstance(recovery.get("snapshot"), dict):
             published = recovery["snapshot"]
 
-    source = dict(published) if isinstance(published, dict) else dict(project)
+    if isinstance(published, dict):
+        source = dict(published)
+    else:
+        source = dict(project)
+        source["schedule"] = {"instances": [], "assignment": {}}
     # v1892: old group publications may have persisted only the raw primary row
     # of an implicit stream even though the editor rendered all linked groups.
     # Repair only linkage already declared by the published primary load.
@@ -2405,6 +2420,9 @@ def save_store(store, backup=True, durable=True, refresh_public=True, refresh_st
     # transaction, so readers never observe a half-written project and there is
     # no storage.json temp-file/rename race. JSON backups remain available for
     # human inspection and one-click restore.
+    if isinstance(store.get("schedule-data-v2"), dict):
+        store["schedule-data-v2"] = complete_project(store["schedule-data-v2"])
+    _authorize_user_changes(store)
     os.makedirs(DATA_DIR, exist_ok=True)
     if backup and _storage_exists():
         _backup_current_store()
@@ -2443,6 +2461,9 @@ def _save_store_key_fast(key, value, durable=False, revision_map=None, revision_
     the in-process cache.  Backups/public sidecars remain intentionally deferred
     exactly as they were for cell patches.
     """
+    if str(key) == "schedule-data-v2":
+        value = complete_project(value)
+        value = _authorize_user_changes({str(key): value})[str(key)]
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = _sqlite_connect()
     revision_map = {str(k): int(v) for k, v in (revision_map or {}).items() if str(k)}
@@ -2599,36 +2620,198 @@ APP_BUILD_ID = _compute_app_build_id()
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 
 
-def _editor_compact_project(data):
-    """Return editor payload without historical publication snapshots.
+def _auth_project(store):
+    """Читает рабочий проект без изменения ссылок кеша хранилища."""
+    raw = store.get("schedule-data-v2")
+    return json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
 
-    scheduleVersions can contain dozens of full semester snapshots and was the
-    largest source of browser RAM use.  Keep only metadata in ordinary editor
-    responses; the selected snapshot is fetched lazily by id when restoring.
-    """
+
+def _auth_read_users():
+    """Выдаёт отдельную копию учётных записей для проверки и изменения пароля."""
+    return copy.deepcopy(_auth_project(load_store()).get("users") or [])
+
+
+def _auth_update_users(users):
+    """Пишет проверенное сервером изменение пользователей под общей блокировкой."""
+    store = load_store()
+    project = dict(_auth_project(store))
+    project["users"] = users
+    store["schedule-data-v2"] = project
+    g.auth_internal_write = True
+    try:
+        save_store(store, refresh_public=False, refresh_status=False)
+    finally:
+        g.auth_internal_write = False
+
+
+def _auth_current_users():
+    """Читает свежие credentials проекцией JSON, не передавая большой проект."""
+    if not _storage_exists():
+        return []
+    conn = _sqlite_connect()
+    try:
+        projection = "(value_json::jsonb -> 'users')::text" if USE_POSTGRES else "json_extract(value_json, '$.users')"
+        row = conn.execute(f"SELECT {projection} FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
+        if row and row[0] is not None:
+            return json.loads(row[0]) or []
+        # Старый формат содержит JSON-строку внутри value_json, а не объект.
+        row = conn.execute("SELECT value_json FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
+        project = json.loads(row[0]) if row else {}
+        project = json.loads(project) if isinstance(project, str) else project
+        return project.get("users") or []
+    finally:
+        conn.close()
+
+
+def _validate_user_edit(incoming, existing, baseline):
+    """Разрешает явное управление пользователями только актуальному superadmin."""
+    from werkzeug.exceptions import Conflict
+    if (getattr(g, "auth_user", None) or {}).get("role") != "superadmin":
+        raise Forbidden("Управление пользователями доступно только главному администратору")
+    if baseline != existing:
+        raise Conflict("Учётные записи изменились; обновите страницу")
+    if not isinstance(incoming, list) or not all(isinstance(u, dict) for u in incoming):
+        raise Forbidden("Неверный список пользователей")
+    if not any(u.get("role") == "superadmin" for u in incoming):
+        raise Forbidden("Нельзя удалить последнего главного администратора")
+
+
+def _authorize_user_changes(store):
+    """Сохраняет свежие пароли при запоздавшем autosave и проверяет смену ролей."""
+    if not has_request_context() or getattr(g, "auth_internal_write", False):
+        return store
+    existing = _auth_current_users()
+    baseline = getattr(g, "auth_users", existing)
+    project = _auth_project(store)
+    incoming = project.get("users") or []
+    if incoming != baseline:
+        try:
+            _validate_user_edit(incoming, existing, baseline)
+        except Exception:
+            _invalidate_store_cache()
+            raise
+    else:
+        project = dict(project)
+        project["users"] = existing
+        store["schedule-data-v2"] = project
+    return store
+
+
+install_auth(app, DATA_DIR, _auth_read_users, _auth_update_users, _lock)
+app.before_request(partial_write_error)
+
+def _editor_read_project(key):
+    """Связывает кеш проекта с ревизией транзакционной строки, а не identity dict."""
+    store = load_store()
+    if key not in store:
+        return None
+    raw = store[key]
+    project = json.loads(raw) if isinstance(raw, str) else raw
+    conn = _sqlite_connect()
+    try:
+        row = conn.execute("SELECT updated_at FROM kv_store WHERE key=?", (key,)).fetchone()
+    finally:
+        conn.close()
+    return project, str(row[0]) if row else "missing"
+
+
+def _instance_has_group(instance, group_id):
+    """Быстро проверяет причастность пары к группе без вычисления недель нагрузки."""
+    if not group_id:
+        return True
+    if str(instance.get("groupId") or "") == group_id:
+        return True
+    if any(str(x) == group_id for x in instance.get("groupIds") or []):
+        return True
+    if any(str(x) == group_id for x in instance.get("streamGroupIds") or []):
+        return True
+    parts = instance.get("streamParticipants") or []
+    return any(str(p.get("groupId") or "") == group_id for p in parts if isinstance(p, dict))
+
+
+def _editor_matches_scope(project, instance, group_id, week):
+    """Повторяет правила рабочего расписания, отсекая чужие группы до тяжелого анализа."""
+    if not _instance_has_group(instance, group_id):
+        return False
+    weeks = _instance_weeks_for_project_py(project, instance)
+    if week and week not in weeks:
+        return False
+    if not group_id:
+        return True
+    selected_weeks = [week] if week else weeks
+    groups = _schedule_instance_group_ids_for_weeks_py(project, instance, selected_weeks)
+    return str(group_id) in {str(identifier) for identifier in groups}
+
+
+def _stream_project_json(project):
+    """Пакует JSON в блоки, чтобы экспорт не создавал ещё одну полную строку в RAM."""
+    encoder = json.JSONEncoder(ensure_ascii=False, separators=(",", ":"))
+    buffer, length = [], 0
+    for part in encoder.iterencode(project):
+        buffer.append(part)
+        length += len(part)
+        if length >= 65536:
+            yield "".join(buffer)
+            buffer, length = [], 0
+    if buffer:
+        yield "".join(buffer)
+
+
+@app.get("/api/editor/<key>/export")
+def editor_export(key):
+    """Выгружает полный переносимый проект, включая отдельно хранимую историю."""
+    with _lock:
+        store = load_store()
+        if key not in store:
+            return jsonify(error="Проект не найден"), 404
+        portable = _store_with_snapshots_for_backup(store)
+        raw = portable[key]
+        project = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(project, dict) and "users" in project:
+            from editor_transport import sanitize_users
+            project = dict(project)
+            project["users"] = sanitize_users(project["users"])
+    response = Response(_stream_project_json(project), content_type="application/json; charset=utf-8")
+    response.headers["Content-Disposition"] = 'attachment; filename="timetable-project.json"'
+    response.headers["Cache-Control"] = "private, no-store"
+    return response
+
+
+install_editor_transport(app, _editor_read_project, _lock,
+    matches_scope=_editor_matches_scope, cell_revisions=_schedule_cell_revisions_get)
+
+
+
+
+def _editor_version_metadata(row):
+    """Сохраняет метаданные истории; сами снимки загружаются отдельным запросом."""
+    snapshot = row.get("snapshot") if isinstance(row.get("snapshot"), dict) else {}
+    stats = ((snapshot.get("schedule") or {}).get("stats") or {})
+    return {
+        **{key: row.get(key) for key in ("id", "at", "by", "note")},
+        "placed": row.get("placed", stats.get("placed")),
+        "hasSnapshot": bool(snapshot) or row.get("hasSnapshot") is True,
+    }
+
+
+def _editor_compact_project(data):
+    """Не отправляет историю снимков и ещё не запрошенные редактором разделы."""
     if not isinstance(data, dict):
         return data
     out = dict(data)
-    compact_versions = []
-    for row in (data.get("scheduleVersions") or []):
-        if not isinstance(row, dict):
-            continue
-        snapshot = row.get("snapshot") if isinstance(row.get("snapshot"), dict) else {}
-        stats = ((snapshot.get("schedule") or {}).get("stats") or {}) if isinstance(snapshot, dict) else {}
-        compact_versions.append({
-            "id": row.get("id"),
-            "at": row.get("at"),
-            "by": row.get("by"),
-            "note": row.get("note"),
-            "placed": stats.get("placed"),
-            "hasSnapshot": bool(snapshot) or row.get("hasSnapshot") is True,
-        })
-    out["scheduleVersions"] = compact_versions
-    return out
+    if "users" in out and isinstance(out["users"], list):
+        out["users"] = sanitize_users(out["users"])
+    out["scheduleVersions"] = [
+        _editor_version_metadata(row) for row in data.get("scheduleVersions") or []
+        if isinstance(row, dict)
+    ]
+    return project_for_editor(out)
 
 
 @app.get("/api/storage/<key>")
 def get_key(key):
+    if key == "schedule-data-v2" and not request.args.get("editor") and request.args.get("full") != "1":
+        return redirect("/api/editor/schedule-data-v2?section=bootstrap", code=307)
     with _lock:
         store = load_store()
         if key not in store:
@@ -2645,7 +2828,7 @@ def get_key(key):
                 save_store(backup_store, backup=False, refresh_public=True)
                 return jsonify({
                     "key": key,
-                    "value": backup_store[key],
+                    "value": _editor_compact_project(backup_store[key]) if request.args.get("editor") else backup_store[key],
                     "recovered": True,
                     "backup": backup_name,
                 })
@@ -2721,7 +2904,7 @@ def get_key_meta(key):
 
 
 
-CURRENT_SCHEDULE_CLIENT_BUILD = 1895
+CURRENT_SCHEDULE_CLIENT_BUILD = 1896
 # Short compatibility grace: during an active scheduling session a tab can lag
 # behind several rapid deploys.  Keep the last three editor builds writable;
 # the UI independently detects the newer build and reloads itself.  Very old
@@ -2745,6 +2928,17 @@ def _stale_schedule_client_response():
         "currentBuild": CURRENT_SCHEDULE_CLIENT_BUILD,
     }), 409
 
+def _decompress_storage_body(raw_bytes):
+    """Ограничивает распаковку отдельно от HTTP-тела, останавливая gzip bomb."""
+    limit = int(os.environ.get("MAX_STORAGE_BYTES", 128 * 1024 * 1024))
+    with gzip.GzipFile(fileobj=io.BytesIO(raw_bytes)) as source:
+        expanded = source.read(limit + 1)
+    if len(expanded) > limit:
+        from werkzeug.exceptions import RequestEntityTooLarge
+        raise RequestEntityTooLarge("Распакованные данные превышают допустимый размер")
+    return expanded
+
+
 @app.post("/api/storage/<key>")
 def set_key(key):
     allow_create = request.args.get("allow_create") == "1"
@@ -2753,7 +2947,7 @@ def set_key(key):
         raw_bytes = request.get_data(cache=False)
         if request.headers.get("Content-Encoding", "").lower() == "gzip" and raw_bytes[:2] == b"\x1f\x8b":
             try:
-                raw_bytes = gzip.decompress(raw_bytes)
+                raw_bytes = _decompress_storage_body(raw_bytes)
             except (OSError, EOFError) as exc:
                 return jsonify({"error": f"Не удалось распаковать данные сохранения: {exc}"}), 400
         try:
@@ -2774,6 +2968,8 @@ def set_key(key):
             incoming_value = json.loads(incoming_value)
         except Exception:
             return jsonify({"error": "Не удалось разобрать данные расписания"}), 422
+    if key == "schedule-data-v2":
+        incoming_value = complete_project(incoming_value)
     with _lock:
         # Пересборка/перезапуск приложения НИКОГДА не должна молча создавать новое
         # storage.json. Если постоянный диск почему-то не примонтирован или файл пропал,
@@ -2809,14 +3005,17 @@ def set_key(key):
         # disappear/reappear in waves between administrators. Schedule mutations
         # must go through the atomic schedule endpoints below. Explicit first-time
         # creation is the only generic-write exception.
-        if key == "schedule-data-v2" and key in store and not allow_create:
+        if key == "schedule-data-v2" and key in store:
             try:
                 remote_existing = json.loads(store[key]) if isinstance(store[key], str) else store[key]
             except Exception:
                 remote_existing = None
-            if isinstance(remote_existing, dict) and isinstance(incoming_value, dict) and "schedule" in remote_existing:
-                incoming_value = dict(incoming_value)
-                incoming_value["schedule"] = remote_existing.get("schedule")
+            if isinstance(remote_existing, dict) and isinstance(incoming_value, dict):
+                incoming_value = preserve_deferred_sections(incoming_value, remote_existing)
+                if "schedule" in remote_existing and not allow_create:
+                    incoming_value["schedule"] = remote_existing.get("schedule")
+                if "users" in incoming_value and "users" in remote_existing:
+                    incoming_value["users"] = merge_users_preserve_hashes(incoming_value["users"], remote_existing["users"])
         store[key] = incoming_value
         save_store(store)
     if raw_mode:
@@ -2889,8 +3088,9 @@ def public_index():
         resp.headers["Expires"] = "0"
         resp.headers["X-Public-Snapshot"] = marker[:96]
         return resp
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        app.logger.exception("public_index failed")
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
 @app.get("/api/public-status")
@@ -2914,8 +3114,9 @@ def public_status():
         resp.headers["Pragma"] = "no-cache"
         resp.headers["Expires"] = "0"
         return resp
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        app.logger.exception("public_index failed")
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
 @app.get("/api/public-room-availability")
@@ -3095,8 +3296,9 @@ def public_schedule_shard(kind, entity_id):
         resp.headers["X-Public-Snapshot"] = marker[:96]
         resp.headers["X-Public-Scope"] = scope
         return resp
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        app.logger.exception("public_index failed")
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
 @app.get("/api/public-bootstrap")
@@ -3146,8 +3348,9 @@ def public_bootstrap():
         resp.headers["Expires"] = "0"
         resp.headers["X-Public-Snapshot"] = marker[:96]
         return resp
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        app.logger.exception("public_index failed")
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
 def _active_presence():
@@ -3523,8 +3726,9 @@ def _run_generation_job(job_id, payload, script_path=SCHEDULER_SCRIPT):
                                         "message":"Расчёт остановлен: вкладка редактора больше не активна."})
                     return
             else:
+                max_mb = str(int(os.environ.get("NODE_WORKER_MAX_OLD_SPACE_MB", "512")))
                 proc = subprocess.run(
-                    ["node", script_path],
+                    ["node", f"--max-old-space-size={max_mb}", script_path],
                     input=json.dumps(run_payload, ensure_ascii=False),
                     text=True, capture_output=True, timeout=GENERATION_TIMEOUT_SECONDS, check=False,
                 )
@@ -3594,6 +3798,8 @@ def schedule_generate_start():
     job_id = uuid.uuid4().hex
     with _generation_jobs_lock:
         queued = sum(1 for j in _generation_jobs.values() if j.get("status") in {"queued", "running"})
+        if queued >= 4:
+            return jsonify({"error": "Очередь генерации заполнена; повторите позже"}), 429
         _generation_jobs[job_id] = {
             "id": job_id, "kind": "schedule", "status": "queued", "phase": "queued", "created_at": time.time(),
             "queue_position": queued + 1, "storage_key": storage_key, "group_id": group_id, "protected_ids": set(),
@@ -3750,8 +3956,9 @@ def schedule_placement_options():
         result = parsed.get("result") or {}
         _schedule_options_cache_put(cache_key, result)
         return jsonify({"result": result, "elapsed_ms": parsed.get("elapsedMs") or int((time.time()-started)*1000), "cached": False, "worker": True})
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        app.logger.exception("public_index failed")
+        return jsonify({"error": "Внутренняя ошибка сервера"}), 500
 
 
 @app.get("/api/schedule/generate/<job_id>")
@@ -3823,6 +4030,8 @@ def graph_auto_group_start():
     job_id = uuid.uuid4().hex
     with _generation_jobs_lock:
         queued = sum(1 for j in _generation_jobs.values() if j.get("status") in {"queued", "running"})
+        if queued >= 4:
+            return jsonify({"error": "Очередь генерации заполнена; повторите позже"}), 429
         _generation_jobs[job_id] = {
             "id": job_id, "kind": "graph", "status": "queued", "phase": "queued", "created_at": time.time(),
             "queue_position": queued + 1, "storage_key": storage_key, "group_id": group_id,
@@ -4117,7 +4326,7 @@ def storage_section_merge(key):
         # an fsync/public-status penalty on every small editor change.
         _maybe_periodic_backup_async()
         save_store(store, backup=False, durable=False, refresh_public=False, refresh_status=False)
-    return jsonify({"ok": True, "token": str(merged["_syncMeta"]["saveId"]), "value": merged})
+    return jsonify({"ok": True, "token": str(merged["_syncMeta"]["saveId"]), "value": _editor_compact_project(merged)})
 
 
 
@@ -5648,7 +5857,7 @@ def storage_graph_merge(key):
         # an fsync/public-status penalty on every small editor change.
         _maybe_periodic_backup_async()
         save_store(store, backup=False, durable=False, refresh_public=False, refresh_status=False)
-    return jsonify({"ok": True, "token": str(merged["_syncMeta"]["saveId"]), "value": merged})
+    return jsonify({"ok": True, "token": str(merged["_syncMeta"]["saveId"]), "value": _editor_compact_project(merged)})
 
 
 
@@ -7715,7 +7924,7 @@ def storage_schedule_group_merge(key):
 
     return jsonify({
         "ok": True,
-        "value": _editor_compact_project(remote) if bool(meta.get("compact")) else remote,
+        "value": _editor_compact_project(remote),
         "token": sync_meta["saveId"],
         "conflicts": conflicts[:100],
         "hadConflicts": bool(conflicts),
@@ -7779,27 +7988,15 @@ def storage_schedule_merge(key):
     return jsonify({
         "ok": True,
         "token": str(merged["_syncMeta"]["saveId"]),
-        "value": _editor_compact_project(merged) if bool(meta.get("compact")) else merged,
+        "value": _editor_compact_project(merged),
         "conflicts": sorted(set(merge_conflicts))[:200],
         "hadConflicts": bool(merge_conflicts),
     })
 
 
 def _request_admin_user():
-    """Resolve an admin/superadmin from the canonical store for sensitive recovery endpoints."""
-    user_id = str(request.headers.get("X-Admin-User-Id") or "").strip()
-    if not user_id:
-        return None
-    try:
-        store = load_store()
-        raw = store.get("schedule-data-v2")
-        data = json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
-        for user in (data.get("users") or []):
-            if str(user.get("id") or "") == user_id and str(user.get("role") or "") in {"admin", "superadmin"}:
-                return user
-    except Exception:
-        return None
-    return None
+    """Доверяет только личности, проверенной серверной подписанной сессией."""
+    return getattr(g, "auth_user", None)
 
 
 @app.post("/api/storage-backups/create")
@@ -7899,12 +8096,17 @@ def storage_backup_restore(name):
 @app.after_request
 def _performance_cache_headers(response):
     path = request.path or ""
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     if path.startswith("/assets/"):
         response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     elif path == "/" or path.startswith("/admin") or path.startswith("/group/") or path.startswith("/teacher/") or path.startswith("/specialty/"):
         # HTML shell must notice a new deploy, but avoid legacy proxy caching.
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     return response
 
 @app.get("/api/app-build")

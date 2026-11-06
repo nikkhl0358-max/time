@@ -1,11 +1,13 @@
-export const CLIENT_BUILD_ID = "1895";
+/** Сохраняет совместное расписание через API, сохраняя конфликты и временные сбои различимыми. */
+import { storageFetch, getEditorDeferred } from "./editorTransport.js";
+export const CLIENT_BUILD_ID = "1896";
 
 // Замена window.storage (доступной только внутри артефактов Claude) на настоящий
 // backend API. Тот же смысл: get(key) / set(key, value), данные общие для всех.
 
 export async function storageGet(key) {
   try {
-    const res = await fetch(`/api/storage/${encodeURIComponent(key)}`);
+    const res = await storageFetch(`/api/storage/${encodeURIComponent(key)}`);
     if (!res.ok) return null; // 404 — ключа ещё нет, это нормально при первом запуске
     return await res.json(); // { key, value }
   } catch (e) {
@@ -16,7 +18,7 @@ export async function storageGet(key) {
 
 export async function storageMeta(key) {
   try {
-    const res = await fetch(`/api/storage-meta/${encodeURIComponent(key)}`, {
+    const res = await storageFetch(`/api/storage-meta/${encodeURIComponent(key)}`, {
       cache: "no-store",
       headers: { "Cache-Control": "no-cache" },
     });
@@ -72,6 +74,10 @@ const rememberCellRevisions = (key, revisions) => {
   scheduleCellRevisionCache.set(String(key), current);
   scheduleCellRevisionReady.add(String(key));
 };
+export function storageRememberCellRevisions(key, revisions) {
+  rememberCellRevisions(key, revisions);
+}
+
 const touchedSchedulePatchIds = (patch) => {
   const ids = new Set();
   for (const id of Object.keys(patch?.assignmentSet || {})) ids.add(String(id));
@@ -85,88 +91,62 @@ const touchedSchedulePatchIds = (patch) => {
 // Строгая загрузка с повторными попытками. Во время redeploy reverse-proxy Amvera
 // может несколько секунд отвечать 502/503 или оборвать запрос, хотя рабочий storage
 // на постоянном диске никуда не делся. Такие ответы нельзя трактовать как отсутствие данных.
-export async function storageGetStrict(key, options = {}) {
-  const attempts = Math.max(1, Number(options.attempts || 8));
-  const delayMs = Math.max(100, Number(options.delayMs || 850));
-  let lastError = null;
+const TRANSIENT_STORAGE_STATUSES = new Set([425, 429, 500, 502, 503, 504]);
 
+function storageAttempts(value, fallback) {
+  const count = Number(value);
+  return Number.isFinite(count) && count >= 1 ? Math.floor(count) : fallback;
+}
+
+async function retryStorage(operation, attempts, delayMs) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      const qs = options.editorCompact ? "?editor=1" : "";
-      const res = await fetch(`/api/storage/${encodeURIComponent(key)}${qs}`, {
-        cache: "no-store",
-        headers: { "Cache-Control": "no-cache" },
-      });
-      if (res.status === 404) return { key, value: null, missing: true, status: 404 };
-
-      if (!res.ok) {
-        const detail = await res.json().catch(() => ({}));
-        const err = new Error(detail?.error || `Ошибка загрузки данных: HTTP ${res.status}`);
-        err.status = res.status;
-        // 5xx/429/425 могут быть переходным состоянием при пересборке.
-        if ([425, 429, 500, 502, 503, 504].includes(res.status) && attempt < attempts) {
-          lastError = err;
-          await sleep(delayMs * attempt);
-          continue;
-        }
-        throw err;
-      }
-
-      let payload;
-      try {
-        payload = await res.json();
-      } catch (e) {
-        const err = new Error("Сервер хранения вернул неполный ответ");
-        if (attempt < attempts) {
-          lastError = err;
-          await sleep(delayMs * attempt);
-          continue;
-        }
-        throw err;
-      }
-
-      if (!payload || typeof payload !== "object" || !("value" in payload)) {
-        const err = new Error("Сервер хранения вернул ответ без поля данных");
-        if (attempt < attempts) {
-          lastError = err;
-          await sleep(delayMs * attempt);
-          continue;
-        }
-        throw err;
-      }
-
-      // Пустой существующий ключ тоже не считаем «новой базой». Повторяем запрос,
-      // а затем отдаём отдельный признак, чтобы пользователь мог восстановить backup.
-      if (payload.value === null || payload.value === "") {
-        if (attempt < attempts) {
-          lastError = new Error("Ключ хранилища временно пуст");
-          await sleep(delayMs * attempt);
-          continue;
-        }
-        return { ...payload, empty: true, status: 200 };
-      }
-      if (payload.cellRevisions) rememberCellRevisions(key, payload.cellRevisions);
-      return { ...payload, status: 200 };
-    } catch (e) {
-      lastError = e;
-      if (attempt < attempts) {
-        await sleep(delayMs * attempt);
-        continue;
-      }
+      return await operation(attempt === attempts);
+    } catch (error) {
+      const status = Number(error?.status || 0);
+      if (attempt === attempts || (status && !TRANSIENT_STORAGE_STATUSES.has(status))) throw error;
+      await sleep(delayMs * attempt);
     }
   }
-  throw lastError || new Error("Сервер хранения недоступен");
+}
+
+async function readStrictStorage(key, editorCompact, finalAttempt) {
+  const qs = editorCompact ? "?editor=1" : "";
+  const res = await storageFetch(`/api/storage/${encodeURIComponent(key)}${qs}`, {
+    cache: "no-store", headers: { "Cache-Control": "no-cache" },
+  });
+  if (res.status === 404) return { key, value: null, missing: true, status: 404 };
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw apiErrorFromResponse(detail, `Ошибка загрузки данных: HTTP ${res.status}`, res.status);
+  }
+  const payload = await res.json().catch(() => { throw new Error("Сервер хранения вернул неполный ответ"); });
+  if (!payload || typeof payload !== "object" || !("value" in payload)) {
+    throw new Error("Сервер хранения вернул ответ без поля данных");
+  }
+  if (payload.value === null || payload.value === "") {
+    if (!finalAttempt) throw new Error("Ключ хранилища временно пуст");
+    return { ...payload, empty: true, status: 200 };
+  }
+  if (payload.cellRevisions) rememberCellRevisions(key, payload.cellRevisions);
+  return { ...payload, status: 200 };
+}
+
+export async function storageGetStrict(key, options = {}) {
+  const attempts = storageAttempts(options.attempts, 8);
+  const delayMs = Math.max(100, Number(options.delayMs) || 850);
+  return retryStorage((finalAttempt) => readStrictStorage(key, options.editorCompact, finalAttempt), attempts, delayMs);
 }
 
 export async function storageVersionGet(key, versionId) {
-  const res = await fetch(`/api/storage-version/${encodeURIComponent(key)}/${encodeURIComponent(versionId)}`, { cache: "no-store" });
+  const res = await storageFetch(`/api/storage-version/${encodeURIComponent(key)}/${encodeURIComponent(versionId)}`, { cache: "no-store" });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Не удалось загрузить версию: HTTP ${res.status}`);
   return data?.version || null;
 }
 
 export async function scheduleArchiveList(key = "schedule-data-v2") {
-  const res = await fetch(`/api/schedule-archive/${encodeURIComponent(key)}`, { cache: "no-store" });
+  const res = await storageFetch(`/api/schedule-archive/${encodeURIComponent(key)}`, { cache: "no-store" });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Не удалось загрузить архив публикаций: HTTP ${res.status}`);
   return {
@@ -176,7 +156,7 @@ export async function scheduleArchiveList(key = "schedule-data-v2") {
 }
 
 export async function scheduleFinalizeWeek(key, week, meta = {}) {
-  const res = await fetch(`/api/schedule-archive/${encodeURIComponent(key)}/finalize-week`, {
+  const res = await storageFetch(`/api/schedule-archive/${encodeURIComponent(key)}/finalize-week`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ week, meta }),
@@ -188,7 +168,7 @@ export async function scheduleFinalizeWeek(key, week, meta = {}) {
 }
 
 export async function scheduleArchiveGet(key, archiveKind, archiveId) {
-  const res = await fetch(`/api/schedule-archive/${encodeURIComponent(key)}/${encodeURIComponent(archiveKind)}/${encodeURIComponent(archiveId)}`, {
+  const res = await storageFetch(`/api/schedule-archive/${encodeURIComponent(key)}/${encodeURIComponent(archiveKind)}/${encodeURIComponent(archiveId)}`, {
     cache: "no-store",
   });
   const data = await res.json().catch(() => ({}));
@@ -214,7 +194,7 @@ export async function scheduleArchiveDownload(key, archiveKind, archiveId) {
 }
 
 export async function storageCreateBackup(userId) {
-  const res = await fetch("/api/storage-backups/create", {
+  const res = await storageFetch("/api/storage-backups/create", {
     method: "POST",
     cache: "no-store",
     headers: { "X-Admin-User-Id": String(userId || "") },
@@ -225,14 +205,14 @@ export async function storageCreateBackup(userId) {
 }
 
 export async function storageBackups() {
-  const res = await fetch("/api/storage-backups", { cache: "no-store" });
+  const res = await storageFetch("/api/storage-backups", { cache: "no-store" });
   if (!res.ok) throw new Error(`Не удалось получить резервные копии: HTTP ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.backups) ? data.backups : [];
 }
 
 export async function storageDownloadBackup(name, userId) {
-  const res = await fetch(`/api/storage-backups/${encodeURIComponent(name)}/download`, {
+  const res = await storageFetch(`/api/storage-backups/${encodeURIComponent(name)}/download`, {
     cache: "no-store",
     headers: { "X-Admin-User-Id": String(userId || "") },
   });
@@ -255,7 +235,7 @@ export async function storageDownloadBackup(name, userId) {
 }
 
 export async function storageRestoreBackup(name) {
-  const res = await fetch(`/api/storage-backups/${encodeURIComponent(name)}/restore`, { method: "POST" });
+  const res = await storageFetch(`/api/storage-backups/${encodeURIComponent(name)}/restore`, { method: "POST" });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Не удалось восстановить резервную копию: HTTP ${res.status}`);
   return data;
@@ -265,7 +245,7 @@ export async function storageRestorePublishedGroup(key, groupId, meta = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 45000);
   try {
-    const res = await fetch(`/api/storage-restore-published-group/${encodeURIComponent(key)}`, {
+    const res = await storageFetch(`/api/storage-restore-published-group/${encodeURIComponent(key)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ groupId, meta }),
@@ -288,7 +268,7 @@ export async function storageUndoPublishedGroupRestore(key, groupId, meta = {}) 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 45000);
   try {
-    const res = await fetch(`/api/storage-undo-published-group/${encodeURIComponent(key)}`, {
+    const res = await storageFetch(`/api/storage-undo-published-group/${encodeURIComponent(key)}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ groupId, meta }),
@@ -307,67 +287,55 @@ export async function storageUndoPublishedGroupRestore(key, groupId, meta = {}) 
   }
 }
 
-export async function storageSet(key, value, options = {}) {
-  const qs = new URLSearchParams();
-  if (options.allowCreate) qs.set("allow_create", "1");
-  qs.set("raw", "1");
-  const url = `/api/storage/${encodeURIComponent(key)}?${qs.toString()}`;
-  const text = typeof value === "string" ? value : JSON.stringify(value);
-  const attempts = Math.max(1, Number(options.attempts || 3));
-  const timeoutMs = Math.max(5000, Number(options.timeoutMs || 60000));
-
-  let body = text;
+async function storageSaveBody(text, baseToken) {
   const headers = { "Content-Type": "application/json; charset=utf-8" };
-  if (options.baseToken) headers["X-Base-Token"] = String(options.baseToken);
-  if (text.length > 128 * 1024 && typeof CompressionStream !== "undefined") {
-    try {
-      const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"));
-      body = new Uint8Array(await new Response(stream).arrayBuffer());
-      headers["Content-Encoding"] = "gzip";
-    } catch (e) {
-      console.warn("gzip save compression unavailable, using plain payload", e);
-      body = text;
-    }
+  if (baseToken) headers["X-Base-Token"] = String(baseToken);
+  if (text.length <= 128 * 1024 || typeof CompressionStream === "undefined") return { body: text, headers };
+  try {
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("gzip"));
+    const body = new Uint8Array(await new Response(stream).arrayBuffer());
+    return { body, headers: { ...headers, "Content-Encoding": "gzip" } };
+  } catch (error) {
+    console.warn("gzip save compression unavailable, using plain payload", error);
+    return { body: text, headers };
   }
-
-  let lastError = null;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, { method: "POST", headers, body, signal: controller.signal });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const err = new Error(data?.error || `Ошибка сохранения: HTTP ${res.status}`);
-        err.status = res.status;
-        if ([425, 429, 500, 502, 503, 504].includes(res.status) && attempt < attempts) {
-          lastError = err;
-          await sleep(600 * attempt);
-          continue;
-        }
-        throw err;
-      }
-      return data;
-    } catch (e) {
-      lastError = e?.name === "AbortError" ? new Error("Сохранение не завершилось за отведённое время") : e;
-      if (attempt < attempts) {
-        await sleep(600 * attempt);
-        continue;
-      }
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  console.error("storageSet failed", lastError);
-  throw lastError || new Error("Не удалось сохранить данные");
 }
 
+async function saveStorageRequest(url, request, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await storageFetch(url, { method: "POST", ...request, signal: controller.signal });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw apiErrorFromResponse(data, `Ошибка сохранения: HTTP ${res.status}`, res.status);
+    return data;
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("Сохранение не завершилось за отведённое время");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function storageSet(key, value, options = {}) {
+  if (getEditorDeferred().length && !options.allowCreate) {
+    throw Object.assign(new Error("Сначала загрузите проект целиком"), { status: 409 });
+  }
+  const qs = new URLSearchParams({ raw: "1" });
+  if (options.allowCreate) qs.set("allow_create", "1");
+  const url = `/api/storage/${encodeURIComponent(key)}?${qs.toString()}`;
+  const text = typeof value === "string" ? value : JSON.stringify(value);
+  const request = await storageSaveBody(text, options.baseToken);
+  const attempts = storageAttempts(options.attempts, 3);
+  const timeoutMs = Math.max(5000, Number(options.timeoutMs) || 60000);
+  return retryStorage(() => saveStorageRequest(url, request, timeoutMs), attempts, 600);
+}
 
 
 // v1498: generic atomic page-section merge. Each admin page sends only the
 // sections it owns, together with the exact base snapshot used to make the edit.
 export async function storageSectionMerge(key, base, local, meta = {}) {
-  const res = await fetch(`/api/storage-section-merge/${encodeURIComponent(key)}`, {
+  const res = await storageFetch(`/api/storage-section-merge/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ base, local, meta }),
@@ -415,7 +383,7 @@ export async function storageSchedulePatch(key, patch = {}, meta = {}) {
     // window and retry only once for genuine transient gateway/network failures.
     const timer = setTimeout(() => controller.abort(), 52000);
     try {
-      const res = await fetch(`/api/storage-schedule-patch/${encodeURIComponent(key)}`, {
+      const res = await storageFetch(`/api/storage-schedule-patch/${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Client-Build": CLIENT_BUILD_ID },
         body: JSON.stringify({ patch: patchWithRevision, meta: requestMeta }),
@@ -446,7 +414,7 @@ export async function storageSchedulePatch(key, patch = {}, meta = {}) {
 
 
 export async function storagePublicationCommit(key, payload = {}, meta = {}) {
-  const res = await fetch(`/api/storage-publication-commit/${encodeURIComponent(key)}`, {
+  const res = await storageFetch(`/api/storage-publication-commit/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ...payload, meta }),
@@ -461,7 +429,7 @@ export async function storagePublicationCommit(key, payload = {}, meta = {}) {
 }
 
 export async function storagePublishWeeks(key, weeks = [], meta = {}) {
-  const res = await fetch(`/api/storage-publish-weeks/${encodeURIComponent(key)}`, {
+  const res = await storageFetch(`/api/storage-publish-weeks/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ weeks, meta }),
@@ -484,7 +452,7 @@ export async function storageScheduleGroupMerge(key, groupId, base, local, meta 
   let lastError = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const res = await fetch(`/api/storage-schedule-group-merge/${encodeURIComponent(key)}`, {
+      const res = await storageFetch(`/api/storage-schedule-group-merge/${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Client-Build": CLIENT_BUILD_ID },
         body: JSON.stringify({ groupId, base, local, meta: payloadMeta }),
@@ -508,7 +476,7 @@ export async function storageScheduleGroupMerge(key, groupId, base, local, meta 
 }
 
 export async function storageScheduleMerge(key, base, local, meta = {}) {
-  const res = await fetch(`/api/storage-schedule-merge/${encodeURIComponent(key)}`, {
+  const res = await storageFetch(`/api/storage-schedule-merge/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Client-Build": CLIENT_BUILD_ID },
     body: JSON.stringify({ base, local, meta }),
@@ -527,7 +495,7 @@ export async function storageScheduleMerge(key, base, local, meta = {}) {
 // holding the storage lock, so debounce order between browsers cannot erase
 // another employee's graph edits.
 export async function storageGraphMerge(key, base, local, meta = {}) {
-  const res = await fetch(`/api/storage-graph-merge/${encodeURIComponent(key)}`, {
+  const res = await storageFetch(`/api/storage-graph-merge/${encodeURIComponent(key)}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ base, local, meta }),
@@ -557,7 +525,7 @@ export async function storageGraphPatch(key, changes = [], historyAppend = [], m
   const requestMeta = { ...(meta || {}), requestId };
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
-      const res = await fetch(`/api/storage-graph-patch/${encodeURIComponent(key)}`, {
+      const res = await storageFetch(`/api/storage-graph-patch/${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Client-Build": CLIENT_BUILD_ID },
         body: JSON.stringify({ changes, historyAppend, meta: requestMeta, schedulePatch }),
@@ -579,7 +547,7 @@ export async function storageGraphPatch(key, changes = [], historyAppend = [], m
 
 export async function presenceHeartbeat(payload) {
   try {
-    const res = await fetch("/api/presence/heartbeat", {
+    const res = await storageFetch("/api/presence/heartbeat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -595,7 +563,7 @@ export async function presenceHeartbeat(payload) {
 
 export async function presenceGet() {
   try {
-    const res = await fetch("/api/presence");
+    const res = await storageFetch("/api/presence");
     if (!res.ok) return [];
     const data = await res.json();
     return data.active || [];
@@ -613,14 +581,14 @@ export function presenceLeave(sessionId) {
       navigator.sendBeacon("/api/presence/leave", new Blob([body], { type: "application/json" }));
       return;
     }
-    fetch("/api/presence/leave", { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
+    storageFetch("/api/presence/leave", { method: "POST", headers: { "Content-Type": "application/json" }, body, keepalive: true }).catch(() => {});
   } catch { /* TTL всё равно снимет статус */ }
 }
 
 export async function serverGenerateStart(payload = {}) {
   // Only a tiny command is sent. The server reads the already saved project
   // snapshot itself, avoiding HTTP 413 on large semesters.
-  const res = await fetch('/api/schedule/generate', {
+  const res = await storageFetch('/api/schedule/generate', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ storageKey: payload.storageKey || 'schedule-data-v2', groupId: payload.groupId || '', fastMode: !!payload.fastMode, weekNumber: Number(payload.weekNumber || 0) }),
@@ -632,14 +600,14 @@ export async function serverGenerateStart(payload = {}) {
 
 export async function serverGenerateStatus(jobId, afterProgress = 0) {
   const suffix = Number(afterProgress) > 0 ? `?after_progress=${encodeURIComponent(Number(afterProgress))}` : '';
-  const res = await fetch(`/api/schedule/generate/${encodeURIComponent(jobId)}${suffix}`, { cache: 'no-store' });
+  const res = await storageFetch(`/api/schedule/generate/${encodeURIComponent(jobId)}${suffix}`, { cache: 'no-store' });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Не удалось получить статус расчёта: HTTP ${res.status}`);
   return data;
 }
 
 export async function serverGenerateCancel(jobId) {
-  const res = await fetch(`/api/schedule/generate/${encodeURIComponent(jobId)}/cancel`, {
+  const res = await storageFetch(`/api/schedule/generate/${encodeURIComponent(jobId)}/cancel`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: '{}',
@@ -650,7 +618,7 @@ export async function serverGenerateCancel(jobId) {
 }
 
 export async function serverAutoGraphStart(payload = {}) {
-  const res = await fetch('/api/graphs/auto-group', {
+  const res = await storageFetch('/api/graphs/auto-group', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -666,7 +634,7 @@ export async function serverAutoGraphStart(payload = {}) {
 }
 
 export async function serverAutoGraphStatus(jobId) {
-  const res = await fetch(`/api/graphs/auto-group/${encodeURIComponent(jobId)}`, { cache: 'no-store' });
+  const res = await storageFetch(`/api/graphs/auto-group/${encodeURIComponent(jobId)}`, { cache: 'no-store' });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Не удалось получить статус автографика: HTTP ${res.status}`);
   return data;
@@ -675,7 +643,7 @@ export async function serverAutoGraphStatus(jobId) {
 
 export async function publicIndexGet() {
   try {
-    const res = await fetch(`/api/public-index?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await storageFetch(`/api/public-index?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -690,7 +658,7 @@ export async function publicScheduleGet(kind, id, options = {}) {
     const scope = options?.scope === 'week' && Number(options?.week) > 0 ? 'week' : 'semester';
     const qs = scope === 'week' ? `?scope=week&week=${encodeURIComponent(Number(options.week))}` : '?scope=semester';
     const sep = qs.includes('?') ? '&' : '?';
-    const res = await fetch(`/api/public-schedule/${safeKind}/${encodeURIComponent(String(id || ''))}${qs}${sep}_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await storageFetch(`/api/public-schedule/${safeKind}/${encodeURIComponent(String(id || ''))}${qs}${sep}_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -701,7 +669,7 @@ export async function publicScheduleGet(kind, id, options = {}) {
 
 export async function publicStatusGet() {
   try {
-    const res = await fetch(`/api/public-status?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await storageFetch(`/api/public-status?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -714,7 +682,7 @@ export async function publicBootstrapGet() {
   try {
     // v1628: публичный bootstrap имеет короткий HTTP cache + ETag на сервере.
     // Не запрещаем браузеру использовать его: повторные открытия заметно быстрее.
-    const res = await fetch(`/api/public-bootstrap?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
+    const res = await storageFetch(`/api/public-bootstrap?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });
     if (!res.ok) return null;
     return await res.json();
   } catch (e) {
@@ -728,14 +696,14 @@ export async function publicBootstrapGet() {
 // heavy schedule project. This keeps public visitors away from the app while
 // administrators are doing intensive timetable work.
 export async function publicControlGet() {
-  const res = await fetch(`/api/public-control?_t=${Date.now()}`, { cache: "no-store", headers: { "Cache-Control": "no-cache" } });
+  const res = await storageFetch(`/api/public-control?_t=${Date.now()}`, { cache: "no-store", headers: { "Cache-Control": "no-cache" } });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data?.error || `Не удалось получить состояние публичного контура: HTTP ${res.status}`);
   return data;
 }
 
 export async function publicControlSet(paused, userId) {
-  const res = await fetch('/api/public-control', {
+  const res = await storageFetch('/api/public-control', {
     method: 'POST',
     cache: 'no-store',
     headers: {

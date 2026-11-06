@@ -1,6 +1,60 @@
 const uid = () => Math.random().toString(36).slice(2, 10);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
+// v1813: горячие проверки конфликтов вызываются сотни раз за одно действие.
+// Не строим Map по всей Нагрузке внутри каждого сравнения; кеш живёт ровно
+// пока неизменен массив data.loads (при редактировании loads React создаёт новый массив).
+const LOAD_BY_ID_CACHE = new WeakMap();
+function loadByIdIndex(data) {
+  const loads = data?.loads;
+  if (!Array.isArray(loads)) return new Map();
+  let index = LOAD_BY_ID_CACHE.get(loads);
+  if (!index) {
+    index = new Map(loads.filter((row) => row?.id).map((row) => [String(row.id), row]));
+    LOAD_BY_ID_CACHE.set(loads, index);
+  }
+  return index;
+}
+
+
+// v1806: helpers for smart format control. They are intentionally pure:
+// they analyse existing instances and never trigger schedule regeneration.
+function getFormatValue(inst) {
+  return inst?.format || inst?.deliveryMode || (inst?.isRemote ? "remote" : "offline");
+}
+function formatStats(instances = [], filter = {}) {
+  const rows = instances.filter((x) => {
+    if (filter.groupId && String(x.groupId || "") !== String(filter.groupId)) return false;
+    if (filter.week && Number(x.week || 0) !== Number(filter.week)) return false;
+    return true;
+  });
+  const remote = rows.filter((x) => getFormatValue(x) === "remote").length;
+  const offline = rows.length - remote;
+  return {
+    total: rows.length,
+    remote,
+    offline,
+    remotePercent: rows.length ? Math.round(remote * 100 / rows.length) : 0,
+    offlinePercent: rows.length ? Math.round(offline * 100 / rows.length) : 0,
+  };
+}
+function compatibleRemoteGroupScore(a, b) {
+  let score = 0;
+  if (String(a.subjectId || "") === String(b.subjectId || "")) score += 25;
+  if (String(a.teacherId || "") === String(b.teacherId || "")) score += 25;
+  if (String(a.typeId || "") === String(b.typeId || "")) score += 20;
+  if (String(getFormatValue(a)) === String(getFormatValue(b))) score += 15;
+  if (Number(a.week || 0) === Number(b.week || 0)) score += 15;
+  return score;
+}
+function findRemoteMergeCandidates(inst, allInstances = []) {
+  return allInstances
+    .filter((x) => x && x.instId !== inst?.instId)
+    .map((x) => ({ instance: x, score: compatibleRemoteGroupScore(inst, x) }))
+    .filter((x) => x.score >= 60)
+    .sort((a, b) => b.score - a.score);
+}
+
 const DAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
 const DAY_LABELS_FULL = [
   "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
@@ -111,6 +165,34 @@ function weekDayWithinSemester(config, week, day) {
   if (config.semesterEnd && date > config.semesterEnd) return false;
   return true;
 }
+
+function isGroupOnPractice(data, groupId, date) {
+  return (data?.practices || []).find((p) => p.groupId === groupId && p.dateStart <= date && date <= p.dateEnd) || null;
+}
+
+// v1852: an assignment is not automatically a real occupied occurrence.
+// Old/stale cards can retain day/period while that concrete date is hidden by
+// semester bounds, a no-class exception or group practice. Every occupancy
+// check must compare only weeks that are actually visible for that assignment.
+function visibleWeeksForAssignedOccurrence(data, inst, assignment) {
+  if (!data?.config?.semesterStart || !inst || !assignment || assignment.day == null) return [];
+  const out = [];
+  for (const week of weekNumbersForInstance(data.config, inst).map(Number).filter(Number.isFinite)) {
+    const date = dateForWeekDay(data.config, week, Number(assignment.day));
+    if (!date || !weekDayWithinSemester(data.config, week, Number(assignment.day))) continue;
+    if (isNoClassDate(data, date)) continue;
+    if (!instanceAppliesToDate(data.config, inst, date)) continue;
+    if (streamGroups(inst).some((gid) => !!isGroupOnPractice(data, gid, date))) continue;
+    out.push(Number(week));
+  }
+  return [...new Set(out)].sort((a,b)=>a-b);
+}
+
+function visibleAssignedWeeksOverlap(data, aInst, aAssignment, bInst, bAssignment) {
+  const aWeeks = new Set(visibleWeeksForAssignedOccurrence(data, aInst, aAssignment));
+  if (!aWeeks.size) return false;
+  return visibleWeeksForAssignedOccurrence(data, bInst, bAssignment).some((w)=>aWeeks.has(Number(w)));
+}
 function defaultParityForWeek(n) {
   return n % 2 === 1 ? "odd" : "even";
 }
@@ -219,7 +301,10 @@ function instanceAppliesToDate(config, inst, dateStr) {
   if (pattern === "all") return true;
   if (pattern === "custom") {
     const n = weekNumberOf(config.semesterStart, dateStr);
-    return n !== null && (inst.customWeeks || []).includes(n);
+    // v1601: старые/ручные экземпляры могут хранить customWeeks как строки
+    // ("2"), а weekNumberOf возвращает число (2). Строгий includes скрывал
+    // реальную карточку из сетки, хотя сервер корректно видел её как занятую.
+    return n !== null && (inst.customWeeks || []).some((w) => Number(w) === Number(n));
   }
   if (pattern === "perWeek") {
     const n = weekNumberOf(config.semesterStart, dateStr);
@@ -238,7 +323,7 @@ function weekNumbersForInstance(config, inst) {
   const total = totalSemesterWeeks(config);
   if (!total) return [];
   const pattern = inst?.weekPattern || "all";
-  if (pattern === "custom") return (inst.customWeeks || []).map(Number).filter((n) => n >= 1 && n <= total).slice().sort((a,b)=>a-b);
+  if (pattern === "custom") return [...new Set((inst.customWeeks || []).map(Number).filter((n) => Number.isFinite(n) && n >= 1 && n <= total))].sort((a,b)=>a-b);
   if (pattern === "perWeek") {
     const wp = inst?.weeklyPairs || {};
     return Object.keys(wp).map(Number).filter((n) => n >= 1 && n <= total && Number(wp[n] || wp[String(n)] || 0) > 0).sort((a,b)=>a-b);
@@ -327,32 +412,117 @@ function ensureUniqueLoadIdsStable(list, priorLoads = []) {
   return ensureUniqueIds(rows, "load");
 }
 
+// v1811: строки Нагрузки являются владельцами обычных schedule.instance.
+// Если строка нагрузки удалена, старый instance не должен оставаться ни в сетке,
+// ни в «Неразмещённых». Для потокового occurrence, у которого удалён только
+// прежний primary-load, сохраняем занятие, переякорив его на живого участника.
+function pruneOrphanScheduleInstances(schedule, loads = []) {
+  if (!schedule || !Array.isArray(schedule.instances)) return schedule;
+  const loadById = new Map((loads || []).filter((row) => row?.id).map((row) => [String(row.id), row]));
+  const nextInstances = [];
+  const removedIds = new Set();
+
+  for (const src of (schedule.instances || [])) {
+    if (!src?.instId || src.isScheduleEvent || !src.loadId) {
+      nextInstances.push(src);
+      continue;
+    }
+
+    const primaryLoad = loadById.get(String(src.loadId));
+    const liveParticipants = (Array.isArray(src.streamParticipants) ? src.streamParticipants : [])
+      .filter((part) => !part?.loadId || loadById.has(String(part.loadId)));
+
+    if (primaryLoad) {
+      // v1812: Нагрузка — единый источник истины не только для номера п/г,
+      // но и для владельца/преподавателя/дисциплины/вида занятия. Иначе старый
+      // schedule.instance может невидимо продолжать занимать преподавателя после
+      // редактирования Нагрузки (типичный «фантомный конфликт»).
+      const syncedParticipants = liveParticipants.map((part) => {
+        const partLoad = part?.loadId ? loadById.get(String(part.loadId)) : null;
+        return partLoad ? { ...part, groupId: partLoad.groupId, subgroup: Number(partLoad.subgroup) || 0 } : part;
+      });
+      nextInstances.push({
+        ...src,
+        loadId: primaryLoad.id,
+        groupId: primaryLoad.groupId,
+        teacherId: primaryLoad.teacherId,
+        subjectId: primaryLoad.subjectId,
+        typeId: primaryLoad.typeId,
+        subgroup: Number(primaryLoad.subgroup) || 0,
+        roomType: primaryLoad.roomType || src.roomType,
+        streamParticipants: syncedParticipants,
+      });
+      continue;
+    }
+
+    const replacementPart = liveParticipants.find((part) => part?.loadId && loadById.has(String(part.loadId)));
+    const replacementLoad = replacementPart ? loadById.get(String(replacementPart.loadId)) : null;
+    if (!replacementLoad) {
+      removedIds.add(String(src.instId));
+      continue;
+    }
+
+    // Не уничтожаем общий поток из-за удаления его прежней первой строки.
+    const remainingParticipants = liveParticipants.filter((part) => String(part?.loadId || '') !== String(replacementLoad.id));
+    const priorGroupIds = [...new Set([...(src.streamGroupIds || []), ...(src.groupIds || [])].filter(Boolean))];
+    const remainingGroupIds = [...new Set([
+      ...priorGroupIds.filter((gid) => String(gid) !== String(replacementLoad.groupId)),
+      ...remainingParticipants.map((part) => part?.groupId).filter(Boolean),
+    ])];
+    nextInstances.push({
+      ...src,
+      loadId: replacementLoad.id,
+      groupId: replacementLoad.groupId,
+      teacherId: replacementLoad.teacherId,
+      subjectId: replacementLoad.subjectId,
+      typeId: replacementLoad.typeId,
+      subgroup: Number(replacementLoad.subgroup) || 0,
+      roomType: replacementLoad.roomType || src.roomType,
+      streamGroupIds: remainingGroupIds,
+      streamParticipants: remainingParticipants,
+    });
+  }
+
+  // v1812: даже без удаления instance нужно вернуть синхронизированные поля
+  // (teacherId/groupId/subjectId/typeId/subgroup). Ранний return v1811 терял
+  // эти исправления и оставлял фантомную занятость до следующей пересборки.
+  const validIds = new Set(nextInstances.map((row) => String(row?.instId || '')).filter(Boolean));
+  const assignment = Object.fromEntries(
+    Object.entries(schedule.assignment || {}).filter(([id, value]) => validIds.has(String(id)) && value)
+  );
+  const locked = [...new Set((schedule.locked || []).map(String).filter((id) => validIds.has(id)))];
+  const unplaced = [...new Set((schedule.unplaced || []).map(String).filter((id) => validIds.has(id) && !assignment[id]))];
+  if (removedIds.size) console.warn('v1811: removed orphan schedule instances', [...removedIds]);
+  return { ...schedule, instances: nextInstances, assignment, locked, unplaced };
+}
+
 function normalizeScheduleInstanceIds(schedule) {
   if (!schedule || !Array.isArray(schedule.instances)) return schedule;
-  const seen = new Map();
-  const assignment = { ...(schedule.assignment || {}) };
-  const locked = new Set(schedule.locked || []);
-  const unplaced = new Set(schedule.unplaced || []);
+
+  // v1636 SAFE READ: duplicate instId is corrupted data, not a second lesson.
+  // Older code renamed the duplicate AND copied assignment[base] to it. Merely
+  // reloading the page could therefore create a visibly doubled placed lesson.
+  // Keep exactly one row for one storage key and never fabricate a placement.
+  const seen = new Set();
+  const duplicates = [];
   const instances = [];
-  for (let idx = 0; idx < schedule.instances.length; idx++) {
-    const src = schedule.instances[idx] || {};
-    const base = String(src.instId || `inst_${idx+1}`);
-    const count = (seen.get(base) || 0) + 1;
-    seen.set(base, count);
-    if (count === 1) { instances.push(src); continue; }
-    let instId = `${base}__DUP${count}`;
-    let suffix = count;
-    while (instances.some((x)=>x.instId===instId)) instId = `${base}__DUP${++suffix}`;
-    const migrated = { ...src, instId, duplicateOfInstId: base };
-    instances.push(migrated);
-    // Старый баг мог создать несколько экземпляров с одним instId. Они фактически
-    // использовали одну запись assignment; копируем её, чтобы обе карточки были
-    // видны и нормальная проверка конфликтов могла их различить.
-    if (assignment[base] && !assignment[instId]) assignment[instId] = { ...assignment[base] };
-    if (locked.has(base)) locked.add(instId);
-    if (unplaced.has(base)) unplaced.add(instId);
+  for (const src of (schedule.instances || [])) {
+    const sid = String(src?.instId || '');
+    if (!sid) { instances.push(src); continue; }
+    if (seen.has(sid)) { duplicates.push(sid); continue; }
+    seen.add(sid);
+    instances.push(src);
   }
-  return { ...schedule, instances, assignment, locked:[...locked], unplaced:[...unplaced] };
+  const validIds = new Set(instances.map((x)=>String(x?.instId||'')).filter(Boolean));
+  const assignment = Object.fromEntries(
+    Object.entries(schedule.assignment || {}).filter(([id, value])=>validIds.has(String(id)) && value)
+  );
+  const locked = [...new Set((schedule.locked || []).map(String).filter((id)=>validIds.has(id)))];
+  const unplaced = [...new Set((schedule.unplaced || []).map(String).filter((id)=>validIds.has(id) && !assignment[id]))];
+  if (duplicates.length) {
+    console.error('v1636: duplicate schedule instId detected; extra rows hidden without changing storage', [...new Set(duplicates)]);
+  }
+  return { ...schedule, instances, assignment, locked, unplaced };
 }
 
 function graphPersistenceSignature(load) {
@@ -374,6 +544,69 @@ function graphStateFromLoads(loads = []) {
     if (sig) out[`sig:${sig}`] = entry;
   }
   return out;
+}
+
+
+function normalizedPublicConfig(raw) {
+  const c = raw || {};
+  return {
+    activeDays: Array.isArray(c.activeDays) ? c.activeDays : [true, true, true, true, true, false, false],
+    periodsPerDay: Number(c.periodsPerDay) || 6,
+    periodTimes: Array.isArray(c.periodTimes) ? c.periodTimes : [
+      "08:00–09:30", "09:40–11:10", "11:30–13:00", "13:30–15:00", "15:10–16:40", "16:50–18:20",
+    ],
+    voznesenskyPeriodTimes: Array.isArray(c.voznesenskyPeriodTimes) ? c.voznesenskyPeriodTimes : [...DEFAULT_VOZNESENSKY_PERIOD_TIMES],
+    shortenedPeriodTimes: Array.isArray(c.shortenedPeriodTimes) ? c.shortenedPeriodTimes : [
+      "08:00–09:10", "09:20–10:30", "10:40–11:50", "12:00–13:10", "13:20–14:30", "14:40–15:50",
+    ],
+    shortenedDates: Array.isArray(c.shortenedDates) ? c.shortenedDates : [],
+    semesterStart: c.semesterStart || "",
+    semesterEnd: c.semesterEnd || "",
+    weekParityOverrides: c.weekParityOverrides && typeof c.weekParityOverrides === "object" ? c.weekParityOverrides : {},
+    holidays: Array.isArray(c.holidays) ? c.holidays : [],
+    ...c,
+    dailyLoadRules: normalizedDailyLoadRules(c),
+    peExtraPairAllowed: c.peExtraPairAllowed !== false,
+  };
+}
+
+function normalizePublicStoredData(raw) {
+  // v1637: public contour must not run the editor's migration/reconciliation pipeline.
+  // Published snapshots are already coherent. Running normalizeStoredData here rebuilt
+  // instances, graph mirrors and legacy load migrations on every visitor's device and
+  // was a major source of the long white-screen load on phones.
+  const data = raw || {};
+  return {
+    ...data,
+    config: normalizedPublicConfig(data.config),
+    specialties: Array.isArray(data.specialties) ? data.specialties : [],
+    groups: (data.groups || []).map((g) => ({ educationBase: "9", programSemesters: (g.educationBase || "9") === "11" ? 6 : 8, curriculumSemester: 1, subgroupCount: 2, profile: "", ...g })),
+    teachers: (data.teachers || []).map((t) => ({ profile: "", employmentType: "staff", ...t, preferredRoomIds: Array.isArray(t.preferredRoomIds) ? t.preferredRoomIds : [] })),
+    departments: Array.isArray(data.departments) ? data.departments : [],
+    subjects: Array.isArray(data.subjects) ? data.subjects : [],
+    lessonTypes: Array.isArray(data.lessonTypes) ? data.lessonTypes : [],
+    rooms: (data.rooms || []).map((r) => ({ hasProjector: false, ...r })),
+    loads: Array.isArray(data.loads) ? data.loads : [],
+    practices: Array.isArray(data.practices) ? data.practices : [],
+    substitutions: Array.isArray(data.substitutions) ? data.substitutions : [],
+    retakes: Array.isArray(data.retakes) ? data.retakes : [],
+    interimAssessments: Array.isArray(data.interimAssessments) ? data.interimAssessments : [],
+    debtLiquidations: Array.isArray(data.debtLiquidations) ? data.debtLiquidations : [],
+    attestation: Array.isArray(data.attestation) ? data.attestation : [],
+    consultations: Array.isArray(data.consultations) ? data.consultations : [],
+    announcements: Array.isArray(data.announcements) ? data.announcements : [],
+    calendarExceptions: Array.isArray(data.calendarExceptions) ? data.calendarExceptions : [],
+    publishedWeeks: Array.isArray(data.publishedWeeks) ? data.publishedWeeks : [],
+    publicWeekSelectionEnabled: data.publicWeekSelectionEnabled === true,
+    schedule: data.schedule ? {
+      ...data.schedule,
+      instances: Array.isArray(data.schedule.instances) ? data.schedule.instances : [],
+      assignment: data.schedule.assignment || {},
+      unplaced: Array.isArray(data.schedule.unplaced) ? data.schedule.unplaced : [],
+      locked: Array.isArray(data.schedule.locked) ? data.schedule.locked : [],
+    } : { instances: [], assignment: {}, unplaced: [], locked: [] },
+    publicIntroText: data.publicIntroText || "",
+  };
 }
 
 function normalizeStoredData(raw) {
@@ -421,7 +654,7 @@ function normalizeStoredData(raw) {
   }));
   const interimAssessments = (data.interimAssessments || []).map((a) => ({ commissionTeacherIds: [], ...a }));
   for (const ex of migratedExamAssessments) if (!interimAssessments.some((a) => a.id === ex.id)) interimAssessments.push(ex);
-  const normalizedSchedule = normalizeScheduleInstanceIds(data.schedule);
+  const normalizedScheduleBase = normalizeScheduleInstanceIds(data.schedule);
   const persistedGraphState = (data.graphState && typeof data.graphState === "object") ? data.graphState : {};
   let normalizedLoadsBase = ensureUniqueIds((data.loads || []).map(normalizeLoad), "load");
   // v1520 migration: до разделения связок комбинированный/ДО поток хранился в
@@ -486,6 +719,8 @@ function normalizeStoredData(raw) {
     return load;
   });
 
+  const normalizedSchedule = pruneOrphanScheduleInstances(normalizedScheduleBase, normalizedLoads);
+
   const normalized = {
     ...data,
     config: { ...config, dailyLoadRules: normalizedDailyLoadRules(config), peExtraPairAllowed: config.peExtraPairAllowed !== false },
@@ -519,8 +754,9 @@ function normalizeStoredData(raw) {
     groupDayBlocks: Array.isArray(data.groupDayBlocks) ? data.groupDayBlocks : [], // {id,groupId,date,addedLockedIds[]}
     groupSlotBlocks: Array.isArray(data.groupSlotBlocks) ? data.groupSlotBlocks : [], // {id,groupId,date,period} — запрет только для авто
     groupDayFreezes: Array.isArray(data.groupDayFreezes) ? data.groupDayFreezes : [], // {id,groupId,date,addedLockedIds[]}
-    groupScheduleFreezes: Array.isArray(data.groupScheduleFreezes) ? data.groupScheduleFreezes : [], // полностью зафиксированные группы
+    groupScheduleFreezes: Array.isArray(data.groupScheduleFreezes) ? data.groupScheduleFreezes : [], // {id,groupId,addedLockedIds[]} — фиксирует всю группу
     interimAssessments,
+    debtLiquidations: Array.isArray(data.debtLiquidations) ? data.debtLiquidations : [],
     examSchedule: [],
     schedule: normalizedSchedule,
     scheduleVersions: data.scheduleVersions || [],
@@ -529,19 +765,23 @@ function normalizeStoredData(raw) {
     publicIntroText: data.publicIntroText || "",
     announcements: Array.isArray(data.announcements) ? data.announcements : [],
     consultations: Array.isArray(data.consultations) ? data.consultations : [],
+    publishedWeeks: Array.isArray(data.publishedWeeks) ? data.publishedWeeks.map(Number).filter((n)=>Number.isFinite(n)&&n>0) : [],
+    publicWeekSelectionEnabled: data.publicWeekSelectionEnabled === true,
     publishedSnapshot: data.publishedSnapshot || null,
     publishedAt: data.publishedAt || "",
     publishedBy: data.publishedBy || "",
   };
 
-  // v1850: НИКОГДА не перестраиваем расписание из графиков при обычной
-  // нормализации/загрузке проекта. Сохранённая сетка является самостоятельным
-  // источником истины: reload, autosave другого раздела, restart сервера или
-  // исправление weeklyPairs не должны менять instances/assignment/unplaced.
+  // v1636 SAFE READ CONTRACT:
+  // normalizeStoredData is used by initial load, reload, restore, version restore,
+  // publication rollback and server merge responses. It MUST be read-only for
+  // timetable semantics. In particular it must never call
+  // syncScheduleInstancesToGraph(), remap assignment, trim weeks, create repair
+  // tails, or unplace a lesson merely because data was opened in a browser.
   //
-  // Если в графике есть требование, которого нет в расписании, администратор
-  // добавляет его явно через «Восстановить пропавшие по графику». Это действие
-  // добавляет недостающее в «Неразмещённые», не двигая уже поставленные пары.
+  // Graph → schedule reconciliation is now allowed only from an explicit user
+  // edit in the «Графики» page (graphSet below). Potential historical anomalies
+  // stay visible until an explicit corrective action is requested.
   return normalized;
 }
 function weeksOverlap(instA, instB, config = null) {
@@ -626,8 +866,16 @@ function downloadTemplate(filename, headers, exampleRows) {
   XLSX.writeFile(wb, filename);
 }
 
+function sanitizeCellForExcel(val) {
+  if (typeof val === "string" && /^[=+\-@\t\r]/.test(val)) {
+    return "'" + val;
+  }
+  return val;
+}
+
 function downloadRowsXlsx(filename, sheetName, headers, rows) {
-  const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+  const safeRows = rows.map((r) => Array.isArray(r) ? r.map(sanitizeCellForExcel) : r);
+  const ws = XLSX.utils.aoa_to_sheet([headers, ...safeRows]);
   ws["!cols"] = headers.map((h, i) => ({ wch: Math.max(12, Math.min(36, Math.max(h.length + 2, ...rows.slice(0, 100).map((r) => String(r[i] ?? "").length + 2)))) }));
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, sheetName || "Данные");
@@ -653,6 +901,7 @@ function assignmentRoomIds(a) {
   return [...new Set([...legacy, ...additional].filter(Boolean))];
 }
 function assignmentRoomLabel(data, a) {
+  if (a?.roomPending) return "Аудитория на уточнении";
   return assignmentRoomIds(a).map((id) => data.rooms.find((r) => r.id === id)?.name).filter(Boolean).join(" + ");
 }
 function assignmentUsesExternalRoom(data, a) {
@@ -729,27 +978,104 @@ function linkedInPersonLoadRows(data, load) {
   const wanted = new Set([load.groupId, ...(load.streamGroupIds || [])].filter(Boolean));
   return loads.filter((row) => wanted.has(row.groupId) && row.subjectId === load.subjectId && row.teacherId === load.teacherId && row.typeId === load.typeId && Number(row.subgroup || 0) === Number(load.subgroup || 0));
 }
+// v1824: legacy stream instances may still contain a participant on weeks where
+// that participant no longer has this graph layer.  The current weekly graph is
+// authoritative; prune such stale participants from the client occurrence view.
+// This is deliberately conservative: if weeklyPairs are unavailable/legacy, keep
+// the participant rather than guessing.
+function loadHasGraphLayerForInstanceWeeks(data, load, inst) {
+  if (!load || !inst) return true;
+  if ((load.weekPattern || "perWeek") !== "perWeek") return true;
+  const entries = Object.entries(load.weeklyPairs || {});
+  if (!entries.length) return true;
+  const weeks = new Set(weekNumbersForInstance(data?.config || {}, inst).map(Number).filter(Number.isFinite));
+  if (!weeks.size) return true;
+  const layer = String(canonicalRequirementLayer(inst) || "1");
+  if (layer.startsWith("CARRY_")) return true;
+  for (const [weekRaw, countRaw] of entries) {
+    const week = Number(weekRaw);
+    if (!weeks.has(week)) continue;
+    const count = Math.max(0, Number(countRaw) || 0);
+    const whole = Math.floor(count + 1e-9);
+    if (layer === "H") {
+      if (count - whole >= 0.49) return true;
+    } else {
+      const n = Number(layer);
+      if (Number.isFinite(n) && n > 0 && whole >= n) return true;
+    }
+  }
+  return false;
+}
+
 function enrichInstanceStreamGroups(data, inst) {
   if (!inst) return inst;
-  const load = (data?.loads || []).find((l) => String(l.id) === String(inst.loadId));
+  const loadsById = loadByIdIndex(data);
+  const load = loadsById.get(String(inst.loadId));
   if (!load) return inst;
-  // v1810: loadId -> Нагрузка является источником истины для подгруппы.
-  // После ручной смены п/г старые schedule.instance могли продолжать хранить
-  // прежнее значение и давать ложный конфликт п/г1 с п/г2.
+
+  // v1812: все ключевые поля schedule.instance освежаются из Нагрузки.
+  // Это устраняет фантомную занятость старым teacherId/subjectId/typeId после
+  // редактирования строки нагрузки и делает карточку/конфликты единообразными.
   const authoritativeSubgroup = Number(load.subgroup) || 0;
-  const baseInst = Number(inst.subgroup || 0) === authoritativeSubgroup
-    ? inst
-    : { ...inst, subgroup: authoritativeSubgroup };
-  // v1529: очная и ДО-связки — разные контуры. Для конкретного occurrence
-  // добавляем только тот состав, который относится к его фактическому формату.
+  const normalizeParticipants = (items) => [...(Array.isArray(items) ? items : [])].map((part) => {
+    if (!part?.loadId) return part;
+    const partLoad = loadsById.get(String(part.loadId));
+    if (!partLoad) return part;
+    return { ...part, groupId: partLoad.groupId, subgroup: Number(partLoad.subgroup) || 0 };
+  });
+  const baseInst = {
+    ...inst,
+    groupId: load.groupId,
+    teacherId: load.teacherId,
+    subjectId: load.subjectId,
+    typeId: load.typeId,
+    subgroup: authoritativeSubgroup,
+    roomType: load.roomType || inst.roomType,
+    ...(Array.isArray(inst.streamParticipants) ? { streamParticipants: normalizeParticipants(inst.streamParticipants) } : {}),
+  };
+
+  // Состав конкретного occurrence остаётся авторитетным: не расширяем его
+  // до всего потока. Но номера подгрупп внутри этого состава уже освежены из loads.
+  const hasExplicitOccurrenceScope = Array.isArray(baseInst.streamParticipants) && Array.isArray(baseInst.streamGroupIds);
+  if (hasExplicitOccurrenceScope && !baseInst.isScheduleEvent && !baseInst.weekCopySnapshot) {
+    const allParts = [
+      { groupId:baseInst.groupId, subgroup:Number(baseInst.subgroup)||0, loadId:baseInst.loadId||"" },
+      ...normalizeParticipants(baseInst.streamParticipants),
+    ].filter((part)=>part?.groupId);
+    const activeParts = allParts.filter((part)=>{
+      const partLoad = part?.loadId ? loadsById.get(String(part.loadId)) : null;
+      return !partLoad || loadHasGraphLayerForInstanceWeeks(data, partLoad, baseInst);
+    });
+    // If at least one participant is still valid for these occurrence weeks,
+    // remove only the stale members.  This fixes old streams where, for example,
+    // 2-КДД-44 was still shown on a week that exists only for 2-КДД-40.
+    if (activeParts.length && activeParts.length !== allParts.length) {
+      const primaryPart = activeParts[0];
+      const primaryLoad = primaryPart.loadId ? loadsById.get(String(primaryPart.loadId)) : null;
+      return {
+        ...baseInst,
+        groupId:primaryPart.groupId,
+        subgroup:Number(primaryLoad?.subgroup ?? primaryPart.subgroup ?? 0) || 0,
+        loadId:primaryPart.loadId || baseInst.loadId || "",
+        teacherId:primaryLoad?.teacherId || baseInst.teacherId,
+        subjectId:primaryLoad?.subjectId || baseInst.subjectId,
+        typeId:primaryLoad?.typeId || baseInst.typeId,
+        streamParticipants:activeParts.slice(1).map((part)=>({
+          ...part,
+          subgroup:Number((part.loadId ? loadsById.get(String(part.loadId))?.subgroup : part.subgroup) ?? part.subgroup ?? 0) || 0,
+        })),
+        streamGroupIds:[...new Set(activeParts.slice(1).map((part)=>part.groupId).filter(Boolean))],
+        staleStreamParticipantsPruned:true,
+      };
+    }
+  }
+  if (baseInst.manualStreamBreak || baseInst.manualStreamSnapshot || baseInst.isScheduleEvent || hasExplicitOccurrenceScope) return baseInst;
+
+  // Очная и ДО-связки — разные контуры. Для occurrence добавляем только
+  // состав его фактического формата.
   const rows = baseInst.format === "remote" ? linkedRemoteLoadRows(data, load) : linkedInPersonLoadRows(data, load);
   const ids = new Set([baseInst.groupId, ...(baseInst.groupIds || []), ...(baseInst.streamGroupIds || []), load.groupId].filter(Boolean));
-  const participants = [...(Array.isArray(baseInst.streamParticipants) ? baseInst.streamParticipants : [])].map((part) => {
-    if (!part?.loadId) return part;
-    const partLoad = (data?.loads || []).find((l) => String(l.id) === String(part.loadId));
-    if (!partLoad || String(partLoad.groupId || "") !== String(part.groupId || "")) return part;
-    return { ...part, subgroup: Number(partLoad.subgroup) || 0 };
-  });
+  const participants = normalizeParticipants(baseInst.streamParticipants);
   for (const row of rows) {
     if (row?.groupId) ids.add(row.groupId);
     if (row?.groupId && row.id !== load.id && !participants.some((p) => p.loadId === row.id || (p.groupId === row.groupId && Number(p.subgroup || 0) === Number(row.subgroup || 0)))) {
@@ -762,7 +1088,149 @@ function enrichInstanceStreamGroups(data, inst) {
 function instanceGroupNames(data, inst) {
   const enriched = enrichInstanceStreamGroups(data, inst);
   const ids = [...new Set([enriched?.groupId, ...(enriched?.groupIds || []), ...(enriched?.streamGroupIds || [])].filter(Boolean))];
-  return ids.map((id) => data.groups.find((g) => g.id === id)?.name).filter(Boolean);
+  const names = ids.map((id) => data.groups.find((g) => g.id === id)?.name).filter(Boolean);
+  if (enriched?.externalGroupName && !names.includes(enriched.externalGroupName)) names.push(enriched.externalGroupName);
+  return names;
+}
+function instanceTeacherIds(inst) {
+  if (!inst) return [];
+  return [...new Set([
+    inst.teacherId,
+    ...(Array.isArray(inst.teacherIds) ? inst.teacherIds : []),
+  ].filter(Boolean).map(String))];
+}
+function instanceTeacherNames(data, inst) {
+  return instanceTeacherIds(inst)
+    .map((id) => (data?.teachers || []).find((t) => String(t.id) === String(id))?.name)
+    .filter(Boolean);
+}
+
+function clockMinutes(value) {
+  const m = String(value || "").trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = Number(m[1]), mm = Number(m[2]);
+  if (h < 0 || h > 23 || mm < 0 || mm > 59) return null;
+  return h * 60 + mm;
+}
+function parsePeriodClockRange(value) {
+  const parts = String(value || "").match(/(\d{1,2}:\d{2})/g) || [];
+  if (parts.length < 2) return null;
+  const start = clockMinutes(parts[0]), end = clockMinutes(parts[1]);
+  return start == null || end == null ? null : { start, end };
+}
+function eventStartsInsideAcademicPeriod(config, eventInst, period, dataContext = null, lessonInst = null, day = null) {
+  if (!eventInst?.isScheduleEvent) return false;
+  // v1729: the event editor records the exact timetable rows in which the
+  // event starts after the beginning of an academic pair. Trust that explicit
+  // marker first. This avoids client/server disagreement when selected groups
+  // use different bell schedules: the event may occupy several row numbers,
+  // but only its starting row is allowed to coexist with a lesson until the
+  // event's actual start time.
+  if ((eventInst.eventStartOverlapPeriods || []).map(Number).includes(Number(period))) return true;
+  const start = clockMinutes(eventInst.eventStartTime);
+  if (start == null) return false;
+  const standard = parsePeriodClockRange(config?.periodTimes?.[Number(period)] || "");
+  if (standard && start > standard.start && start < standard.end) return true;
+  if (!dataContext || !lessonInst || day == null) return false;
+  const shared = sharedParticipantGroupIds(lessonInst, eventInst);
+  const gids = shared.length ? shared : streamGroups(lessonInst).map(String);
+  const lessonWeeks = new Set(weekNumbersForInstance(config, lessonInst).map(Number));
+  const eventWeeks = new Set(weekNumbersForInstance(config, eventInst).map(Number));
+  const overlapWeeks = [...lessonWeeks].filter((w)=>eventWeeks.has(w));
+  for (const gid of gids) {
+    for (const week of (overlapWeeks.length ? overlapWeeks : [...lessonWeeks])) {
+      const raw = periodTimeForGroupDay(dataContext, gid, Number(day), Number(period), "", defaultParityForWeek(Number(week)));
+      const range = parsePeriodClockRange(raw || "");
+      if (range && start > range.start && start < range.end) return true;
+    }
+  }
+  return false;
+}
+function sharedParticipantGroupIds(a, b) {
+  const A = new Set(streamGroups(a).map(String));
+  return streamGroups(b).map(String).filter((gid)=>A.has(gid));
+}
+
+function eventStartOverlapPeriods(config, startTime, dataContext = null, groupIds = [], day = null, week = null) {
+  const start = clockMinutes(startTime);
+  if (start == null) return [];
+  const periodCount = Math.max(1, Number(config?.periodsPerDay || 6));
+  const out = new Set();
+  const inspect = (period, raw) => {
+    const r = parsePeriodClockRange(raw || "");
+    if (r && start > r.start && start < r.end) out.add(Number(period));
+  };
+  for (let period=0; period<periodCount; period++) inspect(period, config?.periodTimes?.[period] || "");
+  if (dataContext && day != null) {
+    const parity = week ? defaultParityForWeek(Number(week)) : null;
+    for (const gid of (groupIds || [])) {
+      for (let period=0; period<periodCount; period++) {
+        inspect(period, periodTimeForGroupDay(dataContext, String(gid), Number(day), period, "", parity));
+      }
+    }
+  }
+  return [...out].sort((a,b)=>a-b);
+}
+
+function eventOccupiedPeriods(config, startTime, endTime, dataContext = null, groupIds = [], day = null, week = null) {
+  const start = clockMinutes(startTime), end = clockMinutes(endTime);
+  if (start == null || end == null || end <= start) return [];
+  const periodCount = Math.max(1, Number(config?.periodsPerDay || 6));
+  const rangesByPeriod = new Map();
+  const addRange = (period, raw) => {
+    const r = parsePeriodClockRange(raw || "");
+    if (!r) return;
+    if (!rangesByPeriod.has(period)) rangesByPeriod.set(period, []);
+    rangesByPeriod.get(period).push(r);
+  };
+  for (let period=0; period<periodCount; period++) addRange(period, config?.periodTimes?.[period] || "");
+  if (dataContext && day != null) {
+    const parity = week ? defaultParityForWeek(Number(week)) : null;
+    for (const gid of (groupIds || [])) {
+      for (let period=0; period<periodCount; period++) {
+        addRange(period, periodTimeForGroupDay(dataContext, String(gid), Number(day), period, "", parity));
+      }
+    }
+  }
+  const periods=[];
+  for (const [period, ranges] of rangesByPeriod) {
+    if (ranges.some((r)=>start < r.end && end > r.start)) periods.push(Number(period));
+  }
+  if (periods.length) return [...new Set(periods)].sort((a,b)=>a-b);
+
+  const flat=[...rangesByPeriod.entries()].flatMap(([period,ranges])=>ranges.map((r)=>({period,...r})));
+  if (!flat.length) return [0];
+  let best=flat[0], bestDist=Infinity;
+  for (const r of flat) {
+    const mid=(r.start+r.end)/2, dist=Math.abs(start-mid);
+    if (dist<bestDist) { bestDist=dist; best=r; }
+  }
+  return [Number(best.period)];
+}
+// v1719: для публичного расписания преподавателя/аудитории подгруппа
+// подписывается рядом с КАЖДОЙ конкретной группой, а не одной общей меткой
+// у названия занятия. Это особенно важно для потоков из разных подгрупп.
+function publicParticipantGroupLabels(data, inst, combinedSubgroups = null) {
+  const enriched = enrichInstanceStreamGroups(data, inst || {});
+  const ids = [...new Set(streamGroups(enriched).filter(Boolean))];
+  if (!ids.length && enriched?.groupId) ids.push(enriched.groupId);
+  const combined = Array.isArray(combinedSubgroups)
+    ? [...new Set(combinedSubgroups.map(Number).filter((x)=>x>0))].sort((a,b)=>a-b)
+    : [];
+  return ids.map((groupId) => {
+    const groupName = (data?.groups || []).find((g) => String(g?.id) === String(groupId))?.name || "";
+    if (!groupName) return "";
+    let subs = normalizedParticipantSubgroups(data, enriched, groupId);
+    // Когда публичный контур схлопнул две параллельные карточки п/г 1 + п/г 2
+    // в одну, состав второй карточки уже не лежит внутри inst. Передаём его явно.
+    if (combined.length && String(groupId) === String(enriched.groupId || "")) {
+      subs = [...new Set([...(subs || []), ...combined])];
+    }
+    if (!subs.length || subs.includes(0)) return groupName;
+    const concrete = [...new Set(subs.filter((x) => Number(x) > 0).map(Number))].sort((a,b)=>a-b);
+    if (!concrete.length) return groupName;
+    return `${groupName} (п/г ${concrete.join(", ")})`;
+  }).filter(Boolean);
 }
 
 async function sha256Hex(text) {
@@ -865,6 +1333,7 @@ function buildSeed() {
     substitutions: [], // { id, date, instId, type: 'sub'|'cancel', newTeacherId, newRoomId, note }
     retakes: [], // { id, date, period, groupId, subjectId, teacherId, roomId, note }
     interimAssessments: [], // { id, academicYear, groupId, subjectId, teacherId, date, period, roomId, kind, note }
+    debtLiquidations: [], // { id, academicYear, session, groupId, subjectId, controlKind, date, time, roomId, mode, teacherId, chairTeacherId, memberTeacherIds, note }
     attestationTypes: ["зачёт", "экзамен", "курсовая работа", "дифф. зачёт"],
     practices: [], // { id, groupId, kind, name, teacherId, dateStart, dateEnd, note, roomBookings:[{id,date,period,roomId}] }
     calendarExceptions: [], // {id,date,kind,name,noClasses}
@@ -1004,8 +1473,77 @@ function streamParticipants(inst) {
   return [{ groupId: inst.groupId, subgroup: Number(inst.subgroup) || 0, loadId: inst.loadId || "" },
     ...((inst.streamGroupIds || []).filter(Boolean).map((groupId) => ({ groupId, subgroup: Number(inst.subgroup) || 0, loadId: "" })))];
 }
+function effectiveInstanceGroupIds(inst) {
+  if (!inst) return [];
+  const out = [];
+  const add = (value) => { if (value != null && String(value)) out.push(String(value)); };
+  add(inst.groupId);
+  const transferScoped = !!(inst.manualStreamBreak || inst.transferSubgroupDetached || inst.transferSubgroupRetained || inst.transferredLoadRemainder);
+  if (!transferScoped || inst.isScheduleEvent === true) {
+    for (const gid of (inst.groupIds || [])) add(gid);
+  }
+  const explicit = Array.isArray(inst.streamParticipants) ? inst.streamParticipants : [];
+  const hasExplicit = explicit.some((p) => p?.groupId);
+  if (hasExplicit) {
+    for (const p of explicit) add(p?.groupId);
+  } else {
+    for (const gid of (inst.streamGroupIds || [])) add(gid);
+  }
+  return [...new Set(out)];
+}
 function streamGroups(inst) {
-  return [...new Set(streamParticipants(inst).map((p) => p.groupId).filter(Boolean))];
+  // v1891: membership (which public/group pages need) is wider than the
+  // detailed participant list: legacy stream cards may store secondary groups
+  // only in groupIds.  Keep transfer-split stale groupIds excluded above.
+  return effectiveInstanceGroupIds(inst);
+}
+// v1618: сложная потоковая связка из нескольких подгрупп должна выглядеть
+// как единый поток, а не как "п/г 1" основной строки. Например, если в один
+// ДО-поток объединены п/г 1 и 2 сразу у трёх групп (6 подгрупп), в карточке
+// показываем только значок "поток".
+function isMultiSubgroupStream(inst) {
+  const parts = streamParticipants(inst).filter((p) => Number(p.subgroup || 0) > 0);
+  if (parts.length < 2) return false;
+  const groups = new Map();
+  for (const p of parts) {
+    if (!groups.has(p.groupId)) groups.set(p.groupId, new Set());
+    groups.get(p.groupId).add(Number(p.subgroup) || 0);
+  }
+  // Главный признак сложной связки: хотя бы одна участвующая группа представлена
+  // несколькими подгруппами. Это отличает её от обычного потока "п/г 1 трёх групп".
+  return [...groups.values()].some((subs) => subs.size > 1);
+}
+function authoritativeSubgroupForInstance(data, inst) {
+  if (!inst) return 0;
+  const loads = Array.isArray(data?.loads) ? data.loads : [];
+  const loadId = String(inst.loadId || "");
+  if (loadId) {
+    const load = loads.find((l) => String(l?.id || "") === loadId);
+    if (load && String(load.groupId || "") === String(inst.groupId || "")) {
+      return Number(load.subgroup || 0);
+    }
+  }
+  return Number(inst.subgroup || 0);
+}
+function scheduleSubgroupLabel(data, inst, groupId = "") {
+  if (!inst) return "";
+  const targetGroups = groupId ? [String(groupId)] : streamGroups(inst).map(String);
+  const subgroupSet = new Set();
+  for (const gid of targetGroups) {
+    for (const sg of normalizedParticipantSubgroups(data, inst, gid)) {
+      const n = Number(sg || 0);
+      if (n === 0) return ""; // занятие всей группы — подпись подгруппы не нужна
+      if (n > 0) subgroupSet.add(n);
+    }
+  }
+  // Fallback для старых одиночных записей без полноценного состава потока.
+  if (!subgroupSet.size) {
+    const subgroup = authoritativeSubgroupForInstance(data, inst);
+    if (subgroup > 0) subgroupSet.add(subgroup);
+  }
+  const concrete = [...subgroupSet].sort((a,b)=>a-b);
+  if (!concrete.length) return "";
+  return ` · п/г ${concrete.join(", ")}`;
 }
 function subgroupsForGroup(inst, groupId) {
   return streamParticipants(inst).filter((p) => p.groupId === groupId).map((p) => Number(p.subgroup) || 0);
@@ -1020,7 +1558,7 @@ function participantSubgroupsOverlap(a, b, groupId) {
 // хотя реальная строка нагрузки относится только к п/г 1 или п/г 2.
 // Источник истины — loadId -> loads; metadata экземпляра используется только как fallback.
 function normalizedParticipantSubgroups(data, inst, groupId) {
-  const loadsById = new Map((data?.loads || []).map((l) => [l.id, l]));
+  const loadsById = loadByIdIndex(data);
   const authoritative = [];
   const fallback = [];
   for (const part of streamParticipants(inst || {})) {
@@ -1044,12 +1582,59 @@ function normalizedParticipantSubgroupsOverlap(data, a, b, groupId) {
   return aa.some((sa) => bb.some((sb) => subgroupOverlap(sa, sb)));
 }
 function belongsToGroup(inst, groupId) {
-  return streamGroups(inst).includes(groupId);
+  return streamGroups(inst).map(String).includes(String(groupId));
+}
+
+// v1676: group timetable pages must not upload/download the whole semester on
+// every debounce. Keep the exact same merge semantics, but serialize only the
+// selected group's slice (shared stream rows included).
+function scheduleSliceForGroupClient(schedule, groupId) {
+  const src = schedule || {};
+  const rows = (src.instances || []).filter((row) => belongsToGroup(row, groupId));
+  const ids = new Set(rows.map((row) => String(row?.instId || '')).filter(Boolean));
+  const assignment = {};
+  for (const [id, value] of Object.entries(src.assignment || {})) if (ids.has(String(id))) assignment[id] = value;
+  return {
+    ...src,
+    instances: rows,
+    assignment,
+    locked: (src.locked || []).filter((id) => ids.has(String(id))),
+    unplaced: (src.unplaced || []).filter((id) => ids.has(String(id))),
+  };
+}
+function replaceScheduleGroupSliceClient(schedule, slice, groupId) {
+  const src = schedule || {};
+  const incoming = slice || {};
+  const oldGroupIds = new Set((src.instances || []).filter((row) => belongsToGroup(row, groupId)).map((row) => String(row?.instId || '')).filter(Boolean));
+  const keptRows = (src.instances || []).filter((row) => !belongsToGroup(row, groupId));
+  const incomingRows = incoming.instances || [];
+  const incomingIds = new Set(incomingRows.map((row) => String(row?.instId || '')).filter(Boolean));
+  const assignment = {};
+  for (const [id, value] of Object.entries(src.assignment || {})) if (!oldGroupIds.has(String(id))) assignment[id] = value;
+  Object.assign(assignment, incoming.assignment || {});
+  const locked = new Set((src.locked || []).filter((id) => !oldGroupIds.has(String(id))));
+  for (const id of (incoming.locked || [])) locked.add(String(id));
+  const unplaced = new Set((src.unplaced || []).filter((id) => !oldGroupIds.has(String(id))));
+  for (const id of (incoming.unplaced || [])) if (!assignment[String(id)]) unplaced.add(String(id));
+  return {
+    ...src,
+    ...incoming,
+    instances: [...keptRows, ...incomingRows],
+    assignment,
+    locked: [...locked].filter((id) => assignment[id] || incomingIds.has(id)),
+    unplaced: [...unplaced].filter((id) => !assignment[id]),
+  };
+}
+function rowsForGroupClient(rows, groupId) {
+  return (rows || []).filter((row) => String(row?.groupId || '') === String(groupId || ''));
+}
+function replaceRowsForGroupClient(rows, incoming, groupId) {
+  return [...(rows || []).filter((row) => String(row?.groupId || '') !== String(groupId || '')), ...(incoming || [])];
 }
 
 // v1619: один преподаватель может одновременно вести две разные подгруппы
-// ОДНОЙ группы как одно фактически объединённое занятие — и ОЧНО, и ДО.
-// Разрешаем это только для одинаковых дисциплины, вида занятия и формата; потоки/разные группы не
+// ОДНОЙ группы как одно фактически объединённое занятие. Разрешаем это только
+// для одинаковых дисциплины, вида занятия и формата; потоки/разные группы не
 // попадают под исключение. Это защищает от случайного разрешения преподавателю
 // вести два разных предмета одновременно.
 function sameTeacherSiblingSubgroupsCompatible(a, b) {
@@ -1063,6 +1648,44 @@ function sameTeacherSiblingSubgroupsCompatible(a, b) {
   if (ag.length !== 1 || bg.length !== 1 || ag[0] !== bg[0]) return false;
   const asg = Number(a.subgroup || 0), bsg = Number(b.subgroup || 0);
   return asg > 0 && bsg > 0 && asg !== bsg;
+}
+
+// v1612: разные технические экземпляры одного и того же потока не являются
+// двойной занятостью преподавателя/аудитории. После синхронизации нагрузки
+// один поток может быть представлен несколькими instId — по строке участника,
+// но фактически это одна общая пара.
+function sameLogicalStreamLesson(a, b) {
+  if (!a || !b || a.instId === b.instId) return false;
+  if (!a.teacherId || String(a.teacherId) !== String(b.teacherId || "")) return false;
+  if (String(a.subjectId || "") !== String(b.subjectId || "")) return false;
+  if (String(a.typeId || "") !== String(b.typeId || "")) return false;
+  if ((a.format || "inperson") !== (b.format || "inperson")) return false;
+
+  const aStreamId = String(a.streamId || "");
+  const bStreamId = String(b.streamId || "");
+  if (aStreamId && bStreamId && aStreamId === bStreamId) return true;
+
+  const ag = [...new Set(streamGroups(a).map(String))].sort();
+  const bg = [...new Set(streamGroups(b).map(String))].sort();
+
+  // v1721: у ДО-потока после ручной смены формата/старой потоковой пересборки
+  // рядом с канонической многогрупповой карточкой может временно жить её
+  // одно-групповой технический хвост. Это не две пары преподавателя.
+  // Для дистанта считаем такие subset-копии одной логической парой, если
+  // предмет/преподаватель/вид уже совпали выше и хотя бы одна сторона — поток.
+  if ((a.format || "inperson") === "remote" && (ag.length > 1 || bg.length > 1)) {
+    const aset = new Set(ag), bset = new Set(bg);
+    const overlap = ag.some((gid)=>bset.has(gid));
+    const subset = ag.every((gid)=>bset.has(gid)) || bg.every((gid)=>aset.has(gid));
+    if (overlap && subset) return true;
+  }
+
+  // Потоком считаем только многогрупповую связку. Для обычных одиночных
+  // занятий одинаковые группа/предмет/преподаватель не должны автоматически
+  // превращаться в "одну пару".
+  if (ag.length < 2 || bg.length < 2) return false;
+  if (ag.length !== bg.length) return false;
+  return ag.every((gid, i) => gid === bg[i]);
 }
 
 function computeOccupancy(assignment, instances) {
@@ -1104,24 +1727,46 @@ function roomIdsEquivalent(rooms, a, b) {
   return !!na && na === nb;
 }
 
-function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null, allowMixedDayFormat = false) {
-  const inst = instances.find((i) => i.instId === instId);
+function canPlace(assignment, instances, rooms, instId, day, period, roomId, extraRoomId = null, proposedHalf = undefined, config = null, allowMixedDayFormat = false, dataContext = null) {
+  // v1609: this function is called many times while choosing a room.
+  // Building one id->instance map changes repeated linear .find() calls inside
+  // the assignment loop from O(N*A) to O(N+A) per validation.
+  const instanceById = new Map((instances || []).map((i) => [String(i?.instId || ""), i]));
+  const assignmentEntries = Object.entries(assignment || {});
+  const inst = instanceById.get(String(instId));
   if (!inst) return { ok: false, reason: "Занятие не найдено" };
 
-  const overlaps = (other) => !!other && weeksOverlap(other, inst, config);
+  const proposedAssignment = { ...(assignment?.[instId] || {}), day:Number(day), period:Number(period), half:proposedHalf ?? assignment?.[instId]?.half ?? null };
+  const proposedVisibleWeeks = dataContext ? visibleWeeksForAssignedOccurrence(dataContext, inst, proposedAssignment) : null;
+  if (dataContext && !proposedVisibleWeeks.length) return { ok:false, reason:"На выбранных неделях этот день закрыт, находится вне семестра или перекрыт практикой" };
+  const overlaps = (other, otherAssignment) => {
+    if (!other) return false;
+    if (!dataContext) return weeksOverlap(other, inst, config);
+    const otherWeeks = new Set(visibleWeeksForAssignedOccurrence(dataContext, other, otherAssignment || {}));
+    return proposedVisibleWeeks.some((w)=>otherWeeks.has(Number(w)));
+  };
   const sameParticipantGroup = (other) => streamGroups(inst).some((gid) =>
     belongsToGroup(other, gid) && (dataContext
       ? normalizedParticipantSubgroupsOverlap(dataContext, other, inst, gid)
       : participantSubgroupsOverlap(other, inst, gid)));
-  const siblingTeacherPartnersAt = (half) => Object.entries(assignment || {}).filter(([otherId, a]) => {
-    if (otherId === instId || !a || Number(a.day) !== Number(day) || Number(a.period) !== Number(period)) return false;
-    const other = instances.find((i) => i.instId === otherId);
-    if (!other || !weeksOverlap(other, inst, config)) return false;
+  const siblingTeacherPartnersAt = (half) => assignmentEntries.filter(([otherId, a]) => {
+    if (String(otherId) === String(instId) || !a || Number(a.day) !== Number(day) || Number(a.period) !== Number(period)) return false;
+    const other = instanceById.get(String(otherId));
+    if (!other || !overlaps(other, a)) return false;
     const sameHalf = a.half == null || half == null || Number(a.half) === Number(half);
     return sameHalf && !inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId;
   });
+  // v1618: новая 0,5-пара сначала всегда пробует 1-ю часть (half=0).
+  // Если пара уже стояла, при переносе сначала сохраняем её прежнюю половину.
+  const previousHalf = assignment?.[instId]?.half;
   const halfCandidates = inst.halfPair
-    ? [...new Set([proposedHalf, assignment?.[instId]?.half, 0, 1].filter((h) => h === 0 || h === 1).map(Number))]
+    ? [...new Set([
+        proposedHalf,
+        previousHalf,
+        ...(previousHalf === 0 || previousHalf === 1 ? [] : [0]),
+        0,
+        1,
+      ].filter((h) => h === 0 || h === 1).map(Number))]
     : [null];
 
   // Аудиторные требования не зависят от выбранной половины пары.
@@ -1153,14 +1798,15 @@ function canPlace(assignment, instances, rooms, instId, day, period, roomId, ext
   for (const half of halfCandidates) {
     let reason = "";
     const teacherPartners = siblingTeacherPartnersAt(half);
-    const allowedSiblingTeacherId = teacherPartners.length === 1 && sameTeacherSiblingSubgroupsCompatible(inst, instances.find((i) => i.instId === teacherPartners[0][0])) ? teacherPartners[0][0] : null;
-    // v1631: sibling subgroups of one group with one teacher may use
-    // the same OR different rooms simultaneously.
+    const allowedSiblingTeacherId = teacherPartners.length === 1 && sameTeacherSiblingSubgroupsCompatible(inst, instanceById.get(String(teacherPartners[0][0]))) ? teacherPartners[0][0] : null;
+    // v1631: две разные подгруппы ОДНОЙ группы у одного преподавателя
+    // могут идти одновременно как в одной, так и в РАЗНЫХ аудиториях.
+    // Совместимость определяется предметом/типом/форматом/подгруппой, а не roomId.
     if (reason) { firstReason = reason; continue; }
-    for (const [otherId, a] of Object.entries(assignment || {})) {
-      if (otherId === instId || !a) continue;
-      const other = instances.find((i) => i.instId === otherId);
-      if (!other || !overlaps(other)) continue;
+    for (const [otherId, a] of assignmentEntries) {
+      if (String(otherId) === String(instId) || !a) continue;
+      const other = instanceById.get(String(otherId));
+      if (!other || !overlaps(other, a)) continue;
 
       // Формат дня должен совпадать только на реально пересекающихся неделях.
       // v1613: `allowMixedDayFormat` is a manual-only override (never set by
@@ -1169,8 +1815,17 @@ function canPlace(assignment, instances, rooms, instId, day, period, roomId, ext
       // person deliberately place an in-person lesson on an otherwise-ДО day
       // for that group/teacher, or vice versa.
       if (!allowMixedDayFormat && a.day === day && other.format !== inst.format) {
-        if (sameParticipantGroup(other)) { reason = `В этот день у группы уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
-        if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId) { reason = `В этот день у преподавателя уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
+        if (sameParticipantGroup(other) && !other.isScheduleEvent) { reason = `В этот день у группы уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`; break; }
+        const teacherOverlap = !inst.isVacancyTeacher && !other.isVacancyTeacher &&
+          instanceTeacherIds(inst).some((tid)=>instanceTeacherIds(other).includes(String(tid)));
+        const eventMidPairTeacherOverlap =
+          teacherOverlap &&
+          other.isScheduleEvent &&
+          eventStartsInsideAcademicPeriod(config, other, period, dataContext, inst, day);
+        if (teacherOverlap && !eventMidPairTeacherOverlap) {
+          reason = `В этот день у преподавателя уже стоят занятия ${other.format === "remote" ? "дистанционно" : "очно"} на пересекающихся неделях — весь день недели должен быть в одном формате`;
+          break;
+        }
       }
       if (a.day !== day || a.period !== period) continue;
 
@@ -1178,11 +1833,42 @@ function canPlace(assignment, instances, rooms, instId, day, period, roomId, ext
       // один номер пары, если занимают разные половины.
       const sameHalf = (a.half == null || half == null || Number(a.half) === Number(half));
       if (!sameHalf) continue;
-      if (!inst.isVacancyTeacher && !other.isVacancyTeacher && other.teacherId === inst.teacherId && otherId !== allowedSiblingTeacherId) { reason = "Преподаватель занят в это время на пересекающихся неделях"; break; }
-      if (sameParticipantGroup(other)) { reason = "У группы/подгруппы уже есть занятие в это время на пересекающихся неделях"; break; }
+      const teacherOverlap = !inst.isVacancyTeacher && !other.isVacancyTeacher &&
+        instanceTeacherIds(inst).some((tid)=>instanceTeacherIds(other).includes(String(tid)));
+
+      // v1625: если мероприятие начинается ВНУТРИ учебной пары,
+      // совпадающий преподаватель тоже не блокирует постановку этой пары:
+      // он уходит на мероприятие в момент его начала вместе с группой.
+      const teacherMayLeaveMidPair =
+        teacherOverlap &&
+        other.isScheduleEvent &&
+        eventStartsInsideAcademicPeriod(config, other, period, dataContext, inst, day);
+
+      if (teacherOverlap && !teacherMayLeaveMidPair && otherId !== allowedSiblingTeacherId) {
+        reason = "Преподаватель занят в это время на пересекающихся неделях";
+        break;
+      }
+
+      if (sameParticipantGroup(other)) {
+        const groupMayLeaveMidPair =
+          other.isScheduleEvent &&
+          eventStartsInsideAcademicPeriod(config, other, period, dataContext, inst, day) &&
+          sharedParticipantGroupIds(inst, other).length > 0;
+        if (!groupMayLeaveMidPair) {
+          reason = "У группы/подгруппы уже есть занятие в это время на пересекающихся неделях";
+          break;
+        }
+      }
       if (inst.format !== "remote") {
         const occupiedRooms = new Set(assignmentRoomIds(a));
-        if (otherId !== allowedSiblingTeacherId && selectedRooms.some((r)=>[...occupiedRooms].some((rid)=>roomIdsEquivalent(rooms, rid, r.id)))) { reason = "Одна из аудиторий занята в это время на пересекающихся неделях"; break; }
+        // v1728: если мероприятие начинается внутри текущей учебной пары,
+        // занятие может идти в этой же аудитории до момента начала мероприятия.
+        // Группа/преподаватель уже имеют такое исключение выше; аудитория должна
+        // подчиняться той же логике, иначе ручная постановка всё равно блокировалась.
+        const roomMayPassToMidPairEvent =
+          other.isScheduleEvent &&
+          eventStartsInsideAcademicPeriod(config, other, period, dataContext, inst, day);
+        if (!roomMayPassToMidPairEvent && otherId !== allowedSiblingTeacherId && selectedRooms.some((r)=>[...occupiedRooms].some((rid)=>roomIdsEquivalent(rooms, rid, r.id)))) { reason = "Одна из аудиторий занята в это время на пересекающихся неделях"; break; }
       }
     }
     if (!reason) return { ok: true, half };
@@ -1271,9 +1957,16 @@ function generateSchedule(data, prior, perfScope = null) {
     });
   };
   // v1695: weeklyPairs хранит КОЛИЧЕСТВО ПАР, а не академические часы.
-  // Значение 2 у потока означает две отдельные пары этой недели.
+  // Это видно и в самом графике: сумма weeklyPairs показывается как «пар»,
+  // а справа часы = пары × 2. Поэтому значение 2 у потока означает ДВЕ пары
+  // на этой неделе, а не одну пару из двух академических часов.
   // Половинная механика относится только к конкретной подгрупповой строке.
-  const loadMayUseHalfPair = (l) => Number(l?.subgroup || 0) > 0;
+  // v1618: значение 0,5 в графике — это реальная половина пары
+  // (1 академический час) для ЛЮБОЙ строки нагрузки.
+  // Старое ограничение subgroup>0 приводило к полной потере обычной
+  // нагрузки 0,5: __H-instance вообще не создавался, поэтому его не было
+  // ни в расписании, ни в «Не размещено».
+  const loadMayUseHalfPair = (_l) => true;
   const occurrencePairUnitsForLoad = (_l, raw) => Math.max(0, Number(raw) || 0);
   const occurrenceKeysForLoad = (l) => {
     const keys = [];
@@ -1309,10 +2002,9 @@ function generateSchedule(data, prior, perfScope = null) {
   };
   const occurrenceKeyUnits = (key) => String(key).endsWith(":H") ? 0.5 : 1;
   const graphPairUnitsForLoad = (load) => occurrenceKeysForLoad(load).reduce((sum,key)=>sum+occurrenceKeyUnits(key),0);
-  // v1724: часы у участников лекционного потока могут различаться. Поэтому
-  // лимит считается для КАЖДОЙ строки/группы отдельно, а не общим минимумом
-  // потока. Общий поток берёт только пересекающийся объём; лишние слои остаются
-  // у тех групп, которым они действительно положены по учебному плану.
+  // v1724: участники лекционного потока могут иметь разный объём часов.
+  // Каждый участник ограничивается своим учебным планом; общий поток занимает
+  // только совпадающий объём, а дополнительные слои остаются у групп с большим лимитом.
   const lectureStreamPairLimitForLoad = (load, bucket=[]) => {
     const plan = curriculumPairLimitForLoad(load);
     if (plan == null) return null;
@@ -1335,27 +2027,16 @@ function generateSchedule(data, prior, perfScope = null) {
     }
     return out;
   };
+  // v1764: для потоков ГРАФИК — единственный источник состава week:layer.
+  // Нельзя дополнять участнику отсутствующие слои из соседней группы и нельзя
+  // урезать их расчётным лимитом учебного плана: именно это давало эффект
+  // «по графику 2 пары, а у одной группы в потоке осталась 1» и могло скрывать
+  // поточную лекцию на конкретной неделе. Каждый участник входит только в те
+  // week:layer, которые прямо записаны в его loads[].weeklyPairs.
   const lectureStreamMembership = (bucket) => {
-    const ordered = [...new Set((bucket||[]).flatMap(occurrenceKeysForLoad))].sort((a,b)=>{
-      const aw=Number(String(a).split(":")[0])||0, bw=Number(String(b).split(":")[0])||0;
-      return aw-bw || occurrenceLayerOrder(a)-occurrenceLayerOrder(b);
-    });
     const result = new Map();
     for (const load of bucket || []) {
-      const cap = lectureStreamPairLimitForLoad(load, bucket);
-      const explicit = new Set(capOccurrenceKeysToPairs(occurrenceKeysForLoad(load), cap));
-      let used = [...explicit].reduce((sum,key)=>sum+occurrenceKeyUnits(key),0);
-      const effectiveCap = cap == null ? used : cap;
-      // Старые несинхронные строки потока: если одна группа содержала общий слой,
-      // а у другой ячейка была пустой, достраиваем общий слой до ЕЁ собственного
-      // лимита. При меньшем числе часов группа просто перестаёт участвовать дальше.
-      for (const key of ordered) {
-        if (explicit.has(key)) continue;
-        const units=occurrenceKeyUnits(key);
-        if (used+units > effectiveCap+1e-9) continue;
-        explicit.add(key); used+=units;
-      }
-      result.set(String(load.id||""), explicit);
+      result.set(String(load.id||""), new Set(occurrenceKeysForLoad(load)));
     }
     return result;
   };
@@ -1364,64 +2045,58 @@ function generateSchedule(data, prior, perfScope = null) {
       const aw=Number(String(a).split(":")[0])||0, bw=Number(String(b).split(":")[0])||0;
       return aw-bw || occurrenceLayerOrder(a)-occurrenceLayerOrder(b);
     });
+    // v1589: в комбинированном режиме ДО жёстко ограничено 50%.
+    // Используем floor, чтобы на нечётном числе слоёв никогда не превысить 50%.
+    const pct = 50;
     if (!commonKeys.length) return new Set();
-
-    // v1708: «Можно ДО» больше не имеет жёсткого ритма вида
-    // очно/ДО/очно/ДО или «первая пара недели всегда очно».
-    // Формат пересчитывается заново из текущего weeklyPairs. Сохраняем только
-    // мягкое ограничение по доле ДО (для авто режима максимум 50%) и стараемся
-    // равномерно распределить ДО по всему фактическому графику.
-    const pct = Math.max(0, Math.min(50, Number(remotePercent) || 50));
     const requested = Math.max(0, Math.min(commonKeys.length, Math.floor((commonKeys.length * pct + 1e-9) / 100)));
-    if (requested <= 0) return new Set();
-
     const byWeek = new Map();
     for (const key of commonKeys) {
-      const week = Number(String(key).split(":")[0]) || 0;
+      const week = Number(String(key).split(":")[0]);
       if (!byWeek.has(week)) byWeek.set(week, []);
       byWeek.get(week).push(key);
     }
     for (const list of byWeek.values()) list.sort((a,b)=>occurrenceLayerOrder(a)-occurrenceLayerOrder(b));
-
-    // Кандидаты не запрещаются жёстко. Штрафы лишь помогают оставить
-    // очное присутствие в неделе, когда это возможно, и не складывать всё ДО
-    // подряд. При изменении графика набор и порядок кандидатов пересчитываются.
-    const weekSelected = new Map();
-    const selected = new Set();
-    const targetPositions = Array.from({length: requested}, (_,i)=>
-      Math.min(commonKeys.length-1, Math.floor((i + 0.5) * commonKeys.length / requested))
-    );
-
-    for (let pick=0; pick<requested; pick++) {
-      const target = targetPositions[pick];
-      let bestKey = null, bestScore = Infinity;
-      for (let idx=0; idx<commonKeys.length; idx++) {
-        const key = commonKeys[idx];
-        if (selected.has(key)) continue;
-        const [weekRaw] = String(key).split(":");
-        const week = Number(weekRaw) || 0;
-        const weekList = byWeek.get(week) || [];
-        const already = weekSelected.get(week) || 0;
-        const wouldConsumeWholeWeek = already + 1 >= weekList.length;
-
-        let score = Math.abs(idx - target);
-        // Это именно штраф, не запрет: если другого разумного варианта нет,
-        // единственная пара недели тоже может стать ДО.
-        if (wouldConsumeWholeWeek) score += weekList.length > 1 ? 2.5 : 1.25;
-        score += already * 1.5; // распределяем ДО между неделями
-        if (preferRemoteFirst) score += occurrenceLayerOrder(key) * 0.05;
-
-        // Не любим соседние ДО-слои, но допускаем их при необходимости.
-        if (idx > 0 && selected.has(commonKeys[idx-1])) score += 1.0;
-        if (idx + 1 < commonKeys.length && selected.has(commonKeys[idx+1])) score += 1.0;
-
-        if (score < bestScore - 1e-9) { bestScore = score; bestKey = key; }
+    const activeWeeks=[...byWeek.keys()].sort((a,b)=>a-b);
+    const allowedRemote=[];
+    if (preferRemoteFirst) {
+      // v1599: комбинированная Лек строится в порядке ДО-поток -> очно.
+      // При 2+ лекциях в неделю хотя бы последняя остаётся очной, а ДО берём
+      // с первых слоёв. При одной лекции в неделю чередование начинается с ДО.
+      const maxRemoteLayer=Math.max(0,...activeWeeks.map((week)=>Math.max(0,(byWeek.get(week)||[]).length-1)));
+      for (let layerIndex=0; layerIndex<maxRemoteLayer; layerIndex++) {
+        for (const week of activeWeeks) {
+          const list=byWeek.get(week)||[];
+          if (list.length>=2 && layerIndex<list.length-1) allowedRemote.push(list[layerIndex]);
+        }
       }
-      if (bestKey == null) break;
-      selected.add(bestKey);
-      const week = Number(String(bestKey).split(":")[0]) || 0;
-      weekSelected.set(week, (weekSelected.get(week) || 0) + 1);
+      activeWeeks.forEach((week,activeIndex)=>{
+        const list=byWeek.get(week)||[];
+        if (list.length===1 && activeIndex%2===0) allowedRemote.push(list[0]);
+      });
+    } else {
+      activeWeeks.forEach((week,activeIndex)=>{
+        const list=byWeek.get(week)||[];
+        if (list.length >= 2) {
+          // Для прочих комбинированных занятий сохраняем минимум одну очную пару
+          // в начале недели, а ДО распределяем по остальным слоям.
+          allowedRemote.push(...list.slice(1));
+        } else if (list.length === 1 && activeIndex % 2 === 1) {
+          // При одной паре: очно / ДО / очно / ДО по активным неделям.
+          allowedRemote.push(list[0]);
+        }
+      });
     }
+    const target=Math.min(requested,allowedRemote.length);
+    if (target<=0) return new Set();
+    if (preferRemoteFirst) return new Set(allowedRemote.slice(0,target));
+    if (target>=allowedRemote.length) return new Set(allowedRemote);
+    const selected=new Set();
+    for (let i=0;i<target;i++) {
+      const idx=Math.min(allowedRemote.length-1,Math.floor((i+0.5)*allowedRemote.length/target));
+      selected.add(allowedRemote[idx]);
+    }
+    if (selected.size<target) for (const key of allowedRemote) { selected.add(key); if (selected.size>=target) break; }
     return selected;
   };
   const subgroupCombinedSchemeCache = new Map();
@@ -1465,10 +2140,8 @@ function generateSchedule(data, prior, perfScope = null) {
     const lectureBucket = bucket.length > 1 && bucket.every((row)=>isLectureLessonTypeName(lessonTypeById[row.typeId]?.name));
     const lectureMembership = lectureBucket ? lectureStreamMembership(bucket) : null;
     const occurrenceLists = bucket.map((row)=>lectureMembership ? [...(lectureMembership.get(String(row.id||""))||[])] : occurrenceKeysForLoad(row));
-    // v1724: для лекций используем union только как шкалу возможных слоёв.
-    // Состав участников каждого week:layer определяется отдельно по персональному
-    // лимиту группы. Поэтому 2/1/1/1 превращается в общий слой для всех + один
-    // дополнительный слой только для первой группы, а не в две пары для всех.
+    // v1724: union для лекционного потока задаёт возможные week:layer, но
+    // конкретный участник включается только пока не исчерпан его собственный лимит.
     let commonKeys = lectureBucket
       ? [...new Set(occurrenceLists.flat())]
       : (bucket.length >= 1 ? (occurrenceLists[0] || []) : []);
@@ -1508,8 +2181,6 @@ function generateSchedule(data, prior, perfScope = null) {
       }
     }
     if (lectureBucket) {
-      // v1724: ДО-лекция тоже собирается по конкретному слою и только из тех
-      // групп, которым этот слой положен. Разный объём часов не размножается.
       for (const key of selectedKeys) {
         const members=bucket.filter((row)=>lectureMembership?.get(String(row.id||""))?.has(key));
         if (!members.length) continue;
@@ -1567,8 +2238,8 @@ function generateSchedule(data, prior, perfScope = null) {
     const bucket = loads.filter((row)=>wantedGroups.has(row.groupId) && isLectureLessonTypeName(lessonTypeById[row.typeId]?.name) && row.subjectId===anchor.subjectId && row.teacherId===anchor.teacherId && row.typeId===anchor.typeId && Number(row.subgroup||0)===Number(anchor.subgroup||0));
     if (bucket.length < 2) continue;
 
-    // v1724: состав лекционного потока определяется отдельно для каждого
-    // week:layer. Группа участвует только пока не исчерпан ЕЁ собственный объём.
+    // v1724: участники рассчитываются отдельно на каждом week:layer.
+    // Группа с меньшим числом часов перестаёт входить в поток после своего лимита.
     const membership=lectureStreamMembership(bucket);
     const orderedKeys=[...new Set([...membership.values()].flatMap((set)=>[...set]))].sort((a,b)=>{
       const aw=Number(String(a).split(":")[0])||0, bw=Number(String(b).split(":")[0])||0;
@@ -1578,7 +2249,6 @@ function generateSchedule(data, prior, perfScope = null) {
       const members=bucket.filter((row)=>membership.get(String(row.id||""))?.has(key));
       if (!members.length) continue;
       const inPersonMembers=members.filter((row)=>!practicalAssemblyPlanByLoadId.get(row.id)?.selectedKeys?.has(key));
-      // ДО-план уже закрыл этот слой для своих участников.
       if (inPersonMembers.length < 2) continue;
       const primary = inPersonMembers[0];
       const plan = {
@@ -1656,7 +2326,44 @@ function generateSchedule(data, prior, perfScope = null) {
     });
   };
 
-  const instances = [];
+  // v1711: ниже массив экземпляров может пересобираться целиком при восстановлении
+  // ручных частей и финальной дедупликации потоков. Поэтому это let, а не const.
+  // Иначе любое изменение чисел в графике, которое вызывает buildSchedule(),
+  // падало с `Assignment to constant variable`.
+  let instances = [];
+
+  // v1765: несколько ДО-планов одной лекционной связки могут описывать разные
+  // недели одного и того же слоя. Раньше каждый такой план создавал ОДИНАКОВЫЙ
+  // instId `${load.id}__MANDO_${layer}`. Последующая нормализация оставляла только
+  // одну из карточек (обычно самую раннюю неделю), поэтому график требовал пару,
+  // а она исчезала и из сетки, и из «Не размещено».
+  //
+  // Сохраняем старый стабильный instId, но одинаковые по составу ДО-карточки
+  // объединяем в один recurring-блок по неделям. Если под тем же id встретился
+  // реально другой состав потока, даём ему отдельный детерминированный id.
+  const remoteAssemblyScopeSig = (row) => {
+    const parts = (row?.streamParticipants || [])
+      .map((x)=>`${String(x?.loadId||"")}:${String(x?.groupId||"")}:${Number(x?.subgroup||0)}`)
+      .sort().join(",");
+    const groups = [...new Set((row?.streamGroupIds || []).map(String))].sort().join(",");
+    return [String(row?.loadId||""), String(row?.teacherId||""), String(row?.subjectId||""),
+      String(row?.typeId||""), String(row?.requirementLayer||"1"), String(row?.format||""),
+      String(row?.streamId||""), groups, parts].join("|");
+  };
+  const pushRemoteAssemblyInstance = (candidate) => {
+    const sameId = instances.find((row)=>String(row?.instId||"")===String(candidate?.instId||""));
+    if (!sameId) { instances.push(candidate); return; }
+    if (remoteAssemblyScopeSig(sameId) === remoteAssemblyScopeSig(candidate)) {
+      sameId.weekPattern = "custom";
+      sameId.customWeeks = [...new Set([...(sameId.customWeeks || []), ...(candidate.customWeeks || [])].map(Number).filter(Number.isFinite))].sort((a,b)=>a-b);
+      return;
+    }
+    const firstWeek = Number((candidate.customWeeks || [0])[0] || 0);
+    const base = `${candidate.instId}__W${firstWeek || "X"}`;
+    let nextId = base, n = 2;
+    while (instances.some((row)=>String(row?.instId||"")===nextId)) nextId = `${base}_${n++}`;
+    instances.push({ ...candidate, instId: nextId });
+  };
 
   // Сначала создаём обязательные общие ДО-сборки. Каждая сборка действует ровно
   // на одну конкретную учебную неделю/слой графика и тем самым считается ровно один раз.
@@ -1705,9 +2412,10 @@ function generateSchedule(data, prior, perfScope = null) {
       const weeks=[...new Set(rawWeeks)].sort((a,b)=>a-b);
       if (!weeks.length) continue;
       const halfPair=layerRaw==="H";
-      instances.push({
+      pushRemoteAssemblyInstance({
         instId: `${load.id}__MANDO_${layerRaw}`,
         ...commonRemote,
+        requirementLayer: layerRaw,
         halfPair,
         weekPattern: "custom",
         customWeeks: weeks,
@@ -1740,7 +2448,7 @@ function generateSchedule(data, prior, perfScope = null) {
       const [weekRaw,layerRaw]=key.split(":");
       const week=Number(weekRaw), halfPair=layerRaw==="H";
       instances.push({
-        instId:`${load.id}__LECTURE_STREAM_${week}_${layerRaw}_${++seq}`, loadId:load.id, groupId:load.groupId, teacherId:load.teacherId, subjectId:load.subjectId, typeId:load.typeId,
+        instId:`${load.id}__LECTURE_STREAM_${week}_${layerRaw}_${++seq}`, requirementLayer:layerRaw, loadId:load.id, groupId:load.groupId, teacherId:load.teacherId, subjectId:load.subjectId, typeId:load.typeId,
         roomType:load.roomType, subgroup:load.subgroup||0, format:"inperson", streamGroupIds:plan.streamGroupIds, streamParticipants:plan.streamParticipants,
         isVacancyTeacher:!!teacherById[load.teacherId]?.isVacancy, profileSubject:!!load.profileSubject, position:load.position||"any", allowedRoomIds:load.allowedRoomIds||[], preferredRoomIds:teacherById[load.teacherId]?.preferredRoomIds||[], twoRooms:!!load.twoRooms,
         requiresComputer:!!subjectById[load.subjectId]?.requiresComputerRoom, requiresArt:!!subjectById[load.subjectId]?.requiresArtRoom, requiredRoomTypeId:subjectById[load.subjectId]?.requiredRoomTypeId||"", minRoomCapacity:0, requiredEquipment:"", dedicatedRoomId:teacherById[load.teacherId]?.dedicatedRoomId||"", pairing:"none", halfPair,
@@ -1759,7 +2467,7 @@ function generateSchedule(data, prior, perfScope = null) {
       const [weekRaw,layerRaw]=key.split(":");
       const week=Number(weekRaw), halfPair=layerRaw==="H";
       instances.push({
-        instId:`${load.id}__PRACTICAL_STREAM_${week}_${layerRaw}_${++seq}`, loadId:load.id, groupId:load.groupId, teacherId:load.teacherId, subjectId:load.subjectId, typeId:load.typeId,
+        instId:`${load.id}__PRACTICAL_STREAM_${week}_${layerRaw}_${++seq}`, requirementLayer:layerRaw, loadId:load.id, groupId:load.groupId, teacherId:load.teacherId, subjectId:load.subjectId, typeId:load.typeId,
         roomType:load.roomType, subgroup:0, format:"inperson", streamGroupIds:plan.streamGroupIds, streamParticipants:plan.streamParticipants,
         isVacancyTeacher:!!teacherById[load.teacherId]?.isVacancy, profileSubject:!!load.profileSubject, position:load.position||"any", allowedRoomIds:load.allowedRoomIds||[], preferredRoomIds:teacherById[load.teacherId]?.preferredRoomIds||[], twoRooms:!!load.twoRooms,
         requiresComputer:!!subjectById[load.subjectId]?.requiresComputerRoom, requiresArt:!!subjectById[load.subjectId]?.requiresArtRoom, requiredRoomTypeId:subjectById[load.subjectId]?.requiredRoomTypeId||"", minRoomCapacity:0, requiredEquipment:"", dedicatedRoomId:teacherById[load.teacherId]?.dedicatedRoomId||"", pairing:"none", halfPair,
@@ -1864,7 +2572,7 @@ function generateSchedule(data, prior, perfScope = null) {
         const blockStart = graphBlockSize ? (layer - blockIndex) : 0;
         const remainingInBlock = graphBlockSize ? Math.min(graphBlockSize, maxWhole - blockStart + 1) : 1;
         instances.push({
-          instId: `${load.id}__L${layer}`, ...common, weekPattern: "custom", customWeeks: weeksForLayer,
+          instId: `${load.id}__L${layer}`, requirementLayer:String(layer), ...common, weekPattern: "custom", customWeeks: weeksForLayer,
           blockId: graphBlockSize ? `${load.id}__graph_blk${Math.floor((layer - 1) / graphBlockSize)}` : "",
           blockIndex, blockSize: remainingInBlock, blockMode: graphBlockSize ? "consecutive" : ""
         });
@@ -1873,7 +2581,7 @@ function generateSchedule(data, prior, perfScope = null) {
       const halfWeeks = loadMayUseHalfPair(load)
         ? weekNums.filter((w) => (graphPairUnitsAt(w) - Math.floor(graphPairUnitsAt(w))) >= 0.49 && !(mandatoryPlan?.selectedKeys?.has(`${w}:H`)) && !(lecturePlan?.selectedKeys?.has(`${w}:H`)) && !(practicalInPersonPlan?.selectedKeys?.has(`${w}:H`)))
         : [];
-      if (halfWeeks.length) instances.push({ instId: `${load.id}__H`, ...common, halfPair: true, weekPattern: "custom", customWeeks: halfWeeks, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
+      if (halfWeeks.length) instances.push({ instId: `${load.id}__H`, requirementLayer:"H", ...common, halfPair: true, weekPattern: "custom", customWeeks: halfWeeks, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
       return;
     }
 
@@ -1910,6 +2618,31 @@ function generateSchedule(data, prior, perfScope = null) {
     for (let i = 0; i < n; i++) instances.push({ instId: `${load.id}__${i}`, ...common, ...weekFields, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
     if (loadMayUseHalfPair(load) && hasHalf) instances.push({ instId: `${load.id}__H`, ...common, ...weekFields, halfPair: true, blockId: "", blockIndex: 0, blockSize: 1, blockMode: "" });
   });
+
+  // v1764: карта канонического состава потока для каждого load|week|layer.
+  // Если ниже страховка графика обнаружит пропавший технический instance,
+  // она должна восстановить ИМЕННО общий поток, а не одиночную карточку одной
+  // группы. Иначе у участников одного потока визуально получалось разное число пар.
+  const streamRepairSpecByRequirement = new Map();
+  const registerStreamRepairPlan = (plan, format, kind) => {
+    if (!plan?.primary || !plan?.selectedKeys) return;
+    const members = (plan.bucket || [plan.primary]).filter(Boolean);
+    if (!members.length) return;
+    const primary = plan.primary;
+    const participantRows = members.filter((row)=>String(row.id)!==String(primary.id));
+    for (const key of plan.selectedKeys) {
+      const spec = {
+        primary, members, format, kind,
+        streamId: plan.streamId || "",
+        streamGroupIds: [...new Set(participantRows.map((row)=>row.groupId).filter(Boolean))],
+        streamParticipants: participantRows.map((row)=>({groupId:row.groupId,subgroup:Number(row.subgroup)||0,loadId:row.id})),
+      };
+      for (const row of members) streamRepairSpecByRequirement.set(`${row.id}|${key}`, spec);
+    }
+  };
+  for (const plan of practicalAssemblyPlans) registerStreamRepairPlan(plan, "remote", "remote");
+  for (const plan of lectureStreamPlans) registerStreamRepairPlan(plan, "inperson", "lecture");
+  for (const plan of practicalInPersonStreamPlans) registerStreamRepairPlan(plan, "inperson", "practical");
 
   // v1656: страховка графика от потери отдельной week:layer потребности внутри потока.
   // Поток — это способ совместного проведения, но КАЖДАЯ строка нагрузки по-прежнему
@@ -1979,36 +2712,47 @@ function generateSchedule(data, prior, perfScope = null) {
         const covKey = `${load.id}|${week}|${layer}`;
         if (graphCoverage.has(covKey)) continue;
         const halfPair = layer === "H";
-        const teacher = teacherById[load.teacherId] || {};
+        const streamSpec = streamRepairSpecByRequirement.get(`${load.id}|${week}:${layer}`) || null;
+        const repairLoad = streamSpec?.primary || load;
+        const teacher = teacherById[repairLoad.teacherId] || {};
+        const repairTemplate = streamSpec
+          ? instances.find((inst) => graphCoveredLoadIds(inst).has(String(repairLoad.id)) && String(graphLayerOfInstance(inst)) === String(layer))
+          : template;
         const repair = {
-          ...(template ? { ...template } : {}),
-          instId: `${load.id}__GRAPH_REPAIR_${week}_${layer}`,
-          loadId: load.id,
-          groupId: load.groupId,
-          teacherId: load.teacherId,
-          subjectId: load.subjectId,
-          typeId: load.typeId,
-          roomType: load.roomType,
-          subgroup: Number(load.subgroup || 0),
-          format: (load.canBeRemote && (load.format || "inperson") === "remote") ? "remote" : "inperson",
-          streamGroupIds: [], streamParticipants: [],
+          ...(repairTemplate ? { ...repairTemplate } : {}),
+          instId: `${repairLoad.id}__GRAPH_REPAIR_${week}_${layer}${streamSpec ? "_STREAM" : ""}`,
+          loadId: repairLoad.id,
+          groupId: repairLoad.groupId,
+          teacherId: repairLoad.teacherId,
+          subjectId: repairLoad.subjectId,
+          typeId: repairLoad.typeId,
+          roomType: repairLoad.roomType,
+          subgroup: Number(repairLoad.subgroup || 0),
+          format: streamSpec?.format || ((repairLoad.canBeRemote && (repairLoad.format || "inperson") === "remote") ? "remote" : "inperson"),
+          streamId: streamSpec?.streamId || "",
+          streamGroupIds: streamSpec ? [...streamSpec.streamGroupIds] : [],
+          streamParticipants: streamSpec ? streamSpec.streamParticipants.map((part)=>({...part})) : [],
           isVacancyTeacher: !!teacher.isVacancy,
-          profileSubject: !!load.profileSubject,
-          position: load.position || "any",
-          allowedRoomIds: load.allowedRoomIds || [],
-          preferredRoomIds: teacher.preferredRoomIds || [],
-          twoRooms: !!load.twoRooms,
-          requiresComputer: !!subjectById[load.subjectId]?.requiresComputerRoom,
-          requiresArt: !!subjectById[load.subjectId]?.requiresArtRoom,
-          requiredRoomTypeId: subjectById[load.subjectId]?.requiredRoomTypeId || "",
-          dedicatedRoomId: teacher.dedicatedRoomId || "",
+          profileSubject: !!repairLoad.profileSubject,
+          position: repairLoad.position || "any",
+          allowedRoomIds: streamSpec?.format === "remote" ? [] : (repairLoad.allowedRoomIds || []),
+          preferredRoomIds: streamSpec?.format === "remote" ? [] : (teacher.preferredRoomIds || []),
+          twoRooms: streamSpec?.format === "remote" ? false : !!repairLoad.twoRooms,
+          requiresComputer: streamSpec?.format === "remote" ? false : !!subjectById[repairLoad.subjectId]?.requiresComputerRoom,
+          requiresArt: streamSpec?.format === "remote" ? false : !!subjectById[repairLoad.subjectId]?.requiresArtRoom,
+          requiredRoomTypeId: streamSpec?.format === "remote" ? "" : (subjectById[repairLoad.subjectId]?.requiredRoomTypeId || ""),
+          dedicatedRoomId: streamSpec?.format === "remote" ? "" : (teacher.dedicatedRoomId || ""),
           pairing: "none", halfPair,
           weekPattern: "custom", customWeeks: [week],
           blockId: "", blockIndex: 0, blockSize: 1, blockMode: "",
           graphCoverageRepair: true,
+          graphCoverageStreamRepair: !!streamSpec,
+          requirementLayer: layer,
         };
         instances.push(repair);
-        graphCoverage.add(covKey);
+        for (const coveredLoadId of graphCoveredLoadIds(repair)) {
+          graphCoverage.add(`${coveredLoadId}|${week}|${layer}`);
+        }
       }
     }
   }
@@ -2029,6 +2773,10 @@ function generateSchedule(data, prior, perfScope = null) {
       if (!old?.instId || restoredIds.has(old.instId)) continue;
       const base = canonicalById.get(old.splitFromInstId);
       if (!base) continue;
+      // v1764: manualSplit не должен воскресить старый формат после явной
+      // смены нагрузки ОЧНО ↔ ДО. Если это не ручное исключение конкретной
+      // пары, формат канонического блока имеет приоритет.
+      if (!old.manualFormatOverride && String(old.format || "inperson") !== String(base.format || "inperson")) continue;
       const allowed = new Set(weekNumbersForInstance(config, base).map(Number));
       const keepWeeks = weekNumbersForInstance(config, old)
         .map(Number)
@@ -2055,6 +2803,107 @@ function generateSchedule(data, prior, perfScope = null) {
       }
       instances.push(...restoredChildren);
     }
+  }
+
+  // v1632: аварийно восстановленная из опубликованного снимка группа
+  // должна переживать обычный rebase/sync графика. При этом она остаётся
+  // только на тех неделях, которые всё ещё существуют в актуальном графике.
+  if (prior?.instances?.length) {
+    const restoredRows = (prior.instances || []).filter((i)=>(i?.restoredFromPublished || i?.restoredFromGroupUndo) && i?.loadId);
+    if (restoredRows.length) {
+      const currentRows = () => instances.filter((i)=>!(i?.restoredFromPublished || i?.restoredFromGroupUndo) && i?.loadId);
+      for (const old of restoredRows) {
+        const oldWeeks = weekNumbersForInstance(config, old).map(Number);
+        const layer = canonicalRequirementLayer(old);
+        const base = currentRows().find((candidate)=>
+          String(candidate.loadId||"")===String(old.loadId||"") &&
+          String(candidate.groupId||"")===String(old.groupId||"") &&
+          Number(candidate.subgroup||0)===Number(old.subgroup||0) &&
+          String(candidate.subjectId||"")===String(old.subjectId||"") &&
+          String(candidate.typeId||"")===String(old.typeId||"") &&
+          (candidate.format||"inperson")===(old.format||"inperson") &&
+          canonicalRequirementLayer(candidate)===layer &&
+          weekNumbersForInstance(config,candidate).map(Number).some((w)=>oldWeeks.includes(w))
+        );
+        if (!base) continue;
+        const allowed = new Set(weekNumbersForInstance(config,base).map(Number));
+        const keepWeeks = oldWeeks.filter((w)=>allowed.has(w)).sort((a,b)=>a-b);
+        if (!keepWeeks.length) continue;
+
+        if (base.weekPattern==="custom") {
+          base.customWeeks=(base.customWeeks||[]).map(Number).filter((w)=>!keepWeeks.includes(w));
+        }
+        instances.push({
+          ...old,
+          weekPattern:"custom",
+          customWeeks:keepWeeks,
+          manualSplit:true,
+          userManualSplit:true,
+          manualStreamBreak:true,
+          splitFromInstId:base.instId,
+        });
+      }
+      instances = instances.filter((i)=>i.weekPattern!=="custom" || (i.customWeeks||[]).length>0);
+    }
+  }
+
+  // v1627: мероприятия — отдельные nonEducational instances и не строятся из
+  // нагрузки. Любой полный/групповой/недельный пересчёт обязан переносить их из
+  // prior как есть; иначе автосборка удаляет их из расписания.
+  if (prior?.instances?.length) {
+    const present = new Set(instances.map((i)=>String(i?.instId||'')));
+    for (const eventInst of prior.instances) {
+      if (!eventInst?.isScheduleEvent || !eventInst?.instId) continue;
+      const sid = String(eventInst.instId);
+      if (present.has(sid)) continue;
+      instances.push({ ...eventInst, customWeeks:[...(eventInst.customWeeks||[])] });
+      present.add(sid);
+    }
+  }
+
+  // v1710: последняя защита генератора от «затраивания» потока. Даже если
+  // после старых ручных операций в нагрузках осталась неполная/односторонняя
+  // stream-связь, одна фактическая потребность потока не должна порождать по
+  // экземпляру от каждой группы. Дедуплицируем ПО НЕДЕЛЯМ и requirementLayer,
+  // поэтому две реальные пары одного потока в одной неделе (слои 1 и 2)
+  // сохраняются, а три технические копии слоя 1 схлопываются в одну.
+  {
+    const seenStreamRequirements = new Set();
+    const dedupedInstances = [];
+    const streamRequirementLayer = (raw) => {
+      if (raw?.halfPair) return 'H';
+      if (raw?.requirementLayer != null && String(raw.requirementLayer)) return String(raw.requirementLayer);
+      const id = String(raw?.instId || '');
+      let m = id.match(/__L(\d+)(?:$|__)/);
+      if (m) return String(Number(m[1]));
+      m = id.match(/__(?:LECTURE_STREAM|PRACTICAL_STREAM)_\d+_([^_]+)_/);
+      if (m) return String(m[1]).replace(/^L/, '');
+      return '1';
+    };
+    for (const raw of instances) {
+      if (!raw || raw.isScheduleEvent) { dedupedInstances.push(raw); continue; }
+      const parts = streamParticipants(raw);
+      const participantKey = [...new Set(parts.map((p)=>`${String(p.groupId||'')}:${Number(p.subgroup||0)}`))].sort();
+      if (participantKey.length < 2) { dedupedInstances.push(raw); continue; }
+      const weeks = weekNumbersForInstance(config, raw).map(Number).filter(Number.isFinite);
+      if (!weeks.length) { dedupedInstances.push(raw); continue; }
+      const layer = streamRequirementLayer(raw);
+      const keepWeeks = [];
+      for (const week of weeks) {
+        const key = [
+          week, String(raw.teacherId||''), String(raw.subjectId||''), String(raw.typeId||''),
+          String(raw.format||'inperson'), Number(raw.subgroup||0), raw.halfPair ? 'half' : 'full',
+          String(layer||''), participantKey.join(',')
+        ].join('|');
+        if (seenStreamRequirements.has(key)) continue;
+        seenStreamRequirements.add(key);
+        keepWeeks.push(week);
+      }
+      if (!keepWeeks.length) continue;
+      if (keepWeeks.length === weeks.length) dedupedInstances.push(raw);
+      else dedupedInstances.push({ ...raw, weekPattern:'custom', customWeeks:[...new Set(keepWeeks)].sort((a,b)=>a-b), streamRequirementDeduped:true });
+    }
+    instances = dedupedInstances;
   }
 
   // v1464: «Графики» должны быть источником истины для состава недель
@@ -2264,14 +3113,22 @@ function generateSchedule(data, prior, perfScope = null) {
         if (!assignmentConflictsHalf(oid, inst, half)) continue;
         const other = byInst[oid];
         if (sameTeacherSiblingSubgroupsCompatible(inst, other)) continue;
+      if (sameLogicalStreamLesson(inst, other)) continue;
         return true;
       }
       return false;
     };
     const isFree = (r) => !roomOccupied(r.id) && !additionallyReserved.has(r.id) && !roomBlockedByPractice(inst, day, period, r.id);
-    // v1631: не привязываем вторую подгруппу к кабинету первой.
-    // Один преподаватель может вести две подгруппы одной группы одновременно
-    // в разных аудиториях; обычный подбор кабинета выбирает любой подходящий.
+    // v1619: если в этом слоте уже стоит вторая подгруппа той же группы у того
+    // же преподавателя, это одно объединённое занятие — автоматически используем
+    // ту же аудиторию, а не отправляем преподавателя в два кабинета одновременно.
+    const teacherPartners = !inst.isVacancyTeacher ? [...(busyTeacherOccupants.get(`${sk}|${inst.teacherId}`) || [])]
+      .filter((oid) => assignmentConflictsHalf(oid, inst, half) && sameTeacherSiblingSubgroupsCompatible(inst, byInst[oid])) : [];
+    if (teacherPartners.length === 1) {
+      const partnerRoomId = assignment?.[teacherPartners[0]]?.roomId;
+      const sharedRoom = partnerRoomId ? candidates.find((r) => roomIdsEquivalent(rooms, r.id, partnerRoomId)) : null;
+      if (sharedRoom && isFree(sharedRoom) && !inst.twoRooms) return { ...sharedRoom, extraRoomId: null };
+    }
     for (const r of candidates) {
       if (!isFree(r)) continue;
       if (!inst.twoRooms) return { ...r, extraRoomId: null };
@@ -2465,7 +3322,7 @@ function generateSchedule(data, prior, perfScope = null) {
   function affectedSubgroupsForGroup(inst, gid) {
     const subs = subgroupsForGroup(inst, gid);
     if (subs.some((sg) => Number(sg) === 0)) return [1, 2];
-    const out = [...new Set(subs.map((sg) => Number(sg)).filter((sg) => sg === 1 || sg === 2))];
+    const out = [...new Set(subs.map((sg) => Number(sg)).filter((sg) => Number.isFinite(sg) && sg >= 1))];
     return out.length ? out : [1, 2];
   }
   function teacherWeekDayPeriods(teacherId, week, day, excludeInstId = null) {
@@ -4204,7 +5061,7 @@ function generateSchedule(data, prior, perfScope = null) {
   // `unplacedSet` (nothing ever added it there), and silently disappears
   // from both `assignment` and `unplaced` in the result instead of surfacing
   // as the conflict it actually is.
-  for (const id of lockedIds) if (!finalAssignment[id]) finalUnplaced.add(id);
+  for (const id of lockedIds) if (!finalAssignment[id] && !byInst[id]?.isScheduleEvent) finalUnplaced.add(id);
 
   // v104: финальный hard-pass удаляет назначения на закрытое время только
   // у совместителей/ГПХ. У штатных такие назначения допустимы как аварийный
@@ -4254,43 +5111,6 @@ function generateSchedule(data, prior, perfScope = null) {
     if (streamGroups(inst).some((gid) => groupTimeSlotBlockedForInstance(gid, inst, a.day, a.period))) {
       delete finalAssignment[inst.instId];
       finalUnplaced.add(inst.instId);
-    }
-  }
-
-  // v1696: два слоя ОДНОЙ строки графика (например weeklyPairs=2 -> L1/L2)
-  // никогда не могут занимать одну и ту же физическую пару на пересекающихся
-  // неделях. Это структурное правило сильнее locked: lock фиксирует место
-  // корректного занятия, но не является разрешением склеить L1 и L2 в один слот.
-  // Именно такой legacy/graph-locked дубль давал две одинаковые карточки
-  // «Экономика организации» в одной ячейке.
-  const sameLoadSlotBuckets1696 = new Map();
-  const sameLoadAssigned1696 = instances
-    .filter((inst) => finalAssignment[inst.instId] && inst.loadId)
-    .sort((a,b) => {
-      const al = lockedIds.has(a.instId) ? 0 : 1;
-      const bl = lockedIds.has(b.instId) ? 0 : 1;
-      if (al !== bl) return al - bl;
-      return String(a.instId).localeCompare(String(b.instId), 'ru', { numeric:true });
-    });
-  for (const inst of sameLoadAssigned1696) {
-    const a = finalAssignment[inst.instId];
-    if (!a) continue;
-    let conflict = false;
-    for (const week of weeksOf(inst)) {
-      const base = `${inst.loadId}|${week}|${a.day}|${a.period}`;
-      const keys = a.half == null ? [`${base}|full`, `${base}|0`, `${base}|1`] : [`${base}|full`, `${base}|${Number(a.half)}`];
-      if (keys.some((k)=>(sameLoadSlotBuckets1696.get(k)||[]).length)) { conflict = true; break; }
-    }
-    if (conflict) {
-      delete finalAssignment[inst.instId];
-      finalUnplaced.add(inst.instId);
-      lockedIds.delete(inst.instId);
-      continue;
-    }
-    for (const week of weeksOf(inst)) {
-      const k = `${inst.loadId}|${week}|${a.day}|${a.period}|${a.half == null ? 'full' : Number(a.half)}`;
-      if (!sameLoadSlotBuckets1696.has(k)) sameLoadSlotBuckets1696.set(k, []);
-      sameLoadSlotBuckets1696.get(k).push(inst.instId);
     }
   }
 
@@ -4398,8 +5218,8 @@ function generateSchedule(data, prior, perfScope = null) {
     }
   }
 
-  const totalPairUnits = instances.reduce((sum, inst) => sum + (inst.halfPair ? 0.5 : 1), 0);
-  const unplacedPairUnits = [...finalUnplaced].reduce((sum, id) => sum + (byInst[id]?.halfPair ? 0.5 : 1), 0);
+  const totalPairUnits = instances.reduce((sum, inst) => sum + (inst?.isScheduleEvent ? 0 : (inst.halfPair ? 0.5 : 1)), 0);
+  const unplacedPairUnits = [...finalUnplaced].reduce((sum, id) => sum + (byInst[id]?.isScheduleEvent ? 0 : (byInst[id]?.halfPair ? 0.5 : 1)), 0);
   const stats = {
     totalPairs: totalPairUnits,
     placed: totalPairUnits - unplacedPairUnits,

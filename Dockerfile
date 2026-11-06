@@ -7,9 +7,9 @@ RUN npm config set registry https://registry.npmjs.org/ \
  && npm config set fetch-retry-mintimeout 1000 \
  && npm config set fetch-retry-maxtimeout 10000 \
  && npm config set fetch-timeout 60000 \
- && (timeout 150 npm install --no-audit --no-fund --prefer-online \
-     || (echo "npm install attempt 1 failed; retrying..." && sleep 3 && timeout 150 npm install --no-audit --no-fund --prefer-online) \
-     || (echo "npm install attempt 2 failed; retrying..." && sleep 5 && timeout 150 npm install --no-audit --no-fund --prefer-online))
+ && (timeout 150 npm ci --no-audit --no-fund --prefer-online \
+     || (echo "npm install attempt 1 failed; retrying..." && sleep 3 && timeout 150 npm ci --no-audit --no-fund --prefer-online) \
+     || (echo "npm install attempt 2 failed; retrying..." && sleep 5 && timeout 150 npm ci --no-audit --no-fund --prefer-online))
 COPY frontend/ ./
 RUN npm run build
 
@@ -31,7 +31,7 @@ COPY requirements.txt ./
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/*
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py ./
-COPY pg_compat.py ./
+COPY pg_compat.py auth.py editor_state.py editor_transport.py ./
 COPY server_scheduler.mjs ./
 COPY server_graph_scheduler.mjs ./
 # Production image contains only runtime files. Source-level smoke tests are
@@ -40,4 +40,4 @@ COPY server_graph_scheduler.mjs ./
 COPY --from=frontend-build /frontend/dist ./static
 RUN mkdir -p /data
 EXPOSE 5000
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "120", "--graceful-timeout", "20", "--keep-alive", "5", "--max-requests", "3000", "--max-requests-jitter", "300", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--threads", "4", "--timeout", "120", "--graceful-timeout", "20", "--keep-alive", "5", "app:app"]

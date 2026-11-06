@@ -3,7 +3,11 @@
 No migrations, drops, truncates or overwrites of existing PostgreSQL schemas.
 """
 import re
-import psycopg
+
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 
 SCHEMA = [
     'CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)',
@@ -20,6 +24,8 @@ SCHEMA = [
 ]
 
 def pg_storage_exists(url):
+    if psycopg is None:
+        return False
     try:
         with psycopg.connect(url, connect_timeout=5) as conn:
             return bool(conn.execute("SELECT to_regclass('public.kv_store')").fetchone()[0])
@@ -28,6 +34,8 @@ def pg_storage_exists(url):
 
 class PgConnection:
     def __init__(self, url):
+        if psycopg is None:
+            raise RuntimeError("psycopg is required for PostgreSQL support")
         self.conn = psycopg.connect(url, connect_timeout=10)
         try:
             tables = {r[0] for r in self.conn.execute("SELECT tablename FROM pg_tables WHERE schemaname=current_schema()").fetchall()}

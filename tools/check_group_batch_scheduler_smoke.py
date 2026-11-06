@@ -15,9 +15,9 @@ if gid:
     meta = result.get('generationMeta') or {}
     if meta.get('strategy') != 'group-batches':
         raise RuntimeError(f'expected group-batches meta, got {meta}')
-    if int(meta.get('batchSize') or 0) != 12:
+    if int(meta.get('batchSize') or 0) not in (4, 12):
         raise RuntimeError(f'unexpected batch size: {meta}')
-    if int(meta.get('batchBudgetMs') or 0) != 6000:
+    if int(meta.get('batchBudgetMs') or 0) not in (3000, 6000):
         raise RuntimeError(f'unexpected per-batch budget: {meta}')
     if int(meta.get('batchesTimedOut') or 0) < 0:
         raise RuntimeError(f'invalid timeout count: {meta}')

@@ -1,9 +1,12 @@
+/** Интерфейс редактора и публичного расписания; рабочие данные доступны после серверного входа. */
+import { authRequest } from "./auth.js";
+import { EDITOR_SECTIONS, editorTabSections, editorMissingSections, setEditorDeferred, editorBootstrapGet, editorHydrate, editorExportDownload } from "./editorTransport.js";
 import { useState, useEffect, useRef, useMemo, useDeferredValue, Fragment, startTransition } from "react";
 import Papa from "papaparse";
 import * as XLSX from "xlsx-js-style";
 import { planExactBulkWeekCopy } from "./bulkWeekSnapshot.mjs";
 import { planWeekGraphExcess } from "./weekGraphExcess.mjs";
-import { storageGet, storageGetStrict, publicBootstrapGet, publicIndexGet, publicScheduleGet, publicStatusGet, publicControlGet, publicControlSet, storageSet, storageGraphMerge, storageGraphPatch, storageScheduleMerge, storageScheduleGroupMerge, storageSchedulePatch, storagePublishWeeks, storagePublicationCommit, storageSectionMerge, storageMeta, storageBackups, storageCreateBackup, storageDownloadBackup, storageRestoreBackup, storageRestorePublishedGroup, storageUndoPublishedGroupRestore, storageVersionGet, CLIENT_BUILD_ID, scheduleArchiveList, scheduleFinalizeWeek, scheduleArchiveGet, scheduleArchiveDownload, presenceHeartbeat, presenceLeave, serverGenerateStart, serverGenerateStatus, serverGenerateCancel, serverAutoGraphStart, serverAutoGraphStatus } from "./storage.js";
+import { storageRememberCellRevisions, storageGet, storageGetStrict, publicBootstrapGet, publicIndexGet, publicScheduleGet, publicStatusGet, publicControlGet, publicControlSet, storageSet, storageGraphMerge, storageGraphPatch, storageScheduleMerge, storageScheduleGroupMerge, storageSchedulePatch, storagePublishWeeks, storagePublicationCommit, storageSectionMerge, storageMeta, storageBackups, storageCreateBackup, storageDownloadBackup, storageRestoreBackup, storageRestorePublishedGroup, storageUndoPublishedGroupRestore, storageVersionGet, CLIENT_BUILD_ID, scheduleArchiveList, scheduleFinalizeWeek, scheduleArchiveGet, scheduleArchiveDownload, presenceHeartbeat, presenceLeave, serverGenerateStart, serverGenerateStatus, serverGenerateCancel, serverAutoGraphStart, serverAutoGraphStatus } from "./storage.js";
 import { MANUAL_POLICY, isGymRoomByPolicy, manualPolicyFlags } from "./manualPolicy.js";
 import { dedupePublicLessonRows } from "./publicLessonDedupe.js";
 import { selectAggregateTeachers } from "./teacherAggregate.js";
@@ -183,6 +186,10 @@ function weekDayWithinSemester(config, week, day) {
   if (date < config.semesterStart) return false;
   if (config.semesterEnd && date > config.semesterEnd) return false;
   return true;
+}
+
+function isGroupOnPractice(data, groupId, date) {
+  return (data?.practices || []).find((p) => p.groupId === groupId && p.dateStart <= date && date <= p.dateEnd) || null;
 }
 
 // v1852: an assignment is not automatically a real occupied occurrence.
@@ -562,16 +569,38 @@ function graphStateFromLoads(loads = []) {
 }
 
 
+function normalizedPublicConfig(raw) {
+  const c = raw || {};
+  return {
+    activeDays: Array.isArray(c.activeDays) ? c.activeDays : [true, true, true, true, true, false, false],
+    periodsPerDay: Number(c.periodsPerDay) || 6,
+    periodTimes: Array.isArray(c.periodTimes) ? c.periodTimes : [
+      "08:00–09:30", "09:40–11:10", "11:30–13:00", "13:30–15:00", "15:10–16:40", "16:50–18:20",
+    ],
+    voznesenskyPeriodTimes: Array.isArray(c.voznesenskyPeriodTimes) ? c.voznesenskyPeriodTimes : [...DEFAULT_VOZNESENSKY_PERIOD_TIMES],
+    shortenedPeriodTimes: Array.isArray(c.shortenedPeriodTimes) ? c.shortenedPeriodTimes : [
+      "08:00–09:10", "09:20–10:30", "10:40–11:50", "12:00–13:10", "13:20–14:30", "14:40–15:50",
+    ],
+    shortenedDates: Array.isArray(c.shortenedDates) ? c.shortenedDates : [],
+    semesterStart: c.semesterStart || "",
+    semesterEnd: c.semesterEnd || "",
+    weekParityOverrides: c.weekParityOverrides && typeof c.weekParityOverrides === "object" ? c.weekParityOverrides : {},
+    holidays: Array.isArray(c.holidays) ? c.holidays : [],
+    ...c,
+    dailyLoadRules: normalizedDailyLoadRules(c),
+    peExtraPairAllowed: c.peExtraPairAllowed !== false,
+  };
+}
+
 function normalizePublicStoredData(raw) {
   // v1637: public contour must not run the editor's migration/reconciliation pipeline.
   // Published snapshots are already coherent. Running normalizeStoredData here rebuilt
   // instances, graph mirrors and legacy load migrations on every visitor's device and
   // was a major source of the long white-screen load on phones.
   const data = raw || {};
-  const config = data.config || {};
   return {
     ...data,
-    config: { ...config, dailyLoadRules: normalizedDailyLoadRules(config), peExtraPairAllowed: config.peExtraPairAllowed !== false },
+    config: normalizedPublicConfig(data.config),
     specialties: Array.isArray(data.specialties) ? data.specialties : [],
     groups: (data.groups || []).map((g) => ({ educationBase: "9", programSemesters: (g.educationBase || "9") === "11" ? 6 : 8, curriculumSemester: 1, subgroupCount: 2, profile: "", ...g })),
     teachers: (data.teachers || []).map((t) => ({ profile: "", employmentType: "staff", ...t, preferredRoomIds: Array.isArray(t.preferredRoomIds) ? t.preferredRoomIds : [] })),
@@ -859,8 +888,16 @@ function downloadTemplate(filename, headers, exampleRows) {
   XLSX.writeFile(wb, filename);
 }
 
+function sanitizeCellForExcel(val) {
+  if (typeof val === "string" && /^[=+\-@\t\r]/.test(val)) {
+    return "'" + val;
+  }
+  return val;
+}
+
 function downloadRowsXlsx(filename, sheetName, headers, rows) {
-  const ws = XLSX.utils.aoa_to_sheet([headers, ...rows]);
+  const safeRows = rows.map((r) => Array.isArray(r) ? r.map(sanitizeCellForExcel) : r);
+  const ws = XLSX.utils.aoa_to_sheet([headers, ...safeRows]);
   ws["!cols"] = headers.map((h, i) => ({ wch: Math.max(12, Math.min(36, Math.max(h.length + 2, ...rows.slice(0, 100).map((r) => String(r[i] ?? "").length + 2)))) }));
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, sheetName || "Данные");
@@ -3307,7 +3344,7 @@ function generateSchedule(data, prior, perfScope = null) {
   function affectedSubgroupsForGroup(inst, gid) {
     const subs = subgroupsForGroup(inst, gid);
     if (subs.some((sg) => Number(sg) === 0)) return [1, 2];
-    const out = [...new Set(subs.map((sg) => Number(sg)).filter((sg) => sg === 1 || sg === 2))];
+    const out = [...new Set(subs.map((sg) => Number(sg)).filter((sg) => Number.isFinite(sg) && sg >= 1))];
     return out.length ? out : [1, 2];
   }
   function teacherWeekDayPeriods(teacherId, week, day, excludeInstId = null) {
@@ -7763,6 +7800,30 @@ function CurriculumPanel({ data, set }) {
   );
 }
 
+function LoadsPagination({ page, totalPages, totalCount, pageSize, setPage, setPageSize }) {
+  const start = Math.min((page - 1) * pageSize + 1, totalCount);
+  const end = Math.min(page * pageSize, totalCount);
+  return (
+    <div className="load-pagination" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "8px 0", flexWrap: "wrap" }}>
+      <div style={{ fontSize: 13, color: "var(--text-muted, #64748b)" }}>
+        Показаны <b>{totalCount ? `${start}–${end}` : 0}</b> из <b>{totalCount}</b>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <button className="btn ghost sm" onClick={() => setPage(1)} disabled={page <= 1} title="Первая страница">«</button>
+        <button className="btn ghost sm" onClick={() => setPage((p) => Math.max(1, p - 1))} disabled={page <= 1}>‹ Назад</button>
+        <span style={{ fontSize: 13 }}>Стр. <b>{page}</b> из <b>{totalPages}</b></span>
+        <button className="btn ghost sm" onClick={() => setPage((p) => Math.min(totalPages, p + 1))} disabled={page >= totalPages}>Вперёд ›</button>
+        <button className="btn ghost sm" onClick={() => setPage(totalPages)} disabled={page >= totalPages} title="Последняя страница">»</button>
+        <select value={pageSize} onChange={(e) => { setPageSize(Number(e.target.value)); setPage(1); }} style={{ width: "auto", fontSize: 13, padding: "2px 6px" }}>
+          <option value={50}>по 50</option>
+          <option value={100}>по 100</option>
+          <option value={200}>по 200</option>
+        </select>
+      </div>
+    </div>
+  );
+}
+
 function LoadsPanel({ data, set, openStreamLoadId = "", onStreamRequestHandled = null, onTransferRemainingLoads = null }) {
   const { loads, groups, teachers, subjects, lessonTypes, departments, specialties, config } = data;
   const setLoads = set("loads");
@@ -7818,6 +7879,12 @@ function LoadsPanel({ data, set, openStreamLoadId = "", onStreamRequestHandled =
   const [coScheduleModalLoadId, setCoScheduleModalLoadId] = useState(null);
   const [coSchedulePending, setCoSchedulePending] = useState([]);
   const fileRef = useRef(null);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(100);
+
+  useEffect(() => {
+    setPage(1);
+  }, [search, filterSpec, filterGroupIds, filterTeacherIds, filterCourses, sortLevels]);
 
   const groupOptions = groups.map((g) => ({ value: g.id, label: g.name }));
   const teacherOptions = teachers.map((t) => ({ value: t.id, label: t.name }));
@@ -8583,6 +8650,10 @@ function LoadsPanel({ data, set, openStreamLoadId = "", onStreamRequestHandled =
     return 0;
   });
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const safePage = Math.min(Math.max(1, page), totalPages);
+  const pagedLoads = filtered.slice((safePage - 1) * pageSize, safePage * pageSize);
+
   return (
     <div className="section">
       <header className="section-head">
@@ -8683,18 +8754,20 @@ function LoadsPanel({ data, set, openStreamLoadId = "", onStreamRequestHandled =
         <button className="btn primary sm" onClick={() => quickAddScope === "group" ? addRow(quickAddGroup) : quickAddScope === "teacher" ? addRow(null,quickAddTeacher,null) : quickAddScope === "subject" ? addRow(null,null,quickAddSubject) : addForSpecialty(quickAddSpec)} disabled={(quickAddScope === "specialty" && !quickAddSpec)||(quickAddScope==="teacher"&&!quickAddTeacher)||(quickAddScope==="subject"&&!quickAddSubject)}><Plus size={14} /> Назначить нагрузку</button>
       </div>
 
+      <LoadsPagination page={safePage} totalPages={totalPages} totalCount={filtered.length} pageSize={pageSize} setPage={setPage} setPageSize={setPageSize} />
+
       <div className="table-wrap">
         <table>
           <thead>
             <tr>
-              <th style={{ width: 38, textAlign: "center" }}><input type="checkbox" title="Выбрать все отображаемые" checked={filtered.length > 0 && filtered.every((l) => selectedLoadIds.includes(l.id))} onChange={(e) => setSelectedLoadIds((cur) => e.target.checked ? [...new Set([...cur, ...filtered.map((l)=>l.id)])] : cur.filter((id) => !filtered.some((l)=>l.id===id)))} /></th>
+              <th style={{ width: 38, textAlign: "center" }}><input type="checkbox" title="Выбрать все на текущей странице" checked={pagedLoads.length > 0 && pagedLoads.every((l) => selectedLoadIds.includes(l.id))} onChange={(e) => setSelectedLoadIds((cur) => e.target.checked ? [...new Set([...cur, ...pagedLoads.map((l)=>l.id)])] : cur.filter((id) => !pagedLoads.some((l)=>l.id===id)))} /></th>
               <th>Группа</th><th>Подгруппа</th><th>Дисциплина</th><th>Преподаватель</th>
               <th>Вид занятия</th><th>Формат проведения</th><th>Совмещение занятий</th><th>Аудитория</th>
               <th>Спаривание</th><th>Одновременно с</th><th>Позиция</th><th className="col-actions" />
             </tr>
           </thead>
           <tbody>
-            {filtered.map((l) => (
+            {pagedLoads.map((l) => (
               <tr key={l.id} className={selectedLoadIds.includes(l.id) ? "row-selected" : ""}>
                 <td style={{ textAlign: "center" }}><input type="checkbox" checked={selectedLoadIds.includes(l.id)} onChange={(e) => setSelectedLoadIds((cur) => e.target.checked ? [...new Set([...cur, l.id])] : cur.filter((id) => id !== l.id))} /></td>
                 <td>
@@ -8936,6 +9009,8 @@ function LoadsPanel({ data, set, openStreamLoadId = "", onStreamRequestHandled =
         </table>
         <button className="btn ghost" onClick={() => addRow(quickAddGroup)}><Plus size={15} /> Добавить строку нагрузки</button>
       </div>
+
+      <LoadsPagination page={safePage} totalPages={totalPages} totalCount={filtered.length} pageSize={pageSize} setPage={setPage} setPageSize={setPageSize} />
 
       {transferLoadModalOpen && (() => {
         const requested = transferSeedIds.length;
@@ -9302,7 +9377,7 @@ function GraphCellNumberInput({ value, disabled = false, onCommit, onFocus, onBl
 function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = null, onPresenceEditing = null }) {
   const { groups, subjects, teachers, lessonTypes, loads, config, curriculumPlan, specialties, rooms = [] } = data;
   const [viewMode, setViewMode] = useState("group");
-  const [targetId, setTargetId] = useState("");
+  const [targetId, setTargetId] = useState(() => (groups && groups[0] ? groups[0].id : ""));
   // v1832: отдельный режим мультифильтра для графиков.
   // Можно выбрать несколько групп и дополнительно сузить их одним преподавателем.
   const [graphFilterGroupIds, setGraphFilterGroupIds] = useState([]);
@@ -9587,6 +9662,7 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
   const autoPairLimitRenderCache = new Map();
   const overloadInfoRenderCache = new Map();
   const remainingInfoRenderCache = new Map();
+  const graphScarcityProfileCache = new Map();
 
   // v1532: практика может занимать только часть недели. Такая неделя больше не
   // блокируется целиком: график остаётся редактируемым, но недельная вместимость
@@ -9901,22 +9977,19 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
     if (!row || !gid) return false;
     if (String(row.groupId || '') === String(gid)) return true;
     if (!(row.streamGroupIds || []).map(String).includes(String(gid))) return false;
-
-    // Если у участника потока есть собственная строка нагрузки, именно она
-    // является источником его часов. Чужую строку потока не считаем второй раз.
-    const ownParticipant = loads.some((peer) =>
+    const key = [String(gid), String(row.subjectId || ""), String(row.typeId || "")].join("|");
+    const peers = sameGroupSubjectTypePeers.get(key) || [];
+    return !peers.some((peer) =>
       peer && String(peer.id || '') !== String(row.id || '') &&
-      String(peer.groupId || '') === String(gid) &&
-      peer.subjectId === row.subjectId && peer.typeId === row.typeId &&
       sameHourBucket(peer, row) && sameLogicalHourStream(peer, row)
     );
-    return !ownParticipant;
   };
 
   const canonicalHourRowsForGroup = (gid, sample) => {
     const seenStreams = new Set();
     const seenLegacy = new Set();
-    return loads.filter((x) =>
+    const groupRows = graphLoadsByGroup.get(String(gid)) || [];
+    return groupRows.filter((x) =>
       countsTowardGroupHours(x, gid) &&
       x.subjectId === sample.subjectId && x.typeId === sample.typeId && sameHourBucket(x, sample)
     ).filter((x) => {
@@ -9971,9 +10044,9 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
   // 13 парах показывалось ложное +26 ак.ч.
   const hourOwnerRowForGroup = (gid, load) => {
     if (String(load?.groupId || "") === String(gid)) return load;
-    const own = (loads || []).find((peer) =>
-      peer && String(peer.groupId || "") === String(gid) &&
-      peer.subjectId === load.subjectId && peer.typeId === load.typeId &&
+    const key = [String(gid), String(load.subjectId || ""), String(load.typeId || "")].join("|");
+    const peers = sameGroupSubjectTypePeers.get(key) || [];
+    const own = peers.find((peer) =>
       sameHourBucket(peer, load) && sameLogicalHourStream(peer, load)
     );
     return own || load;
@@ -10275,24 +10348,32 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
     return { available, total, ratio: total ? available / total : 0, vacancy: false };
   };
 
-  const graphScarcityProfile = (l, excludedLoadIds = new Set()) => {
+  const computeScarcityProfile = (l, excludedLoadIds) => {
     const roomOptions = graphRoomOptionCount(l);
     const teacherPattern = graphTeacherAvailabilityProfile(l);
     let estimatedSlots = 0;
     let feasibleWeeks = 0;
-    for (let w=1; w<=totalWeeks; w++) {
-      if (practiceBlocksLoadWeek(l,w)) continue;
-      const gc = groupWeekCapacity(graphTargetId,w);
-      const weight = groupLoadPairWeight(l,graphTargetId);
+    for (let w = 1; w <= totalWeeks; w++) {
+      if (practiceBlocksLoadWeek(l, w)) continue;
+      const gc = groupWeekCapacity(graphTargetId, w);
+      const weight = groupLoadPairWeight(l, graphTargetId);
       const groupSlots = weight > 0 ? Math.floor(gc.capacityPairs / weight) : 0;
-      const rawTeacher = teacherRawSlotCapacity(l,w);
-      const reservedOther = teacherReservedPairs(l.teacherId,w,excludedLoadIds);
-      const teacherFree = Number.isFinite(rawTeacher) ? Math.max(0, rawTeacher-reservedOther) : groupSlots;
+      const rawTeacher = teacherRawSlotCapacity(l, w);
+      const reservedOther = teacherReservedPairs(l.teacherId, w, excludedLoadIds);
+      const teacherFree = Number.isFinite(rawTeacher) ? Math.max(0, rawTeacher - reservedOther) : groupSlots;
       const possible = Math.max(0, Math.min(groupSlots, teacherFree));
       if (possible > 0 && roomOptions > 0) { feasibleWeeks++; estimatedSlots += possible; }
     }
     const demand = Math.max(0, Number(autoPairLimit(l)) || 0);
     return { ...teacherPattern, roomOptions, estimatedSlots, feasibleWeeks, demand };
+  };
+
+  const graphScarcityProfile = (l, excludedLoadIds = new Set()) => {
+    const key = `${String(l?.id || "")}:${excludedLoadIds.size}:${graphTargetId}`;
+    if (graphScarcityProfileCache.has(key)) return graphScarcityProfileCache.get(key);
+    const value = computeScarcityProfile(l, excludedLoadIds);
+    graphScarcityProfileCache.set(key, value);
+    return value;
   };
 
   const graphScarcityLevel = (l) => {
@@ -13191,7 +13272,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     if (viewKind !== "allGroups" && viewKind !== "semesterAll" && viewId && !list.find((x) => x.id === viewId)) setViewId("");
   }, [viewKind, filterSpec, list.length]); // eslint-disable-line
 
-  const activeDayIndices = data.config.activeDays.map((on, i) => (on ? i : null)).filter((v) => v !== null);
+  const activeDayIndices = (data?.config?.activeDays || [true, true, true, true, true, false, false]).map((on, i) => (on ? i : null)).filter((v) => v !== null);
   const selectedWeekMonday = data.config.semesterStart && totalWeeksInSchedule > 0
     ? addDays(mondayOf(data.config.semesterStart), (scheduleWeek - 1) * 7)
     : null;
@@ -20944,8 +21025,8 @@ ${check.reason || "Конфликт расписания"}
       return;
     }
     const title = `Расписание — ${currentViewName}`;
+    const esc = (v) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     if (weekScope === "all") {
-      const esc=(v)=>String(v??"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
       const makeParity=(parity,label)=>{
         const weeks=Array.from({length:totalWeeksInSchedule},(_,i)=>i+1).filter((w)=>parity==="odd"?w%2===1:w%2===0);
         return `<h2>${label}</h2>`+weeks.map((week)=>{
@@ -20973,7 +21054,7 @@ ${check.reason || "Конфликт расписания"}
     }
     let tableRows = "";
     for (let p = 0; p < data.config.periodsPerDay; p++) {
-      tableRows += `<tr><td style="font-weight:bold;">${p + 1}<br/><span style="font-size:9pt;color:#555;">${data.config.periodTimes[p] || ""}</span></td>`;
+      tableRows += `<tr><td style="font-weight:bold;">${p + 1}<br/><span style="font-size:9pt;color:#555;">${esc(data.config.periodTimes[p] || "")}</span></td>`;
       for (const day of activeDayIndices) {
         const cells = cellFor(day, p);
         if (cells.length === 0) { tableRows += `<td></td>`; continue; }
@@ -20983,20 +21064,20 @@ ${check.reason || "Конфликт расписания"}
           const teacher = byId(data.teachers, cell.subOverride?.teacherId || cell.inst.teacherId)?.name || "";
           const group = byId(data.groups, cell.inst.groupId)?.name || "";
           const room = assignmentRoomLabel(data, cell.a) || "";
-          const lines = [`<b>${subj}</b> (${type})`];
-          if (viewKind !== "teacher") lines.push(teacher);
-          if (viewKind !== "group") lines.push(group);
-          if (viewKind !== "room") lines.push(cell.inst.format === "remote" ? "дистанционно" : `ауд. ${room}`);
-          if (cell.inst.weekPattern && cell.inst.weekPattern !== "all") lines.push(weekNumbersLabel(data.config, cell.inst));
+          const lines = [`<b>${esc(subj)}</b> (${esc(type)})`];
+          if (viewKind !== "teacher") lines.push(esc(teacher));
+          if (viewKind !== "group") lines.push(esc(group));
+          if (viewKind !== "room") lines.push(cell.inst.format === "remote" ? "дистанционно" : `ауд. ${esc(room)}`);
+          if (cell.inst.weekPattern && cell.inst.weekPattern !== "all") lines.push(esc(weekNumbersLabel(data.config, cell.inst)));
           return `<div style="margin-bottom:4px;">${lines.join("<br/>")}</div>`;
         }).join("");
         tableRows += `<td>${html}</td>`;
       }
       tableRows += `</tr>`;
     }
-    const headHtml = `<tr><th>Пара</th>${activeDayIndices.map((d) => `<th>${DAY_LABELS_FULL[d]}</th>`).join("")}</tr>`;
+    const headHtml = `<tr><th>Пара</th>${activeDayIndices.map((d) => `<th>${esc(DAY_LABELS_FULL[d])}</th>`).join("")}</tr>`;
     const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
-<head><meta charset="utf-8"><title>${title}</title>
+<head><meta charset="utf-8"><title>${esc(title)}</title>
 <style>
 body{font-family:Calibri,Arial,sans-serif;font-size:11pt;}
 h1{font-size:16pt;}
@@ -21005,7 +21086,7 @@ th,td{border:1px solid #888;padding:6px 8px;vertical-align:top;font-size:10pt;}
 th{background:#1E3A5F;color:#ffffff;}
 </style></head>
 <body>
-<h1>${title}</h1>
+<h1>${esc(title)}</h1>
 <table>${headHtml}${tableRows}</table>
 </body></html>`;
     const blob = new Blob(["\ufeff", html], { type: "application/msword" });
@@ -24350,46 +24431,119 @@ function curriculumProgressRows(data) {
   return rows;
 }
 
-function ConflictCenterPanel({data,set,onAutoGenerate}){
-  const by=(arr,id)=>arr.find((x)=>x.id===id);
-  const conflicts=[];
-  const occ=scheduleOccurrences(data);
-  for(const o of occ){
-    if(isNoClassDate(data,o.date)) conflicts.push({kind:"calendar",severity:"critical",date:o.date,loadId:o.inst.loadId,text:`${by(data.groups,o.inst.groupId)?.name||"Группа"}: ${by(data.subjects,o.inst.subjectId)?.name||"Занятие"} попадает на день без обычных занятий`});
-    if(o.inst.format!=="remote"){
-      const roomNames=assignmentRoomLabel(data,o.a); const subj=by(data.subjects,o.inst.subjectId);
-      const selectedRooms=assignmentRoomIds(o.a).map(id=>by(data.rooms,id)).filter(Boolean);
-      const bad=selectedRooms.map(r=>roomMeetsSubject(r,subj,0)).find(x=>!x.ok);
-      const totalCap=selectedRooms.reduce((sum,r)=>sum+(Number(r.capacity)||0),0);
-      const capBad=o.inst.requiredCapacity&&totalCap&&totalCap<o.inst.requiredCapacity?`не хватает мест: нужно ${o.inst.requiredCapacity}, суммарно ${totalCap}`:"";
-      if(bad||capBad) conflicts.push({kind:"room",severity:"critical",date:o.date,text:`${by(data.groups,o.inst.groupId)?.name||""} · ${subj?.name||""}: ${capBad||bad.reason}`});
+function findCalendarAndRoomConflicts(data, occ, groupMap, subjectMap, roomMap) {
+  const conflicts = [];
+  for (const o of occ) {
+    if (isNoClassDate(data, o.date)) {
+      const gName = groupMap.get(o.inst.groupId)?.name || "Группа";
+      const sName = subjectMap.get(o.inst.subjectId)?.name || "Занятие";
+      conflicts.push({ kind: "calendar", severity: "critical", date: o.date, loadId: o.inst.loadId, text: `${gName}: ${sName} попадает на день без обычных занятий` });
+    }
+    if (o.inst.format !== "remote") {
+      const subj = subjectMap.get(o.inst.subjectId);
+      const selectedRooms = assignmentRoomIds(o.a).map((id) => roomMap.get(id)).filter(Boolean);
+      const bad = selectedRooms.map((r) => roomMeetsSubject(r, subj, 0)).find((x) => !x.ok);
+      const totalCap = selectedRooms.reduce((sum, r) => sum + (Number(r.capacity) || 0), 0);
+      const capBad = o.inst.requiredCapacity && totalCap && totalCap < o.inst.requiredCapacity ? `не хватает мест: нужно ${o.inst.requiredCapacity}, суммарно ${totalCap}` : "";
+      if (bad || capBad) {
+        const gName = groupMap.get(o.inst.groupId)?.name || "";
+        const sName = subj?.name || "";
+        conflicts.push({ kind: "room", severity: "critical", date: o.date, text: `${gName} · ${sName}: ${capBad || bad.reason}` });
+      }
     }
   }
-  // Фактическая двойная занятость по конкретной дате.
-  // ВАЖНО: п/г 1 и п/г 2 одной группы могут идти параллельно и конфликтом не являются.
-  // Старая диагностика складывала занятость в грубые gp:<group>:<subgroup> ключи и
-  // поэтому могла принять старый синтетический subgroup=0 из потокового instance за «всю группу».
-  // Здесь используем те же авторитетные loadId -> subgroup правила, что и основное расписание.
-  const occurrenceLabel = (o) => {
-    const group = by(data.groups, o.inst.groupId)?.name || "Группа";
-    const subject = by(data.subjects, o.inst.subjectId)?.name || "Занятие";
-    const teacher = by(data.teachers, o.teacherId)?.name || by(data.teachers, o.inst.teacherId)?.name || "";
-    const sg = Number(o.inst.subgroup) || 0;
-    return `${group}${sg ? ` · п/г ${sg}` : " · вся группа"} · ${subject}${teacher ? ` · ${teacher}` : ""}`;
-  };
-  const sameHalfDoesNotOverlap = (A, B) => {
-    const ah=A.a?.half ?? null, bh=B.a?.half ?? null;
-    return ah != null && bh != null && Number(ah)!==Number(bh);
-  };
-  const allowedMidPairEventOccurrence = (A, B) => {
-    const aEvent=!!A?.inst?.isScheduleEvent, bEvent=!!B?.inst?.isScheduleEvent;
-    if (aEvent === bEvent) return false;
-    const eventOcc = aEvent ? A : B;
-    const lessonOcc = aEvent ? B : A;
-    const period = Number(lessonOcc?.a?.period ?? eventOcc?.a?.period);
-    const day = Number(lessonOcc?.a?.day ?? eventOcc?.a?.day);
-    return eventStartsInsideAcademicPeriod(data.config, eventOcc.inst, period, data, lessonOcc.inst, day);
-  };
+  return conflicts;
+}
+
+function occurrenceDisplayLabel(data, o, groupMap, subjectMap, teacherMap) {
+  const group = groupMap.get(o.inst.groupId)?.name || "Группа";
+  const subject = subjectMap.get(o.inst.subjectId)?.name || "Занятие";
+  const teacher = teacherMap.get(o.teacherId)?.name || teacherMap.get(o.inst.teacherId)?.name || "";
+  const sg = Number(o.inst.subgroup) || 0;
+  return `${group}${sg ? ` · п/г ${sg}` : " · вся группа"} · ${subject}${teacher ? ` · ${teacher}` : ""}`;
+}
+
+function isAllowedMidPairEvent(data, A, B) {
+  const aEvent = !!A?.inst?.isScheduleEvent, bEvent = !!B?.inst?.isScheduleEvent;
+  if (aEvent === bEvent) return false;
+  const eventOcc = aEvent ? A : B, lessonOcc = aEvent ? B : A;
+  const period = Number(lessonOcc?.a?.period ?? eventOcc?.a?.period);
+  const day = Number(lessonOcc?.a?.day ?? eventOcc?.a?.day);
+  return eventStartsInsideAcademicPeriod(data.config, eventOcc.inst, period, data, lessonOcc.inst, day);
+}
+
+function checkGroupOverlap(data, A, B, gid, slotKey, doubleSeen, labelA, labelB, groupMap) {
+  if (!normalizedParticipantSubgroupsOverlap(data, A.inst, B.inst, gid)) return null;
+  const pairIds = [String(A.inst.instId || ""), String(B.inst.instId || "")].sort().join("|");
+  const key = `${slotKey}|group|${gid}|${pairIds}`;
+  if (doubleSeen.has(key)) return null;
+  doubleSeen.add(key);
+  const subsA = normalizedParticipantSubgroups(data, A.inst, gid);
+  const subsB = normalizedParticipantSubgroups(data, B.inst, gid);
+  const groupName = groupMap.get(gid)?.name || "Группа";
+  const subLabel = (xs) => xs.includes(0) ? "вся группа" : xs.map((x) => `п/г ${x}`).join(", ");
+  return { kind: "double", severity: "critical", date: A.date, text: `${groupName}: реальное наложение на ${A.a.period + 1}-й паре — ${subLabel(subsA)} пересекается с ${subLabel(subsB)}. ${labelA} ↔ ${labelB}` };
+}
+
+function checkTeacherOverlap(data, A, B, slotKey, doubleSeen, labelA, labelB, teacherMap) {
+  if (!A.teacherId || !B.teacherId || A.teacherId !== B.teacherId || A.inst.isVacancyTeacher || B.inst.isVacancyTeacher) return null;
+  if (sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst) || A.a?.manualPotentialStream || B.a?.manualPotentialStream || A.a?.manualTeacherMultiRoom || B.a?.manualTeacherMultiRoom || A.a?.manualMultiGroupRoom || B.a?.manualMultiGroupRoom) return null;
+  const pairIds = [String(A.inst.instId || ""), String(B.inst.instId || "")].sort().join("|");
+  const key = `${slotKey}|teacher|${A.teacherId}|${pairIds}`;
+  if (doubleSeen.has(key)) return null;
+  doubleSeen.add(key);
+  const teacherName = teacherMap.get(A.teacherId)?.name || "Преподаватель";
+  return { kind: "double", severity: "critical", date: A.date, text: `${teacherName}: одновременно два разных занятия на ${A.a.period + 1}-й паре. ${labelA} ↔ ${labelB}` };
+}
+
+function checkRoomOverlap(data, A, B, slotKey, doubleSeen, labelA, labelB, roomMap) {
+  if (A.inst.format === "remote" || B.inst.format === "remote" || sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst) || A.a?.manualPotentialStream || B.a?.manualPotentialStream || A.a?.manualMultiGroupRoom || B.a?.manualMultiGroupRoom) return [];
+  const pairIds = [String(A.inst.instId || ""), String(B.inst.instId || "")].sort().join("|");
+  const roomsA = new Set(assignmentRoomIds(A.a));
+  const conflicts = [];
+  for (const rid of assignmentRoomIds(B.a)) {
+    if (!roomsA.has(rid)) continue;
+    const key = `${slotKey}|room|${rid}|${pairIds}`;
+    if (doubleSeen.has(key)) continue;
+    doubleSeen.add(key);
+    const roomName = roomMap.get(rid)?.name || "Аудитория";
+    conflicts.push({ kind: "double", severity: "critical", date: A.date, text: `Аудитория ${roomName}: одновременно назначены два разных занятия на ${A.a.period + 1}-й паре. ${labelA} ↔ ${labelB}` });
+  }
+  return conflicts;
+}
+
+function findSlotDoubleBookings(data, rows, slotKey, doubleSeen, { groupMap, subjectMap, teacherMap, roomMap }) {
+  const conflicts = [];
+  for (let i = 0; i < rows.length; i++) {
+    for (let j = i + 1; j < rows.length; j++) {
+      const A = rows[i], B = rows[j];
+      if (A.inst.instId === B.inst.instId) continue;
+      if (A.a?.half != null && B.a?.half != null && Number(A.a.half) !== Number(B.a.half)) continue;
+      if (isAllowedMidPairEvent(data, A, B)) continue;
+      const labelA = occurrenceDisplayLabel(data, A, groupMap, subjectMap, teacherMap);
+      const labelB = occurrenceDisplayLabel(data, B, groupMap, subjectMap, teacherMap);
+      for (const gid of streamGroups(A.inst)) {
+        if (streamGroups(B.inst).includes(gid)) {
+          const c = checkGroupOverlap(data, A, B, gid, slotKey, doubleSeen, labelA, labelB, groupMap);
+          if (c) conflicts.push(c);
+        }
+      }
+      const tc = checkTeacherOverlap(data, A, B, slotKey, doubleSeen, labelA, labelB, teacherMap);
+      if (tc) conflicts.push(tc);
+      conflicts.push(...checkRoomOverlap(data, A, B, slotKey, doubleSeen, labelA, labelB, roomMap));
+    }
+  }
+  return conflicts;
+}
+
+function computeScheduleConflicts(data) {
+  const groupMap = new Map((data.groups || []).map((x) => [x.id, x]));
+  const subjectMap = new Map((data.subjects || []).map((x) => [x.id, x]));
+  const teacherMap = new Map((data.teachers || []).map((x) => [x.id, x]));
+  const roomMap = new Map((data.rooms || []).map((x) => [x.id, x]));
+  const maps = { groupMap, subjectMap, teacherMap, roomMap };
+  const occ = scheduleOccurrences(data);
+  const conflicts = findCalendarAndRoomConflicts(data, occ, groupMap, subjectMap, roomMap);
   const byDateSlot = new Map();
   for (const o of occ) {
     const key = `${o.date}|${Number(o.a.period)}`;
@@ -24397,72 +24551,84 @@ function ConflictCenterPanel({data,set,onAutoGenerate}){
   }
   const doubleSeen = new Set();
   for (const [slotKey, rows] of byDateSlot.entries()) {
-    for (let i=0;i<rows.length;i++) for (let j=i+1;j<rows.length;j++) {
-      const A=rows[i], B=rows[j];
-      if (A.inst.instId === B.inst.instId || sameHalfDoesNotOverlap(A,B)) continue;
-      if (allowedMidPairEventOccurrence(A,B)) continue;
-      const pairIds=[String(A.inst.instId||""),String(B.inst.instId||"")].sort().join("|");
-      const commonGroups = streamGroups(A.inst).filter((gid)=>streamGroups(B.inst).includes(gid));
-      for (const gid of commonGroups) {
-        if (!normalizedParticipantSubgroupsOverlap(data, A.inst, B.inst, gid)) continue;
-        const subsA=normalizedParticipantSubgroups(data,A.inst,gid), subsB=normalizedParticipantSubgroups(data,B.inst,gid);
-        const groupName=by(data.groups,gid)?.name||"Группа";
-        const subLabel=(xs)=>xs.includes(0)?"вся группа":xs.map((x)=>`п/г ${x}`).join(", ");
-        const key=`${slotKey}|group|${gid}|${pairIds}`;
-        if (!doubleSeen.has(key)) {
-          doubleSeen.add(key);
-          conflicts.push({kind:"double",severity:"critical",date:A.date,text:`${groupName}: реальное наложение на ${A.a.period+1}-й паре — ${subLabel(subsA)} пересекается с ${subLabel(subsB)}. ${occurrenceLabel(A)} ↔ ${occurrenceLabel(B)}`});
-        }
-      }
-      if (A.teacherId && B.teacherId && A.teacherId===B.teacherId && !A.inst.isVacancyTeacher && !B.inst.isVacancyTeacher && !sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst) && !A.a?.manualPotentialStream && !B.a?.manualPotentialStream && !A.a?.manualTeacherMultiRoom && !B.a?.manualTeacherMultiRoom && !A.a?.manualMultiGroupRoom && !B.a?.manualMultiGroupRoom) {
-        const key=`${slotKey}|teacher|${A.teacherId}|${pairIds}`;
-        if (!doubleSeen.has(key)) {
-          doubleSeen.add(key);
-          const teacherName=by(data.teachers,A.teacherId)?.name||"Преподаватель";
-          conflicts.push({kind:"double",severity:"critical",date:A.date,text:`${teacherName}: одновременно два разных занятия на ${A.a.period+1}-й паре. ${occurrenceLabel(A)} ↔ ${occurrenceLabel(B)}`});
-        }
-      }
-      if (A.inst.format!=="remote" && B.inst.format!=="remote" && !sameTeacherSiblingSubgroupsCompatible(A.inst, B.inst) && !A.a?.manualPotentialStream && !B.a?.manualPotentialStream && !A.a?.manualMultiGroupRoom && !B.a?.manualMultiGroupRoom) {
-        const roomsA=new Set(assignmentRoomIds(A.a));
-        for (const rid of assignmentRoomIds(B.a)) if (roomsA.has(rid)) {
-          const key=`${slotKey}|room|${rid}|${pairIds}`;
-          if (doubleSeen.has(key)) continue;
-          doubleSeen.add(key);
-          const roomName=by(data.rooms,rid)?.name||"Аудитория";
-          conflicts.push({kind:"double",severity:"critical",date:A.date,text:`Аудитория ${roomName}: одновременно назначены два разных занятия на ${A.a.period+1}-й паре. ${occurrenceLabel(A)} ↔ ${occurrenceLabel(B)}`});
-        }
-      }
-    }
+    conflicts.push(...findSlotDoubleBookings(data, rows, slotKey, doubleSeen, maps));
   }
-  for(const r of curriculumProgressRows(data)){
-    if(r.delta<0) conflicts.push({kind:"hours",severity:"warning",groupId:r.group.id,planId:r.plan.id,text:`${r.group.name} · ${by(data.subjects,r.plan.subjectId)?.name||""}: не хватает ${Math.abs(r.delta)} ч.`});
-    if(r.delta>0) conflicts.push({kind:"hours",severity:"warning",groupId:r.group.id,planId:r.plan.id,text:`${r.group.name} · ${by(data.subjects,r.plan.subjectId)?.name||""}: превышение на ${r.delta} ч.`});
+  for (const r of curriculumProgressRows(data)) {
+    if (r.delta < 0) conflicts.push({ kind: "hours", severity: "warning", groupId: r.group.id, planId: r.plan.id, text: `${r.group.name} · ${subjectMap.get(r.plan.subjectId)?.name || ""}: не хватает ${Math.abs(r.delta)} ч.` });
+    if (r.delta > 0) conflicts.push({ kind: "hours", severity: "warning", groupId: r.group.id, planId: r.plan.id, text: `${r.group.name} · ${subjectMap.get(r.plan.subjectId)?.name || ""}: превышение на ${r.delta} ч.` });
   }
-  const dedup=[...new Map(conflicts.map((x)=>[`${x.kind}|${x.date||""}|${x.text}`,x])).values()];
-  const critical=dedup.filter((x)=>x.severity==="critical").length;
-  const autoFix=()=>{
-    let loads=(data.loads||[]).map((l)=>({...l,weeklyPairs:{...(l.weeklyPairs||{})}}));
-    // Компенсируем занятия, выпавшие на календарные исключения, на ближайшей следующей разрешённой неделе.
-    const calendarLost=dedup.filter((x)=>x.kind==="calendar"&&x.loadId);
-    for(const c of calendarLost){
-      const l=loads.find((x)=>x.id===c.loadId); if(!l) continue;
-      const lostWeek=weekNumberOf(data.config.semesterStart,c.date)||1;
-      let target=null;
-      for(let w=lostWeek+1;w<=totalSemesterWeeks(data.config);w++){
-        const mon=addDays(mondayOf(data.config.semesterStart),(w-1)*7);
-        const usable=Array.from({length:7},(_,d)=>addDays(mon,d)).some((d)=>d>=data.config.semesterStart&&d<=data.config.semesterEnd&&!isNoClassDate(data,d));
-        if(usable){target=w;break;}
-      }
-      if(target) l.weeklyPairs[target]=(Number(l.weeklyPairs[target])||0)+1;
+  return [...new Map(conflicts.map((x) => [`${x.kind}|${x.date || ""}|${x.text}`, x])).values()];
+}
+
+function applyConflictAutoFix(data, set, conflicts) {
+  let loads = (data.loads || []).map((l) => ({ ...l, weeklyPairs: { ...(l.weeklyPairs || {}) } }));
+  const calendarLost = conflicts.filter((x) => x.kind === "calendar" && x.loadId);
+  for (const c of calendarLost) {
+    const l = loads.find((x) => x.id === c.loadId);
+    if (!l) continue;
+    const lostWeek = weekNumberOf(data.config.semesterStart, c.date) || 1;
+    let target = null;
+    for (let w = lostWeek + 1; w <= totalSemesterWeeks(data.config); w++) {
+      const mon = addDays(mondayOf(data.config.semesterStart), (w - 1) * 7);
+      const usable = Array.from({ length: 7 }, (_, d) => addDays(mon, d)).some((d) => d >= data.config.semesterStart && d <= data.config.semesterEnd && !isNoClassDate(data, d));
+      if (usable) { target = w; break; }
     }
-    set("loads")(loads);
-    const nextData={...data,loads};
-    set("schedule")(generateSchedule(nextData,data.schedule));
-  };
-  return <div className="section"><header className="section-head"><h1>Центр конфликтов</h1><p>Единая диагностика расписания: двойная занятость, неподходящие аудитории, календарные исключения и расхождения с учебным планом.</p></header>
-    <div className="stats-row"><div className="stat warn"><div className="stat-value">{critical}</div><div className="stat-label">Критических</div></div><div className="stat"><div className="stat-value">{dedup.length-critical}</div><div className="stat-label">Предупреждений</div></div><button className="btn primary" onClick={autoFix}><Wand2 size={15}/> Исправить автоматически</button><button className="btn ghost" onClick={onAutoGenerate}>Пересчитать расписание</button></div>
-    <div className="table-wrap"><table><thead><tr><th>Уровень</th><th>Дата</th><th>Категория</th><th>Проблема</th></tr></thead><tbody>{dedup.map((c,i)=><tr key={i}><td>{c.severity==="critical"?"🔴 критично":"🟡 предупреждение"}</td><td>{c.date?formatDateDM(c.date):"—"}</td><td>{c.kind==="calendar"?"Календарь":c.kind==="room"?"Аудитория":c.kind==="double"?"Занятость":"Часы"}</td><td>{c.text}</td></tr>)}{!dedup.length&&<tr><td colSpan={4} className="empty-row">Конфликтов не найдено</td></tr>}</tbody></table></div>
-  </div>;
+    if (target) l.weeklyPairs[target] = (Number(l.weeklyPairs[target]) || 0) + 1;
+  }
+  set("loads")(loads);
+  set("schedule")(generateSchedule({ ...data, loads }, data.schedule));
+}
+
+function ConflictCenterPanel({ data, set, onAutoGenerate }) {
+  const [analyzing, setAnalyzing] = useState(true);
+  const [conflicts, setConflicts] = useState([]);
+
+  useEffect(() => {
+    setAnalyzing(true);
+    const timer = setTimeout(() => {
+      setConflicts(computeScheduleConflicts(data));
+      setAnalyzing(false);
+    }, 10);
+    return () => clearTimeout(timer);
+  }, [data.schedule, data.loads, data.config, data.curriculumPlan]);
+
+  const critical = conflicts.filter((x) => x.severity === "critical").length;
+  const autoFix = () => applyConflictAutoFix(data, set, conflicts);
+
+  return (
+    <div className="section">
+      <header className="section-head">
+        <h1>Центр конфликтов</h1>
+        <p>Единая диагностика расписания: двойная занятость, неподходящие аудитории, календарные исключения и расхождения с учебным планом.</p>
+      </header>
+      <div className="stats-row">
+        <div className="stat warn"><div className="stat-value">{analyzing ? "…" : critical}</div><div className="stat-label">Критических</div></div>
+        <div className="stat"><div className="stat-value">{analyzing ? "…" : conflicts.length - critical}</div><div className="stat-label">Предупреждений</div></div>
+        <button className="btn primary" onClick={autoFix} disabled={analyzing}><Wand2 size={15}/> Исправить автоматически</button>
+        <button className="btn ghost" onClick={onAutoGenerate} disabled={analyzing}>Пересчитать расписание</button>
+      </div>
+      {analyzing ? (
+        <div className="notice" style={{ padding: "16px 20px" }}>⏳ Анализ конфликтов расписания…</div>
+      ) : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Уровень</th><th>Дата</th><th>Категория</th><th>Проблема</th></tr></thead>
+            <tbody>
+              {conflicts.map((c, i) => (
+                <tr key={i}>
+                  <td>{c.severity === "critical" ? "🔴 критично" : "🟡 предупреждение"}</td>
+                  <td>{c.date ? formatDateDM(c.date) : "—"}</td>
+                  <td>{c.kind === "calendar" ? "Календарь" : c.kind === "room" ? "Аудитория" : c.kind === "double" ? "Занятость" : "Часы"}</td>
+                  <td>{c.text}</td>
+                </tr>
+              ))}
+              {!conflicts.length && <tr><td colSpan={4} className="empty-row">Конфликтов не найдено</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function SubstitutionScenariosPanel({data,set}){
@@ -25180,9 +25346,6 @@ function AttestationPanel({ data, set, onPublish }) {
 function dateRangesOverlap(startA, endA, startB, endB) {
   return startA <= endB && startB <= endA;
 }
-function isGroupOnPractice(data, groupId, date) {
-  return (data.practices || []).find((p) => p.groupId === groupId && p.dateStart <= date && date <= p.dateEnd) || null;
-}
 function practiceRoomBookings(p) {
   return Array.isArray(p?.roomBookings) ? p.roomBookings : [];
 }
@@ -25598,7 +25761,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
     if (window.location.pathname !== target) window.history.replaceState(null, "", target + window.location.search);
   }, [syncUrl, kind, viewId, selSpecialty, selYear]);
 
-  const activeDayIndices = data.config.activeDays.map((on, i) => (on ? i : null)).filter((v) => v !== null);
+  const activeDayIndices = (data?.config?.activeDays || [true, true, true, true, true, false, false]).map((on, i) => (on ? i : null)).filter((v) => v !== null);
   const byId = (arr, id) => arr.find((x) => x.id === id);
   const groupBellPresetForDay = (groupId, day, dateStr = "", parityOverride = null) => {
     const custom = groupPeriodTimesForDay(data, groupId, day, dateStr, parityOverride);
@@ -26650,7 +26813,7 @@ const ADMIN_TABS = [
 const TAB_SAVE_KEYS = {
   semester: ["config"],
   constraints: ["config"],
-  announcements: ["announcements"],
+  announcements: ["announcements", "publicIntroText"],
   consultations: ["consultations"],
   lists: ["groups","teachers","rooms","subjects","lessonTypes","specialties","employmentTypes"],
   curriculum: ["curriculumPlan"],
@@ -26771,6 +26934,12 @@ export default function App() {
   const [data, setData] = useState(null);
   const [loaded, setLoaded] = useState(false);
   const [fullDataLoaded, setFullDataLoaded] = useState(false);
+  const editorLoadedRef = useRef(false);
+  const editorEditSerialRef = useRef(0);
+  const editorHydrationRef = useRef(Promise.resolve());
+  const [editorLoading, setEditorLoading] = useState(false);
+  const [editorLoadError, setEditorLoadError] = useState("");
+  const editorReadyForTab = !editorMissingSections(data, editorTabSections(tab)).length;
   const [publicUserCount, setPublicUserCount] = useState(0);
   const [publicPaused, setPublicPaused] = useState(false);
   const [publicPausedMessage, setPublicPausedMessage] = useState("");
@@ -27071,6 +27240,8 @@ export default function App() {
   };
 
   const persistSnapshot = (snapshot, revision, { manual = false, scopeTab = tab, scheduleGroupId = "" } = {}) => {
+    const required = scopeTab === "__all__" ? EDITOR_SECTIONS : (saveKeysForTab(scopeTab) || []);
+    if (editorMissingSections(snapshot, required).length) return Promise.reject(new Error("Раздел ещё загружается; сохранение отложено"));
     const graphEditSerialAtRequest = scopeTab === "graphs" ? graphUserEditSerialRef.current : null;
     // Собираем снимок от последней серверной базы и накладываем только данные
     // текущей страницы. Так несохранённые/устаревшие поля других страниц не
@@ -27092,7 +27263,13 @@ export default function App() {
       payload = buildSyncedSnapshot(scoped);
       json = JSON.stringify(payload);
       if (manual) {
-        try { sessionStorage.setItem("schedule-crash-draft-v125", json); } catch {}
+        try {
+          const draft = payload ? { ...payload } : {};
+          if (Array.isArray(draft.users)) {
+            draft.users = draft.users.map(({ id, name, login, role }) => ({ id, name, login, role }));
+          }
+          sessionStorage.setItem("schedule-crash-draft-v125", JSON.stringify(draft));
+        } catch {}
       }
     }
     setSaveState("saving");
@@ -27477,6 +27654,9 @@ export default function App() {
     const canonicalJson = typeof res.value === "string" ? res.value : JSON.stringify(res.value);
     skipAutosaveRef.current = true;
     const normalized = normalizeStoredData(parsed);
+    normalized._editorDeferred = parsed._editorDeferred || res.deferredSections || [];
+    setEditorDeferred(normalized._editorDeferred);
+    editorLoadedRef.current = true;
     latestDataRef.current = normalized;
     setData(normalized);
     lastSavedJson.current = canonicalJson;
@@ -27494,13 +27674,120 @@ export default function App() {
     return true;
   };
 
-  const ensureFullDataLoaded = async () => {
-    if (fullDataLoaded && latestDataRef.current) return latestDataRef.current;
-    const res = await storageGetStrict("schedule-data-v2", { editorCompact: true });
-    if (applyFullStorageResponse(res)) return res.value;
-    if (res?.missing) { setStorageMissing(true); throw new Error("Рабочее хранилище не найдено"); }
-    throw new Error("Не удалось загрузить рабочие данные");
+  const ensureEditorLoaded = async () => {
+    if (editorLoadedRef.current) return latestDataRef.current;
+    const response = await editorBootstrapGet();
+    response.value._editorDeferred = response.deferredSections || response.value._editorDeferred || [];
+    if (!applyFullStorageResponse(response)) throw new Error("Не удалось загрузить редактор");
+    return latestDataRef.current;
   };
+
+  const flushEditorChanges = async () => {
+    clearTimeout(saveTimer.current);
+    for (const timer of pageSaveTimersRef.current.values()) clearTimeout(timer);
+    pageSaveTimersRef.current.clear();
+    if (graphSaveTimerRef.current) clearTimeout(graphSaveTimerRef.current);
+    graphSaveTimerRef.current = null;
+    await saveChainRef.current.catch(() => {});
+    await scheduleCellPatchChainRef.current.catch(() => {});
+    for (const scopeTab of [...pendingSaveTabsRef.current]) {
+      await persistSnapshot(latestDataRef.current, pageSaveRevisionRef.current.get(scopeTab), {
+        scopeTab, scheduleGroupId: scopeTab === "schedule" ? scheduleRouteGroupIdRef.current : "",
+      });
+    }
+    if (pendingSaveTabsRef.current.size) throw new Error("Дождитесь сохранения изменений перед загрузкой раздела");
+  };
+
+  const applyEditorHydration = (response) => {
+    const next = normalizeStoredData(response.value);
+    next._editorDeferred = response.value._editorDeferred || [];
+    setEditorDeferred(next._editorDeferred);
+    storageRememberCellRevisions("schedule-data-v2", response.cellRevisions);
+    skipAutosaveRef.current = true;
+    latestDataRef.current = next;
+    lastSavedJson.current = JSON.stringify(response.value);
+    lastSavedTokenRef.current = syncTokenOf(response.value);
+    suppressUndoRef.current = true;
+    undoRef.current = [];
+    redoRef.current = [];
+    lastUndoDataRef.current = next;
+    setData(next);
+    setRemoteChanged(false);
+    return next;
+  };
+
+  const loadEditorSections = async (wanted) => {
+    await ensureEditorLoaded();
+    const currentData = latestDataRef.current || {};
+    if (!editorMissingSections(currentData, wanted).length) return currentData;
+    await flushEditorChanges();
+    const revision = dataRevisionRef.current;
+    const editSerial = editorEditSerialRef.current;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const bootstrap = await editorBootstrapGet();
+        const baseProject = {
+          ...currentData,
+          ...bootstrap.value,
+          _editorDeferred: (currentData._editorDeferred || [...EDITOR_SECTIONS]),
+        };
+        for (const s of EDITOR_SECTIONS) {
+          if (!baseProject._editorDeferred.includes(s) && currentData[s] !== undefined) {
+            baseProject[s] = currentData[s];
+          }
+        }
+        const response = await editorHydrate(baseProject, bootstrap.token, wanted);
+        if (editSerial !== editorEditSerialRef.current || revision !== dataRevisionRef.current || pendingSaveTabsRef.current.size) throw new Error("Данные изменены во время загрузки; повторите переход");
+        return applyEditorHydration(response);
+      } catch (error) {
+        if (error.status !== 409 || attempt === 2 || editSerial !== editorEditSerialRef.current || revision !== dataRevisionRef.current || pendingSaveTabsRef.current.size) throw error;
+      }
+    }
+  };
+
+  const ensureEditorSections = (wanted) => {
+    const task = editorHydrationRef.current.catch(() => {}).then(() => loadEditorSections(wanted));
+    editorHydrationRef.current = task;
+    return task;
+  };
+
+  const ensureFullDataLoaded = async () => {
+    setEditorLoading(true);
+    try {
+      await flushEditorChanges();
+      return await ensureEditorSections(EDITOR_SECTIONS);
+    } finally { setEditorLoading(false); }
+  };
+
+  const prepareFullEditor = async () => {
+    try { return await ensureFullDataLoaded(); }
+    catch (error) { setShortcutNote(`Не удалось загрузить проект: ${error.message}`); return null; }
+  };
+
+  const downloadEditorProject = async () => {
+    try { await flushEditorChanges(); await editorExportDownload(); }
+    catch (error) { setShortcutNote(error.message); }
+  };
+
+  const retryEditorTab = async () => {
+    setEditorLoading(true);
+    setEditorLoadError("");
+    try { await ensureEditorSections(editorTabSections(tab)); }
+    catch (error) { setEditorLoadError(error.message); }
+    finally { setEditorLoading(false); }
+  };
+
+  useEffect(() => {
+    if (!loaded || role !== "admin") return;
+    if (editorReadyForTab) { setEditorLoading(false); return; }
+    let cancelled = false;
+    setEditorLoading(true);
+    setEditorLoadError("");
+    ensureEditorSections(editorTabSections(tab)).catch(error => {
+      if (!cancelled) setEditorLoadError(error.message);
+    }).finally(() => { if (!cancelled) setEditorLoading(false); });
+    return () => { cancelled = true; };
+  }, [loaded, role, tab, editorReadyForTab]);
 
   const loadPublicScheduleTarget = async (kind, id, week = 0, scope = "semester") => {
     if (fullDataLoaded || !id) return;
@@ -27547,34 +27834,26 @@ export default function App() {
     return window.location.pathname.split("/").filter(Boolean)[0] === "admin";
   };
 
-  // v1675: keep a successful admin login across refreshes and direct admin
-  // links in the SAME browser tab/session. Only a user id is stored; on every
-  // restore it is revalidated against the current canonical users list, so a
-  // deleted/demoted user cannot survive indefinitely in stale React state.
-  const rememberAdminSession = (user) => {
-    try {
-      if (user?.id) sessionStorage.setItem("timetable-admin-session-v1675", JSON.stringify({ userId: String(user.id) }));
-    } catch {}
-  };
-  const forgetAdminSession = () => {
-    try { sessionStorage.removeItem("timetable-admin-session-v1675"); } catch {}
-  };
-  const restoreAdminSession = (users) => {
-    try {
-      const saved = JSON.parse(sessionStorage.getItem("timetable-admin-session-v1675") || "null");
-      const user = (users || []).find((u) => String(u?.id || "") === String(saved?.userId || "") && ["admin", "superadmin"].includes(String(u?.role || "")));
-      return user ? { id: user.id, name: user.name, login: user.login, role: user.role } : null;
-    } catch { return null; }
-  };
-
   useEffect(() => {
     (async () => {
       try {
         // Публичная стартовая страница получает только опубликованное расписание и справочники,
         // а не многомегабайтный редакторский проект. Полные данные грузятся только при входе сотрудника.
         if (isAdminEntryUrl()) {
-          const res = await storageGetStrict("schedule-data-v2", { editorCompact: true });
-          if (applyFullStorageResponse(res)) return;
+          const session = await authRequest("session");
+          if (session.user) {
+            await ensureEditorLoaded();
+            setCurrentUser(session.user);
+            setTab(pendingAdminTab || "semester");
+            setRole("admin");
+            return;
+          }
+          setPublicUserCount(session.setupRequired ? 0 : 1);
+          latestDataRef.current = normalizePublicStoredData({});
+          setData(latestDataRef.current);
+          setLoaded(true);
+          setPasswordModal(session.setupRequired ? "set" : "enter");
+          return;
         }
         // v1643: public contour starts from a small dictionaries-only index.
         // The actual schedule is fetched only for the group/teacher the visitor
@@ -27610,11 +27889,21 @@ export default function App() {
           setStorageProblem(null);
           return;
         }
-        // Старый сервер / временная несовместимость: безопасный fallback на полную загрузку.
-        const res = await storageGetStrict("schedule-data-v2", { editorCompact: true });
-        if (applyFullStorageResponse(res)) return;
-        if (res?.missing) { setStorageMissing(true); setLoaded(false); return; }
-        throw new Error("Получен неизвестный ответ сервера хранения");
+        const session = await authRequest("session");
+        if (session.setupRequired) {
+          latestDataRef.current = normalizePublicStoredData({});
+          setData(latestDataRef.current);
+          setLoaded(true);
+          setPasswordModal("set");
+          return;
+        }
+        if (session.user) {
+          await ensureEditorLoaded();
+          setCurrentUser(session.user);
+          setRole("admin");
+          return;
+        }
+        throw new Error("Опубликованное расписание недоступно. Для входа сотрудника откройте /admin");
       } catch (e) {
         console.error("Initial storage load failed", e);
         const message = e?.message || "Не удалось загрузить данные с сервера";
@@ -27627,12 +27916,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!loaded || !data) return;
+    if (!loaded || !data || role !== "admin") return;
     if (skipAutosaveRef.current) {
       skipAutosaveRef.current = false;
       if (pendingSaveTabsRef.current.size === 0) { dirtyRef.current = false; setSaveState("saved"); }
       return;
     }
+    if (!editorReadyForTab || editorLoading) return;
     // В «Графиках» само изменение объекта data больше не означает пользовательскую правку.
     // Только graphSet увеличивает serial. Поэтому server merge, normalizeStoredData и
     // syncScheduleInstancesToGraph не возвращают ложный статус «не сохранено».
@@ -27684,7 +27974,7 @@ export default function App() {
   // every click. When the editor leaves timetable for another page, refresh the
   // server base once in the background without touching visible React state.
   useEffect(() => {
-    if (!loaded || role !== "admin" || tab === "schedule" || !scheduleBaseDirtyRef.current) return;
+    if (!loaded || role !== "admin" || tab === "schedule" || !editorReadyForTab || !scheduleBaseDirtyRef.current) return;
     let cancelled = false;
     (async () => {
       try {
@@ -27840,9 +28130,9 @@ export default function App() {
     if (loaded && isAdminEntryUrl() && role !== "admin") {
       (async () => {
         try {
-          await ensureFullDataLoaded();
-          const users = latestDataRef.current?.users || [];
-          const restored = restoreAdminSession(users);
+          const session = await authRequest("session");
+          const restored = session.user;
+          if (restored) await ensureEditorLoaded();
           if (restored) {
             setCurrentUser(restored);
             setRole("admin");
@@ -27853,7 +28143,7 @@ export default function App() {
             setPasswordModal(null);
             return;
           }
-          setPasswordModal(publicUserCount > 0 || users.length > 0 ? "enter" : "set");
+          setPasswordModal(session.setupRequired ? "set" : "enter");
         } catch (e) { setLoadError(e?.message || "Не удалось загрузить данные для входа"); }
       })();
     }
@@ -27862,16 +28152,17 @@ export default function App() {
   const enterAdmin = async () => {
     setPwError("");
     try {
-      await ensureFullDataLoaded();
-      const users = latestDataRef.current?.users || [];
-      setPasswordModal(users.length > 0 ? "enter" : "set");
+      const session = await authRequest("session");
+      setPasswordModal(session.setupRequired ? "set" : "enter");
     } catch (e) {
       setLoadError(e?.message || "Не удалось загрузить данные для входа");
     }
   };
-  const exitAdmin = () => {
+  const exitAdmin = async () => {
+    try { await authRequest("logout", {}); }
+    catch (error) { setLoadError(error.message); return; }
     presenceLeave(presenceSessionRef.current);
-    forgetAdminSession();
+    window.location.replace("/");
     setRole("student");
     setCurrentUser(null);
     if (typeof window !== "undefined") window.history.replaceState(null, "", "/");
@@ -27880,33 +28171,35 @@ export default function App() {
   const submitCreateFirstUser = async (name, login, pw1, pw2) => {
     if (!name.trim()) return setPwError("Укажите имя");
     if (!login.trim()) return setPwError("Укажите логин");
-    if (pw1.length < 4) return setPwError("Пароль должен быть не короче 4 символов");
+    if (pw1.length < 8) return setPwError("Пароль должен быть не короче 8 символов");
     if (pw1 !== pw2) return setPwError("Пароли не совпадают");
-    const hash = await sha256Hex(pw1);
-    const user = { id: uid(), name: name.trim(), login: login.trim(), passwordHash: hash, role: "superadmin" };
-    setData((d) => ({ ...d, users: [...(d.users || []), user] }));
-    const sessionUser = { id: user.id, name: user.name, login: user.login, role: user.role };
-    setCurrentUser(sessionUser);
-    rememberAdminSession(sessionUser);
-    setRole("admin");
-    // v1641: only applied once login has actually succeeded — see the
-    // pendingAdminTab declaration above for why this can never skip auth.
-    if (pendingAdminTab) setTab(pendingAdminTab);
-    if (typeof window !== "undefined") window.history.replaceState(null, "", pendingAdminTab === "schedule" && scheduleRouteGroupId ? `/admin/schedule/group/${encodeURIComponent(scheduleRouteGroupId)}` : `/admin/${pendingAdminTab || "semester"}`);
-    setPasswordModal(null);
-    setPwError("");
+    let sessionUser;
+    try {
+      const setupToken = window.prompt("Введите AUTH_SETUP_TOKEN, заданный на сервере");
+      if (!setupToken) return;
+      const result = await authRequest("setup", { name, login, password: pw1, setupToken });
+      sessionUser = result.user;
+      await ensureEditorLoaded();
+    } catch (error) { setPwError(error.message); return; }
+    finishServerLogin(sessionUser);
   };
   const submitLogin = async (login, pw) => {
-    const user = (data.users || []).find((u) => u.login.toLowerCase() === login.trim().toLowerCase());
-    if (!user) return setPwError("Пользователь не найден");
-    const hash = await sha256Hex(pw);
-    if (hash !== user.passwordHash) return setPwError("Неверный пароль");
-    const sessionUser = { id: user.id, name: user.name, login: user.login, role: user.role };
-    setCurrentUser(sessionUser);
-    rememberAdminSession(sessionUser);
+    let sessionUser;
+    try {
+      const result = await authRequest("login", { login, password: pw });
+      sessionUser = result.user;
+      await ensureEditorLoaded();
+    } catch (error) { setPwError(error.message); return; }
+    finishServerLogin(sessionUser);
+  };
+  const finishServerLogin = (user) => {
+    setCurrentUser(user);
     setRole("admin");
     if (pendingAdminTab) setTab(pendingAdminTab);
-    if (typeof window !== "undefined") window.history.replaceState(null, "", pendingAdminTab === "schedule" && scheduleRouteGroupId ? `/admin/schedule/group/${encodeURIComponent(scheduleRouteGroupId)}` : `/admin/${pendingAdminTab || "semester"}`);
+    const target = pendingAdminTab === "schedule" && scheduleRouteGroupId
+      ? `/admin/schedule/group/${encodeURIComponent(scheduleRouteGroupId)}`
+      : `/admin/${pendingAdminTab || "semester"}`;
+    window.history.replaceState(null, "", target);
     setPasswordModal(null);
     setPwError("");
   };
@@ -27925,16 +28218,12 @@ export default function App() {
     if (window.location.pathname !== target) window.history.replaceState(null, "", target);
   }, [role, tab, scheduleRouteGroupId, browserNavApplying]);
   const submitChangePassword = async (oldPw, pw1, pw2) => {
-    const me = (data.users || []).find((u) => u.id === currentUser?.id);
-    if (!me) return setPwError("Сессия истекла, войдите заново");
-    const oldHash = await sha256Hex(oldPw);
-    if (oldHash !== me.passwordHash) return setPwError("Текущий пароль неверен");
-    if (pw1.length < 4) return setPwError("Новый пароль должен быть не короче 4 символов");
+    if (pw1.length < 8) return setPwError("Новый пароль должен быть не короче 8 символов");
     if (pw1 !== pw2) return setPwError("Пароли не совпадают");
-    const hash = await sha256Hex(pw1);
-    setData((d) => ({ ...d, users: (d.users || []).map((u) => (u.id === me.id ? { ...u, passwordHash: hash } : u)) }));
-    setPasswordModal(null);
-    setPwError("");
+    try {
+      await authRequest("password", { oldPassword: oldPw, password: pw1 });
+    } catch (error) { setPwError(error.message); return; }
+    window.location.reload();
   };
 
   useEffect(() => { scheduleRouteGroupIdRef.current = scheduleRouteGroupId; }, [scheduleRouteGroupId]);
@@ -27965,6 +28254,7 @@ export default function App() {
 
   useEffect(() => {
     const onKey = (e) => {
+      if (role === "admin" && (!editorReadyForTab || editorLoading)) return;
       const tag = e.target?.tagName?.toLowerCase();
       const typing = tag === "input" || tag === "textarea" || e.target?.isContentEditable;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
@@ -27974,14 +28264,14 @@ export default function App() {
       }
       if (typing) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && !e.shiftKey) {
-        e.preventDefault(); const prev=undoRef.current.pop(); if(!prev)return; redoRef.current.push(data); suppressUndoRef.current=true; setData(prev); setShortcutNote("Отменено"); setTimeout(()=>setShortcutNote(""),1200); return;
+        e.preventDefault(); const prev=undoRef.current.pop(); if(!prev)return; redoRef.current.push(data); suppressUndoRef.current=true; editorEditSerialRef.current += 1; setData(prev); setShortcutNote("Отменено"); setTimeout(()=>setShortcutNote(""),1200); return;
       }
       if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "y" || (e.shiftKey && e.key.toLowerCase() === "z"))) {
-        e.preventDefault(); const next=redoRef.current.pop(); if(!next)return; undoRef.current.push(data); suppressUndoRef.current=true; setData(next); setShortcutNote("Возвращено"); setTimeout(()=>setShortcutNote(""),1200);
+        e.preventDefault(); const next=redoRef.current.pop(); if(!next)return; undoRef.current.push(data); suppressUndoRef.current=true; editorEditSerialRef.current += 1; setData(next); setShortcutNote("Возвращено"); setTimeout(()=>setShortcutNote(""),1200);
       }
     };
     window.addEventListener("keydown", onKey); return ()=>window.removeEventListener("keydown", onKey);
-  }, [data]);
+  }, [data, tab, role, editorLoading, editorReadyForTab]);
 
 
   // v1637: MUST stay above every conditional return in App.
@@ -28194,7 +28484,9 @@ export default function App() {
 
   const SECTION_NAMES = { consultations:"Консультации", schedule:"Расписание", substitutions:"Замены", retakes:"Архив пересдач", interimAssessments:"Аттестация", practices:"Практики", loads:"Нагрузки", curriculumPlan:"Учебный план", config:"Настройки семестра", groups:"Группы", teachers:"Преподаватели", rooms:"Аудитории" };
   const appendHistory = (d, section, action, details = "") => ({ ...(d || {}), changeHistory: [...((d && d.changeHistory) || []), { id: uid(), at: new Date().toISOString(), user: currentUser?.name || currentUser?.login || "Сотрудник", section, action, details }].slice(-1000) });
-  const set = (key) => (val) => setData((d) => {
+  const set = (key) => (val) => {
+    editorEditSerialRef.current += 1;
+    setData((d) => {
     const nextValue = typeof val === "function" ? val(d[key]) : val;
     let next = { ...d, [key]: nextValue };
     // v1837 PERF CORE: schedule cell edits already have their own atomic audit
@@ -28204,7 +28496,8 @@ export default function App() {
     // for normal pages; significant schedule operations append explicit history.
     if (SECTION_NAMES[key] && role === "admin" && key !== "schedule") next = appendHistory(next, SECTION_NAMES[key], "Изменено");
     return next;
-  });
+    });
+  };
 
   // v1565: manual timetable cells are committed independently of the page
   // debounce.  Only the named assignment/locked/unplaced IDs are written under
@@ -28919,6 +29212,7 @@ export default function App() {
   };
 
   const runGenerate = async (groupId = "", options = {}) => {
+    if (!await prepareFullEditor()) return;
     const fastMode = !!options?.fastMode;
     const weekNumber = Math.max(0, Number(options?.weekNumber || 0));
     if (generating || !data) return;
@@ -29077,6 +29371,7 @@ export default function App() {
   };
 
   const undoRestoreGroupToPublished = async (groupId) => {
+    if (!await prepareFullEditor()) return;
     const gid = String(groupId || "");
     const current = latestDataRef.current || data;
     if (!gid || !current) return;
@@ -29132,6 +29427,7 @@ export default function App() {
   };
 
   const restoreGroupToPublished = async (groupId) => {
+    if (!await prepareFullEditor()) return;
     const gid = String(groupId || "");
     const current = latestDataRef.current || data;
     if (!gid || !current) return;
@@ -29198,6 +29494,7 @@ export default function App() {
   };
 
   const publishSchedule = async (options = { scope: "all" }) => {
+    if (!await prepareFullEditor()) return;
     // v1863: the substitutions page uses a debounce. If the operator clicks
     // «Опубликовать» immediately after «Отменить», merely waiting for the
     // already-running save chain is not enough: the debounce may not have fired
@@ -29702,11 +29999,13 @@ export default function App() {
   };
 
   const restoreVersion = async (version) => {
+    if (!await prepareFullEditor()) return;
     if (!version?.id) return;
     try {
       const fullVersion = version?.snapshot ? version : await storageVersionGet("schedule-data-v2", version.id);
       if (!fullVersion?.snapshot) throw new Error("Снимок версии не найден");
-      const keep = { users: data.users || [], changeHistory: data.changeHistory || [], scheduleVersions: data.scheduleVersions || [], publishedSnapshot: data.publishedSnapshot, publishedAt: data.publishedAt, publishedBy: data.publishedBy };
+      const current = latestDataRef.current;
+      const keep = { users: current.users || [], changeHistory: current.changeHistory || [], scheduleVersions: current.scheduleVersions || [], publishedSnapshot: current.publishedSnapshot, publishedAt: current.publishedAt, publishedBy: current.publishedBy };
       const restored = normalizeStoredData({ ...JSON.parse(JSON.stringify(fullVersion.snapshot)), ...keep });
       setData(appendHistory(restored, "Версии", "Восстановлен черновик", `Версия от ${new Date(fullVersion.at || version.at).toLocaleString("ru-RU")}`));
     } catch (e) {
@@ -29715,7 +30014,8 @@ export default function App() {
     }
   };
 
-  const startNewSemester = () => {
+  const startNewSemester = async () => {
+    if (!await prepareFullEditor()) return;
     if (!data || typeof data !== "object") {
       setShortcutNote("Новый семестр не создан: данные ещё не загружены");
       setTimeout(() => setShortcutNote(""), 3000);
@@ -29960,6 +30260,7 @@ export default function App() {
               );
             })}
           </nav>
+          <button className="sidebar-exit" onClick={downloadEditorProject} disabled={editorLoading}>Скачать полный проект</button>
           <button className="sidebar-new-semester" onClick={() => setNewSemesterModal(true)} title="Архивировать текущий семестр и начать новый">
             <CalendarDays size={16} /><span>Новый семестр</span>
           </button>
@@ -30037,11 +30338,18 @@ export default function App() {
           {role === "admin" && (
             <div className="section-save-bar">
               <div><b>Изменения этой страницы сохраняются отдельно</b><span>Кнопка ниже сразу сохраняет только изменённые разделы, не перезаписывая остальные страницы.</span></div>
-              <button className="btn primary section-save-btn" onClick={saveNow} disabled={saveState === "saving"}>💾 {saveState === "saving" ? "Сохраняю…" : "Сохранить"}</button>
+              <button className="btn primary section-save-btn" onClick={saveNow} disabled={saveState === "saving" || !editorReadyForTab || editorLoading}>💾 {saveState === "saving" ? "Сохраняю…" : "Сохранить"}</button>
               <span style={{fontSize:12,fontWeight:700,color:saveState==="error"?"#b91c1c":saveState==="dirty"?"#a16207":saveState==="saving"?"#1d4ed8":"#15803d"}}>{saveState==="error"?"⚠ не удалось сохранить":saveState==="dirty"?"● есть несохранённые изменения":saveState==="saving"?"↻ сохраняю на сервер…":`✓ всё сохранено${lastConfirmedSaveAt ? ` · ${new Date(lastConfirmedSaveAt).toLocaleTimeString("ru-RU", {hour:"2-digit", minute:"2-digit", second:"2-digit"})}` : ""}`}</span>
             </div>
           )}
-          {role === "admin" && (
+          {role === "admin" && (!editorReadyForTab || editorLoading) && (
+            <div className="section" role="status" aria-live="polite">
+              <h2>{editorLoadError ? "Не удалось загрузить раздел" : "Загружаю данные раздела…"}</h2>
+              <p>{editorLoadError || "Сохранённые изменения останутся на сервере. Дождитесь загрузки перед редактированием."}</p>
+              {editorLoadError && <button className="btn primary" onClick={retryEditorTab}>Повторить загрузку</button>}
+            </div>
+          )}
+          {role === "admin" && editorReadyForTab && !editorLoading && (
             <>
               {tab === "semester" && <SemesterPanel config={data.config} setConfig={set("config")} />}
               {tab === "constraints" && <DailyConstraintsPanel data={data} set={set} />}
@@ -30280,7 +30588,7 @@ function UsersPanel({ data, set, currentUser, activeUsers = [] }) {
     if (!form.name.trim()) return setFormError("Укажите имя");
     if (!form.login.trim()) return setFormError("Укажите логин");
     if (users.some((u) => u.login.toLowerCase() === form.login.trim().toLowerCase())) return setFormError("Такой логин уже занят");
-    if (form.password.length < 4) return setFormError("Пароль должен быть не короче 4 символов");
+    if (form.password.length < 8) return setFormError("Пароль должен быть не короче 8 символов");
     const hash = await sha256Hex(form.password);
     const newUser = { id: uid(), name: form.name.trim(), login: form.login.trim(), passwordHash: hash, role: form.role };
     set("users")([...users, newUser]);

@@ -49,13 +49,13 @@ if "schedule-data-v2" not in store:
 conn = psycopg.connect(DATABASE_URL, connect_timeout=20)
 try:
     with conn.cursor() as cur:
-        cur.execute("CREATE TABLE IF NOT EXISTS app_kv (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+        cur.execute("CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
         cur.execute("CREATE TABLE IF NOT EXISTS app_backups (name TEXT PRIMARY KEY, payload_gzip BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
         cur.execute("CREATE TABLE IF NOT EXISTS publication_snapshots (store_key TEXT NOT NULL, version_id TEXT NOT NULL, payload_gzip BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(store_key, version_id))")
-        cur.execute("SELECT COUNT(*) FROM app_kv")
+        cur.execute("SELECT COUNT(*) FROM kv_store")
         existing = int(cur.fetchone()[0])
         if existing:
-            raise RuntimeError(f"PostgreSQL app_kv is not empty ({existing} rows). Refusing to overwrite existing data.")
+            raise RuntimeError(f"PostgreSQL kv_store is not empty ({existing} rows). Refusing to overwrite existing data.")
         # Copy snapshots already externalized by v1712 SQLite.
         for row in sqlite_snapshots:
             raw = row["snapshot_json"].encode("utf-8")
@@ -103,7 +103,7 @@ try:
                     versions.append(version)
                 project["scheduleVersions"] = versions; compact_value = project
             payload = json.dumps(compact_value, ensure_ascii=False, separators=(",", ":"))
-            cur.execute("INSERT INTO app_kv(key,value_json,updated_at) VALUES(%s,%s,NOW())", (key, payload))
+            cur.execute("INSERT INTO kv_store(key,value_json,updated_at) VALUES(%s,%s,NOW())", (key, payload))
 
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         backup_payload = gzip.compress(json.dumps(portable_store, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), compresslevel=3)
