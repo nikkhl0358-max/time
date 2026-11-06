@@ -11,9 +11,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import auth_store
 module = ast.parse((ROOT / "app.py").read_text(encoding="utf-8"))
 function = next(n for n in module.body if isinstance(n, ast.FunctionDef) and n.name == "_auth_current_users")
-namespace = {"json": json, "os": os, "sqlite3": sqlite3}
+namespace = {"json": json, "os": os, "sqlite3": sqlite3, "auth_store": auth_store}
 exec(compile(ast.Module(body=[function], type_ignores=[]), str(ROOT / "app.py"), "exec"), namespace)
 
 
@@ -56,20 +58,16 @@ class TestAuthProjection(unittest.TestCase):
                 namespace["_auth_current_users"]()
             fake_pg.connect.assert_called_once_with("postgres://fake", connect_timeout=5)
 
-    def test_postgres_select_does_not_initialize_schema(self):
+    def test_postgres_reads_small_table_not_legacy_json(self):
         namespace["USE_POSTGRES"] = True
         users = [{"id": "a", "role": "admin"}]
-        fake_conn = Mock()
-        fake_conn.execute.return_value.fetchone.return_value = (json.dumps(users),)
-        fake_cm = Mock()
-        fake_cm.__enter__ = Mock(return_value=fake_conn)
-        fake_cm.__exit__ = Mock(return_value=False)
-        fake_pg = types.SimpleNamespace(connect=Mock(return_value=fake_cm))
-        with patch.dict(sys.modules, {"psycopg": fake_pg}), patch.dict(os.environ, {"DATABASE_URL": "postgres://fake"}):
+        fake_pg = types.SimpleNamespace(connect=Mock())
+        with patch.object(auth_store, "read_users", return_value=users) as read, \
+             patch.dict(sys.modules, {"psycopg": fake_pg}), \
+             patch.dict(os.environ, {"DATABASE_URL": "postgres://fake"}):
             self.assertEqual(namespace["_auth_current_users"](), users)
-        self.assertEqual(fake_conn.execute.call_count, 1)
-        self.assertIn("SELECT CASE", fake_conn.execute.call_args.args[0])
-        self.assertNotIn("CREATE TABLE", fake_conn.execute.call_args.args[0])
+        read.assert_called_once_with("postgres://fake", fake_pg.connect)
+        fake_pg.connect.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

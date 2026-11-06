@@ -11,6 +11,8 @@ except ImportError:
     psycopg = None
 
 SCHEMA = [
+    # Dedicated tiny authentication table; the large timetable JSON remains intact.
+    'CREATE TABLE IF NOT EXISTS auth_user_store (store_key TEXT PRIMARY KEY, users_json TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)',
     'CREATE TABLE IF NOT EXISTS kv_store (key TEXT PRIMARY KEY, value_json TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)',
     'CREATE TABLE IF NOT EXISTS storage_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)',
     'CREATE TABLE IF NOT EXISTS publication_snapshots (store_key TEXT NOT NULL, version_id TEXT NOT NULL, snapshot_json TEXT NOT NULL, created_at DOUBLE PRECISION NOT NULL, PRIMARY KEY(store_key,version_id))',
