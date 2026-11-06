@@ -2620,6 +2620,21 @@ APP_BUILD_ID = _compute_app_build_id()
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 
 
+# A failed database connection is a temporary outage, NOT an empty user list.
+# Keep authentication/API responses machine-readable and never expose DB secrets.
+@app.errorhandler(sqlite3.OperationalError)
+def _sqlite_unavailable(exc):
+    app.logger.error("storage operation failed: %s", type(exc).__name__)
+    return jsonify(error="Хранилище временно недоступно. Повторите вход позже."), 503
+
+try:
+    from psycopg import OperationalError as _PgOperationalError
+except ImportError:
+    _PgOperationalError = None
+if _PgOperationalError is not None:
+    app.register_error_handler(_PgOperationalError, _sqlite_unavailable)
+
+
 def _auth_project(store):
     """Читает рабочий проект без изменения ссылок кеша хранилища."""
     raw = store.get("schedule-data-v2")
@@ -2627,8 +2642,12 @@ def _auth_project(store):
 
 
 def _auth_read_users():
-    """Выдаёт отдельную копию учётных записей для проверки и изменения пароля."""
-    return copy.deepcopy(_auth_project(load_store()).get("users") or [])
+    """Читайте только credentials: не загружайте большой проект при каждом API.
+
+    Ошибка PostgreSQL НЕ трактуется как пустая база: иначе экран может
+    ошибочно предложить создать нового администратора.
+    """
+    return copy.deepcopy(_auth_current_users())
 
 
 def _auth_update_users(users):
@@ -2645,22 +2664,58 @@ def _auth_update_users(users):
 
 
 def _auth_current_users():
-    """Читает свежие credentials проекцией JSON, не передавая большой проект."""
-    if not _storage_exists():
+    """Только users из одной строки БД, без чтения расписания и DDL.
+
+    PostgreSQL: прямое read-only соединение обходит PgConnection.__init__,
+    который иначе проверяет схему и запускает CREATE TABLE при каждом запросе.
+    Никаких изменений самой БД или формата проекта здесь нет.
+    """
+    if USE_POSTGRES:
+        import psycopg
+        # Нельзя подменять сетевую ошибку []: это приведёт к ложному setupRequired.
+        with psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=5) as conn:
+            row = conn.execute(
+                "SELECT CASE WHEN jsonb_typeof(value_json::jsonb) = 'object' "
+                "THEN (value_json::jsonb -> 'users')::text ELSE NULL END "
+                "FROM kv_store WHERE key=%s",
+                ("schedule-data-v2",),
+            ).fetchone()
+            if row and row[0] is not None:
+                users = json.loads(row[0])
+                return users if isinstance(users, list) else []
+            # Compatibility: some older stores double-encoded the JSON project.
+            # Only on this exceptional old-format path read the full row.
+            legacy = conn.execute(
+                "SELECT value_json FROM kv_store WHERE key=%s",
+                ("schedule-data-v2",),
+            ).fetchone()
+            if not legacy:
+                return []
+            project = json.loads(legacy[0])
+            project = json.loads(project) if isinstance(project, str) else project
+            return (project.get("users") or []) if isinstance(project, dict) else []
+
+    if not os.path.exists(SQLITE_PATH):
+        if os.path.exists(LEGACY_DATA_FILE):
+            return (_auth_project(load_store()).get("users") or [])
         return []
-    conn = _sqlite_connect()
-    try:
-        projection = "(value_json::jsonb -> 'users')::text" if USE_POSTGRES else "json_extract(value_json, '$.users')"
-        row = conn.execute(f"SELECT {projection} FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
+    # SQLite: no repeated initialization/schema checks for a read-only lookup.
+    with sqlite3.connect(SQLITE_PATH, timeout=5) as conn:
+        row = conn.execute(
+            "SELECT json_extract(value_json, '$.users') FROM kv_store WHERE key=?",
+            ("schedule-data-v2",),
+        ).fetchone()
         if row and row[0] is not None:
-            return json.loads(row[0]) or []
-        # Старый формат содержит JSON-строку внутри value_json, а не объект.
-        row = conn.execute("SELECT value_json FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
-        project = json.loads(row[0]) if row else {}
+            users = json.loads(row[0])
+            return users if isinstance(users, list) else []
+        legacy = conn.execute(
+            "SELECT value_json FROM kv_store WHERE key=?", ("schedule-data-v2",)
+        ).fetchone()
+        if not legacy:
+            return []
+        project = json.loads(legacy[0])
         project = json.loads(project) if isinstance(project, str) else project
-        return project.get("users") or []
-    finally:
-        conn.close()
+        return (project.get("users") or []) if isinstance(project, dict) else []
 
 
 def _validate_user_edit(incoming, existing, baseline):
