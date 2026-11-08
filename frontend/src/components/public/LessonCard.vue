@@ -33,6 +33,13 @@
           <span v-if="instance?.subgroup" class="subgroup-badge">
             {{ instance.subgroup }} подгруппа
           </span>
+          <span 
+            v-if="effectiveGroups.length > 1 && role === 'group'" 
+            class="stream-badge" 
+            :title="`Потоковое занятие для групп: ${streamGroupsTitle}`"
+          >
+            Поток
+          </span>
         </div>
       </div>
 
@@ -48,26 +55,77 @@
         {{ effectiveSubject }}
       </h4>
 
-      <!-- Преподаватель и Аудитория -->
+      <!-- Подвал карточки: Группы / Преподаватель / Аудитория -->
       <div class="lesson-footer">
-        <button
-          v-if="effectiveTeacherId"
-          type="button"
-          class="teacher-info teacher-btn"
-          :title="`Перейти к расписанию преподавателя: ${effectiveTeacher}`"
-          @click.stop="handleTeacherClick"
-        >
-          <svg class="teacher-icon-svg" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
-            <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm4 8c0-2.21-3.58-3.5-6-3.5S2 10.79 2 13v1h12v-1zm-1.2 0H3.2c.45-1.21 2.5-2.3 4.8-2.3s4.35 1.09 4.8 2.3z"/>
+        <!-- Режим ПРЕПОДАВАТЕЛЬ: отображаем группу (или группы потока) с возможностью перехода -->
+        <div v-if="role === 'teacher'" class="groups-info">
+          <svg class="group-icon-svg" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+            <path d="M7 14s-1 0-1-1 1-4 5-4 5 3 5 4-1 1-1 1H7zm4-6a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm-5.784 6A2.238 2.238 0 0 1 5 13c0-1.355.68-2.75 1.936-3.72A6.325 6.325 0 0 0 5 9c-4 0-5 3-5 4s1 1 1 1h4.216zM4.5 8a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/>
           </svg>
-          <span class="teacher-name">{{ effectiveTeacher }}</span>
-        </button>
-        <div v-else class="teacher-info" :title="effectiveTeacher">
-          <svg class="teacher-icon-svg" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
-            <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm4 8c0-2.21-3.58-3.5-6-3.5S2 10.79 2 13v1h12v-1zm-1.2 0H3.2c.45-1.21 2.5-2.3 4.8-2.3s4.35 1.09 4.8 2.3z"/>
-          </svg>
-          <span class="teacher-name">{{ effectiveTeacher }}</span>
+          <div class="groups-chips-list">
+            <button
+              v-for="grp in effectiveGroups"
+              :key="grp.id"
+              type="button"
+              class="group-tag-btn"
+              :title="`Перейти к расписанию группы ${grp.name}`"
+              @click.stop="handleGroupClick(grp.id)"
+            >
+              {{ grp.name }}
+            </button>
+            <span v-if="!effectiveGroups.length" class="no-group-text">Группа не указана</span>
+          </div>
         </div>
+
+        <!-- Режим АУДИТОРИЯ: группа + преподаватель -->
+        <div v-else-if="role === 'room'" class="room-entity-meta">
+          <div class="groups-chips-list">
+            <button
+              v-for="grp in effectiveGroups"
+              :key="grp.id"
+              type="button"
+              class="group-tag-btn"
+              :title="`Перейти к расписанию группы ${grp.name}`"
+              @click.stop="handleGroupClick(grp.id)"
+            >
+              {{ grp.name }}
+            </button>
+          </div>
+          <button
+            v-if="effectiveTeacherId"
+            type="button"
+            class="teacher-info teacher-btn"
+            :title="`Перейти к расписанию преподавателя: ${effectiveTeacher}`"
+            @click.stop="handleTeacherClick"
+          >
+            <svg class="teacher-icon-svg" viewBox="0 0 16 16" width="12" height="12" fill="currentColor" aria-hidden="true">
+              <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm4 8c0-2.21-3.58-3.5-6-3.5S2 10.79 2 13v1h12v-1zm-1.2 0H3.2c.45-1.21 2.5-2.3 4.8-2.3s4.35 1.09 4.8 2.3z"/>
+            </svg>
+            <span class="teacher-name">{{ effectiveTeacher }}</span>
+          </button>
+        </div>
+
+        <!-- Режим ГРУППА: преподаватель с переходом -->
+        <template v-else>
+          <button
+            v-if="effectiveTeacherId"
+            type="button"
+            class="teacher-info teacher-btn"
+            :title="`Перейти к расписанию преподавателя: ${effectiveTeacher}`"
+            @click.stop="handleTeacherClick"
+          >
+            <svg class="teacher-icon-svg" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+              <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm4 8c0-2.21-3.58-3.5-6-3.5S2 10.79 2 13v1h12v-1zm-1.2 0H3.2c.45-1.21 2.5-2.3 4.8-2.3s4.35 1.09 4.8 2.3z"/>
+            </svg>
+            <span class="teacher-name">{{ effectiveTeacher }}</span>
+          </button>
+          <div v-else class="teacher-info" :title="effectiveTeacher">
+            <svg class="teacher-icon-svg" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+              <path d="M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm2-3a2 2 0 1 1-4 0 2 2 0 0 1 4 0zm4 8c0-2.21-3.58-3.5-6-3.5S2 10.79 2 13v1h12v-1zm-1.2 0H3.2c.45-1.21 2.5-2.3 4.8-2.3s4.35 1.09 4.8 2.3z"/>
+            </svg>
+            <span class="teacher-name">{{ effectiveTeacher }}</span>
+          </div>
+        </template>
 
         <div 
           v-if="formattedRoom && !isRemote" 
@@ -86,12 +144,14 @@ import { computed } from 'vue';
 import SpatialCard from '../common/SpatialCard.vue';
 
 const props = defineProps({
+  role: { type: String, default: 'group' },
   instance: { type: Object, required: true },
   period: { type: Number, required: true },
   subjectName: { type: String, default: '' },
   teacherName: { type: String, default: '' },
   roomName: { type: String, default: '' },
   substitution: { type: Object, default: null },
+  getGroupName: { type: Function, default: null },
   getTeacherName: { type: Function, default: null },
   getRoomName: { type: Function, default: null },
   getRoomLocation: { type: Function, default: () => '' },
@@ -100,7 +160,7 @@ const props = defineProps({
   getPeriodTime: { type: Function, default: () => '' }
 });
 
-const emit = defineEmits(['select-teacher']);
+const emit = defineEmits(['select-teacher', 'select-group']);
 
 const effectiveTeacherId = computed(() => {
   return props.substitution?.newTeacherId || props.instance?.teacherId || '';
@@ -111,6 +171,34 @@ function handleTeacherClick() {
     emit('select-teacher', effectiveTeacherId.value);
   }
 }
+
+function handleGroupClick(groupId) {
+  if (groupId) {
+    emit('select-group', groupId);
+  }
+}
+
+const effectiveGroups = computed(() => {
+  const list = [];
+  const addGid = (gid) => {
+    if (gid && !list.some(g => String(g.id) === String(gid))) {
+      const name = props.getGroupName ? props.getGroupName(gid) : String(gid);
+      list.push({ id: gid, name: name || String(gid) });
+    }
+  };
+  if (props.instance?.groupId) addGid(props.instance.groupId);
+  if (Array.isArray(props.instance?.streamGroupIds)) {
+    props.instance.streamGroupIds.forEach(addGid);
+  }
+  if (Array.isArray(props.instance?.streamParticipants)) {
+    props.instance.streamParticipants.forEach(p => addGid(p?.groupId));
+  }
+  return list;
+});
+
+const streamGroupsTitle = computed(() => {
+  return effectiveGroups.value.map(g => g.name).join(', ');
+});
 
 const hasSub = computed(() => Boolean(props.substitution));
 
@@ -462,6 +550,17 @@ const subDetails = computed(() => {
   white-space: nowrap;
 }
 
+.stream-badge {
+  font-size: 10px;
+  font-weight: 700;
+  color: #7e22ce;
+  background: #f3e8ff;
+  border: 1px solid #e9d5ff;
+  padding: 2px 6px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+
 .subject-title {
   font-size: 14px;
   font-weight: 700;
@@ -485,6 +584,67 @@ const subDetails = computed(() => {
   margin-top: 4px;
   width: 100%;
   min-width: 0;
+}
+
+.groups-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.group-icon-svg {
+  color: var(--blue-700);
+  flex-shrink: 0;
+  opacity: 0.85;
+}
+
+.groups-chips-list {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.group-tag-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 2.5px 8px;
+  background: var(--blue-50);
+  border: 1px solid var(--blue-200);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 800;
+  color: var(--blue-700);
+  cursor: pointer;
+  transition: all 0.16s ease;
+  white-space: nowrap;
+}
+
+.group-tag-btn:hover {
+  background: var(--blue-600);
+  color: #ffffff;
+  border-color: var(--blue-600);
+  transform: translateY(-1px);
+}
+
+.no-group-text {
+  font-size: 11px;
+  color: var(--ink-muted);
+  font-style: italic;
+}
+
+.room-entity-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .teacher-info {

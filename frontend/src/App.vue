@@ -3,11 +3,15 @@
     <!-- Навигационная панель -->
     <Navbar
       :role="selectedKind"
+      :currentRole="selectedKind"
       :activePair="activePair"
       :substitutionsCount="substitutions.length"
+      @select-role="handleSelectRole"
       @update:role="handleSelectRole"
       @open-bells="isBellsOpen = true"
+      @toggle-bells="isBellsOpen = true"
       @open-subs="isSubsOpen = true"
+      @toggle-substitutions="isSubsOpen = true"
       @reset-view="handleResetView"
     />
 
@@ -51,8 +55,10 @@
           />
 
           <ScheduleViewer
+            :role="selectedKind"
             :instances="currentSchedule.instances"
             :loading="loading"
+            :getGroupName="getGroupName"
             :getSubjectName="getSubjectName"
             :getTeacherName="getTeacherName"
             :getRoomName="getRoomName"
@@ -61,6 +67,7 @@
             :getPeriodTime="getPeriodTime"
             :findSub="findSubstitutionForLesson"
             @select-teacher="handleSelectTeacher"
+            @select-group="handleSelectGroup"
           />
         </template>
 

@@ -64,12 +64,14 @@
               <LessonCard
                 v-for="inst in getLessonsForDay(dayObj.index)"
                 :key="inst.instId || inst.id"
+                :role="role"
                 :instance="inst"
                 :period="Number(inst.period) || 1"
                 :subjectName="getSubjectName(inst.subjectId)"
                 :teacherName="getTeacherName(inst.teacherId)"
                 :roomName="getRoomName(inst.roomId || inst.dedicatedRoomId || inst.preferredRoomIds?.[0])"
                 :substitution="findSub(inst, dayObj.index, inst.period || 1)"
+                :getGroupName="getGroupName"
                 :getTeacherName="getTeacherName"
                 :getRoomName="getRoomName"
                 :getRoomLocation="getRoomLocation"
@@ -77,6 +79,7 @@
                 :getLessonTypeName="getLessonTypeName"
                 :getPeriodTime="getPeriodTime"
                 @select-teacher="handleSelectTeacher"
+                @select-group="handleSelectGroup"
               />
             </template>
             <div v-else class="day-no-lessons">
@@ -97,8 +100,10 @@ const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Ч
 const SHORT_DAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 
 const props = defineProps({
+  role: { type: String, default: 'group' },
   instances: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
+  getGroupName: { type: Function, default: () => '' },
   getSubjectName: { type: Function, required: true },
   getTeacherName: { type: Function, required: true },
   getRoomName: { type: Function, required: true },
@@ -108,10 +113,14 @@ const props = defineProps({
   findSub: { type: Function, required: true }
 });
 
-const emit = defineEmits(['select-teacher']);
+const emit = defineEmits(['select-teacher', 'select-group']);
 
 function handleSelectTeacher(teacherId) {
   emit('select-teacher', teacherId);
+}
+
+function handleSelectGroup(groupId) {
+  emit('select-group', groupId);
 }
 
 const activeDayIndex = ref(-1);

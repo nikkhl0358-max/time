@@ -88,7 +88,7 @@ const touchedSchedulePatchIds = (patch) => {
   return [...ids].filter(Boolean);
 };
 
-// Строгая загрузка с повторными попытками. Во время redeploy reverse-proxy хостинга
+// Строгая загрузка с повторными попытками. Во время redeploy reverse-proxy Amvera
 // может несколько секунд отвечать 502/503 или оборвать запрос, хотя рабочий storage
 // на постоянном диске никуда не делся. Такие ответы нельзя трактовать как отсутствие данных.
 const TRANSIENT_STORAGE_STATUSES = new Set([425, 429, 500, 502, 503, 504]);

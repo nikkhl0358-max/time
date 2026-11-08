@@ -7,7 +7,7 @@
           <span class="footer-title">КТМУ · Расписание</span>
         </div>
         <p class="footer-desc">
-          Колледж туризма и медиатехнологий. Интерактивная система расписания.
+          Колледж технологии, моделирования и управления (СПбГУПТД). Интерактивная система расписания.
         </p>
         <span class="footer-copy">© 2026 Все права защищены</span>
       </div>
@@ -19,7 +19,9 @@
           :title="isAdmin ? 'Перейти в кабинет составителя' : 'Вход в панель управления для составителей'"
           @click="$emit('open-admin')"
         >
-          <span class="admin-key-icon">🔐</span>
+          <svg class="admin-key-svg" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+            <path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/>
+          </svg>
           <span>{{ isAdmin ? 'Кабинет составителя (Админ)' : 'Войти (Админ)' }}</span>
         </button>
       </div>
@@ -127,8 +129,9 @@ defineEmits(['open-admin']);
   transform: translateY(0);
 }
 
-.admin-key-icon {
-  font-size: 14px;
+.admin-key-svg {
+  color: var(--blue-700);
+  flex-shrink: 0;
 }
 
 @media (max-width: 768px) {
