@@ -1,0 +1,274 @@
+/**
+ * Современная 3D-тема панели администратора в палитре:
+ * Белый, Лазурно-голубой (#0284C7), Оранжевый (#F97316).
+ * Полностью обновляет визуальный стиль 20 вкладок без вмешательства в логику.
+ */
+
+:root {
+  --ink: #0F172A;
+  --ink-2: #1E293B;
+  --paper: #F8FAFC;
+  --paper-2: #F1F5F9;
+  --chalk: #FFFFFF;
+  --board: #0284C7;
+  --amber: #F97316;
+  --amber-soft: #FFF7ED;
+  --ink-soft: #64748B;
+  --line: #E2E8F0;
+  --red: #EF4444;
+  --green: #10B981;
+  --blue: #0284C7;
+}
+
+/* Базовый корень приложения админки */
+.app-root {
+  background: var(--paper) !important;
+  font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif !important;
+  color: var(--ink) !important;
+}
+
+/* 3D Стилизованный сайдбар */
+.sidebar {
+  width: 236px !important;
+  background: linear-gradient(180deg, #0B132B 0%, #111E38 100%) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
+  box-shadow: 4px 0 24px rgba(0, 0, 0, 0.08) !important;
+  padding: 22px 14px !important;
+}
+
+.brand {
+  gap: 12px !important;
+  padding: 4px 6px 24px !important;
+}
+
+.brand-mark {
+  width: 36px !important;
+  height: 36px !important;
+  border-radius: 10px !important;
+  background: linear-gradient(135deg, #0284C7 0%, #0EA5E9 100%) !important;
+  color: #FFFFFF !important;
+  box-shadow: 0 4px 14px rgba(2, 132, 199, 0.4), inset 0 1px 1px rgba(255, 255, 255, 0.4) !important;
+  font-weight: 800 !important;
+  border: 1px solid rgba(255, 255, 255, 0.25) !important;
+}
+
+.brand-title {
+  font-size: 15px !important;
+  font-weight: 800 !important;
+  letter-spacing: -0.02em !important;
+  color: #FFFFFF !important;
+}
+
+.brand-sub {
+  font-size: 11px !important;
+  color: #38BDF8 !important;
+  font-weight: 600 !important;
+}
+
+/* Элементы меню сайдбара */
+.nav-item {
+  color: #94A3B8 !important;
+  border-radius: 9px !important;
+  font-weight: 600 !important;
+  font-size: 13.5px !important;
+  padding: 9px 12px !important;
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1) !important;
+  margin: 1px 0 !important;
+}
+
+.nav-item:hover {
+  background: rgba(255, 255, 255, 0.07) !important;
+  color: #F8FAFC !important;
+  transform: translateX(3px) !important;
+}
+
+.nav-item.active {
+  background: linear-gradient(135deg, #0284C7 0%, #0369A1 100%) !important;
+  color: #FFFFFF !important;
+  box-shadow: 0 4px 14px rgba(2, 132, 199, 0.35) !important;
+  transform: translateX(4px) !important;
+  font-weight: 700 !important;
+}
+
+.nav-presence-badge {
+  background: #F97316 !important;
+  color: #FFFFFF !important;
+  box-shadow: 0 2px 6px rgba(249, 115, 22, 0.4) !important;
+  font-weight: 800 !important;
+}
+
+/* Кнопка нового семестра */
+.sidebar-new-semester {
+  border: 1px solid rgba(249, 115, 22, 0.3) !important;
+  background: rgba(249, 115, 22, 0.12) !important;
+  color: #FDBA74 !important;
+  border-radius: 9px !important;
+  transition: all 0.18s ease !important;
+}
+
+.sidebar-new-semester:hover {
+  background: rgba(249, 115, 22, 0.22) !important;
+  color: #FFFFFF !important;
+  box-shadow: 0 4px 12px rgba(249, 115, 22, 0.25) !important;
+}
+
+/* Панель присутствия */
+.presence-sidebar {
+  border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+}
+
+.presence-dot {
+  background: #10B981 !important;
+  box-shadow: 0 0 8px rgba(16, 185, 129, 0.5) !important;
+}
+
+/* Плавающая панель сохранения в шапке */
+.section-save-bar {
+  background: rgba(255, 255, 255, 0.95) !important;
+  backdrop-filter: blur(12px) !important;
+  border: 1px solid #E2E8F0 !important;
+  border-radius: 12px !important;
+  padding: 12px 18px !important;
+  box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.06) !important;
+  margin-bottom: 18px !important;
+}
+
+.section-save-btn {
+  background: linear-gradient(135deg, #F97316 0%, #EA580C 100%) !important;
+  color: #FFFFFF !important;
+  border-radius: 8px !important;
+  box-shadow: 0 4px 14px rgba(249, 115, 22, 0.35) !important;
+  border: none !important;
+  font-weight: 700 !important;
+  transition: all 0.15s ease !important;
+}
+
+.section-save-btn:hover:not(:disabled) {
+  transform: translateY(-1px) !important;
+  box-shadow: 0 6px 18px rgba(249, 115, 22, 0.45) !important;
+}
+
+/* Карточки и тулбары */
+.card, 
+.section, 
+.load-toolbar-card, 
+.schedule-toolbar-block, 
+.smart-graph-result, 
+.public-room-overview,
+.bulk-panel,
+.bell-config-card {
+  background: #FFFFFF !important;
+  border: 1px solid #E2E8F0 !important;
+  border-radius: 12px !important;
+  box-shadow: 0 4px 16px -2px rgba(15, 23, 42, 0.05), 0 2px 6px -1px rgba(15, 23, 42, 0.02) !important;
+}
+
+/* Кнопки действий */
+.btn {
+  font-family: 'Plus Jakarta Sans', sans-serif !important;
+  border-radius: 8px !important;
+  font-weight: 700 !important;
+  transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1) !important;
+}
+
+.btn.primary {
+  background: linear-gradient(135deg, #0284C7 0%, #0369A1 100%) !important;
+  color: #FFFFFF !important;
+  border: none !important;
+  box-shadow: 0 4px 12px rgba(2, 132, 199, 0.28) !important;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #0369A1 0%, #075985 100%) !important;
+  box-shadow: 0 6px 16px rgba(2, 132, 199, 0.38) !important;
+  transform: translateY(-1px) !important;
+}
+
+.btn.ghost {
+  background: #FFFFFF !important;
+  border: 1px solid #CBD5E1 !important;
+  color: #334155 !important;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04) !important;
+}
+
+.btn.ghost:hover:not(:disabled) {
+  background: #F8FAFC !important;
+  border-color: #94A3B8 !important;
+  color: #0F172A !important;
+}
+
+/* Поля ввода и селекторы */
+input, select {
+  font-family: 'Plus Jakarta Sans', sans-serif !important;
+  background: #FFFFFF !important;
+  border: 1px solid #CBD5E1 !important;
+  border-radius: 8px !important;
+  color: #0F172A !important;
+  transition: border-color 0.15s, box-shadow 0.15s !important;
+}
+
+input:focus, select:focus {
+  border-color: #0284C7 !important;
+  box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.16) !important;
+}
+
+/* Таблицы */
+th {
+  background: #F1F5F9 !important;
+  color: #475569 !important;
+  font-weight: 700 !important;
+  letter-spacing: 0.04em !important;
+  border-bottom: 2px solid #E2E8F0 !important;
+}
+
+td {
+  border-bottom: 1px solid #F1F5F9 !important;
+}
+
+tr:hover td {
+  background: #F0F9FF !important;
+}
+
+/* Недели в графиках */
+.week-chip.odd {
+  background: #E0F2FE !important;
+  color: #0369A1 !important;
+  border-color: #BAE6FD !important;
+}
+
+.week-chip.even {
+  background: #FFEDD5 !important;
+  color: #C2410C !important;
+  border-color: #FED7AA !important;
+}
+
+.graphs-table th.gw-odd {
+  background: #0284C7 !important;
+  color: #FFFFFF !important;
+}
+
+.graphs-table th.gw-even {
+  background: #0369A1 !important;
+  color: #FFFFFF !important;
+}
+
+/* Переключатели ролей и табов */
+.role-btn {
+  border: 1px solid #CBD5E1 !important;
+  border-radius: 20px !important;
+  box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04) !important;
+}
+
+.role-btn.on {
+  background: #0284C7 !important;
+  border-color: #0284C7 !important;
+  color: #FFFFFF !important;
+  box-shadow: 0 4px 10px rgba(2, 132, 199, 0.28) !important;
+}
+
+.subtab.on {
+  background: #E0F2FE !important;
+  border-color: #0284C7 !important;
+  color: #0369A1 !important;
+}
