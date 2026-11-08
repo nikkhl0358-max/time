@@ -29,7 +29,7 @@ class AppErrorBoundary extends React.Component {
   }
 }
 
-ReactDOM.createRoot(document.getElementById("app")).render(
+ReactDOM.createRoot(document.getElementById("root")).render(
   <AppErrorBoundary>
     <App />
   </AppErrorBoundary>
