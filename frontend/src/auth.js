@@ -1,32 +1,21 @@
-/**
- * Безопасный клиент аутентификации.
- * Проверяет тип контента и корректно обрабатывает JSON и HTML ошибки.
- */
+/** Сервер подтверждает вход до загрузки рабочего проекта; cookie недоступна JavaScript. */
 export async function authRequest(action, body) {
-  const isPost = body !== undefined;
-  const options = {
-    method: isPost ? "POST" : "GET",
+  const response = await fetch(`/api/auth/${action}`, {
+    method: body === undefined ? "GET" : "POST",
     credentials: "same-origin",
     cache: "no-store",
-    headers: isPost ? { "Content-Type": "application/json" } : {},
-    ...(isPost ? { body: JSON.stringify(body) } : {})
-  };
-
-  const response = await fetch(`/api/auth/${action}`, options);
-  let result = null;
-  const contentType = response.headers.get("content-type") || "";
-
-  if (contentType.includes("application/json")) {
-    try {
-      result = await response.json();
-    } catch {
-      result = null;
-    }
-  }
-
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  // A proxy can return HTML instead of JSON on 502/503/504. Show the actual
+  // HTTP problem rather than leaving the login dialog apparently unresponsive.
+  const result = await response.json().catch(() => null);
   if (!response.ok) {
-    const errorMsg = result?.error || `Ошибка сервера (${response.status})`;
-    throw new Error(errorMsg);
+    const reason = result?.error || (response.status >= 500
+      ? `Сервер временно недоступен (HTTP ${response.status}). Повторите попытку позже.`
+      : `Не удалось подтвердить вход (HTTP ${response.status})`);
+    throw new Error(reason);
   }
-  return result || {};
+  if (!result || typeof result !== "object") throw new Error("Некорректный ответ сервера авторизации");
+  return result;
 }

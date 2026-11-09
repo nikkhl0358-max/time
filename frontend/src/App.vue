@@ -150,7 +150,7 @@
     <AdminAuthModal
       :isOpen="isAuthModalOpen"
       @close="isAuthModalOpen = false"
-      @login-success="isAdminMode = true"
+      @login-success="handleOpenAdmin"
     />
   </div>
 </template>
@@ -294,11 +294,7 @@ function handleSelectTeacher(teacherId) {
 
 // 9. Открытие панели администратора
 function handleOpenAdmin() {
-  if (currentUser.value) {
-    isAdminMode.value = true;
-  } else {
-    isAuthModalOpen.value = true;
-  }
+  window.location.assign('/admin');
 }
 
 // 10. Обновление замен

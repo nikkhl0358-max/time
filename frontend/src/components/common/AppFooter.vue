@@ -15,6 +15,12 @@
       <div class="footer-actions">
         <button
           type="button"
+          class="design-return-btn"
+          title="Открыть старый дизайн расписания"
+          @click="switchToOldDesign"
+        >Старый дизайн</button>
+        <button
+          type="button"
           class="admin-entry-btn"
           :title="isAdmin ? 'Перейти в кабинет составителя' : 'Вход в панель управления для составителей'"
           @click="$emit('open-admin')"
@@ -35,6 +41,10 @@ defineProps({
 });
 
 defineEmits(['open-admin']);
+function switchToOldDesign() {
+  try { window.localStorage.setItem('ktmu-design-version', 'old'); } catch (_) {}
+  window.location.assign('/');
+}
 </script>
 
 <style scoped>
@@ -100,6 +110,23 @@ defineEmits(['open-admin']);
   gap: 12px;
 }
 
+.design-return-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 11px;
+  min-height: 32px;
+  border: 1px solid var(--border-light);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--ink-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+}
+.design-return-btn:hover { background: var(--blue-50); border-color: var(--blue-500); color: var(--blue-700); }
 .admin-entry-btn {
   display: inline-flex;
   align-items: center;
@@ -147,8 +174,9 @@ defineEmits(['open-admin']);
   .footer-brand {
     justify-content: center;
   }
+  .footer-actions { flex-wrap: wrap; justify-content: center; }
   .admin-entry-btn {
-    width: 100%;
+    width: auto;
     justify-content: center;
     max-width: 280px;
   }

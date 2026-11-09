@@ -88,7 +88,7 @@ const touchedSchedulePatchIds = (patch) => {
   return [...ids].filter(Boolean);
 };
 
-// Строгая загрузка с повторными попытками. Во время redeploy reverse-proxy Amvera
+// Строгая загрузка с повторными попытками. Во время redeploy reverse-proxy хостинга
 // может несколько секунд отвечать 502/503 или оборвать запрос, хотя рабочий storage
 // на постоянном диске никуда не делся. Такие ответы нельзя трактовать как отсутствие данных.
 const TRANSIENT_STORAGE_STATUSES = new Set([425, 429, 500, 502, 503, 504]);
@@ -674,22 +674,6 @@ export async function publicStatusGet() {
     return await res.json();
   } catch (e) {
     console.error('publicStatusGet failed', e);
-    return null;
-  }
-}
-
-export async function publicRoomAvailabilityGet(date, period) {
-  try {
-    const p = Math.max(0, Number(period) || 0);
-    const qs = `date=${encodeURIComponent(String(date || ''))}&period=${p}&_t=${Date.now()}`;
-    const res = await storageFetch(`/api/public-room-availability?${qs}`, {
-      cache: 'no-store',
-      headers: { 'Cache-Control': 'no-cache' }
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (e) {
-    console.error('publicRoomAvailabilityGet failed', e);
     return null;
   }
 }
