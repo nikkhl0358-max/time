@@ -84,6 +84,7 @@ class TestUIVisualInteractions(unittest.TestCase):
         self.page.wait_for_selector(".group-card", timeout=5000)
         self.page.locator(".group-card").first.click()
         self.page.wait_for_selector(".filter-bar", timeout=5000)
+        self.page.wait_for_selector(".day-filter-bar", timeout=8000)
 
     def assert_no_horizontal_scroll(self, viewport_name=""):
         """Проверяет отсутствие горизонтального скролла на странице."""
@@ -189,6 +190,7 @@ class TestUIVisualInteractions(unittest.TestCase):
     def test_08_day_tabs_active_highlight_and_filter(self):
         """Проверяет подсветку активного дня и фильтрацию пар."""
         self.select_first_group()
+        self.page.wait_for_selector(".day-pill-btn", timeout=8000)
         tabs = self.page.locator(".day-pill-btn")
         self.assertGreater(tabs.count(), 1)
         first_day_tab = tabs.nth(1)
@@ -259,6 +261,40 @@ class TestUIVisualInteractions(unittest.TestCase):
             return '';
         }""")
         self.assertIn("blur", blur_style)
+
+    def test_13_lesson_footer_flex_wrap_and_teacher_layout(self):
+        """Проверяет flex-wrap в lesson-footer и перенос длинных имен педагогов."""
+        self.select_first_group(width=375, height=667)
+        footer = self.page.locator(".lesson-footer").first
+        if footer.count() > 0:
+            wrap = footer.evaluate("el => window.getComputedStyle(el).flexWrap")
+            self.assertEqual(wrap, "wrap", "В lesson-footer должен быть flex-wrap: wrap для предотвращения сжатия ФИО")
+
+    def test_14_no_redundant_stream_inline_when_badge_present(self):
+        """Проверяет отсутствие задвоения бейджа 'Поток' и инлайн-текста '· 🔗 поток'."""
+        self.select_first_group(width=1280, height=800)
+        cards = self.page.locator(".lesson-item")
+        for i in range(min(5, cards.count())):
+            card = cards.nth(i)
+            has_badge = card.locator(".stream-badge").count() > 0
+            if has_badge:
+                has_inline = card.locator(".stream-inline").count() > 0
+                self.assertFalse(has_inline, "При наличии бейджа 'Поток' инлайн '· 🔗 поток' не должен дублироваться")
+
+    def test_15_remote_badge_accent_and_footer_alignment(self):
+        """Проверяет акцентный стиль бейджа 'Дистант' и естественную ширину элементов футера."""
+        self.select_first_group(width=1280, height=800)
+        footer = self.page.locator(".lesson-footer").first
+        if footer.count() > 0:
+            info = footer.locator(".teacher-info").first
+            if info.count() > 0:
+                grow = info.evaluate("el => window.getComputedStyle(el).flexGrow")
+                self.assertEqual(grow, "0", "teacher-info не должен искусственно раздуваться (flex-grow: 0)")
+        remote = self.page.locator(".format-badge.remote").first
+        if remote.count() > 0:
+            svg = remote.locator(".badge-icon-remote")
+            self.assertTrue(svg.count() > 0, "Бейдж 'Дистант' должен содержать векторную иконку онлайна")
+
 
 if __name__ == "__main__":
     unittest.main()

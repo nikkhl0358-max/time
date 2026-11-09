@@ -96,15 +96,21 @@ a {
 
 @media print {
   .app-navbar,
-  .filter-bar,
   .day-filter-bar,
   .ambient-orange-orb,
   .ambient-orange-glow,
   .app-footer,
   .change-entity-btn,
+  .week-nav-btn,
   .action-buttons-row,
   .hero-3d-container {
     display: none !important;
+  }
+  .filter-bar {
+    border: none !important;
+    box-shadow: none !important;
+    padding: 0 0 16px 0 !important;
+    background: transparent !important;
   }
   body, #app, .main-content {
     background: #ffffff !important;

@@ -56,7 +56,10 @@
             :role="selectedKind"
             :selectedId="selectedId"
             :selectedName="currentEntityName"
+            :entitySubtitle="selectedKind === 'room' ? getRoomDetails(selectedId).description : ''"
             v-model:selectedWeek="selectedWeek"
+            :publishedWeeks="publishedWeeks"
+            :publicWeekSelectionEnabled="publicWeekSelectionEnabled"
             :hasSchedule="Boolean(currentSchedule.instances && currentSchedule.instances.length > 0)"
             @change-selection="handleChangeSelection"
             @export-csv="handleExportCSV"
@@ -65,14 +68,26 @@
 
           <ScheduleViewer
             :role="selectedKind"
+            :selectedId="selectedId"
             :instances="currentSchedule.instances"
+            :substitutions="substitutions"
+            :subjects="subjects"
             :loading="loading"
             :selectedWeek="selectedWeek"
             :semesterStart="semesterConfig.semesterStart"
+            :semesterConfig="semesterConfig"
+            :announcements="announcements"
+            :publicIntroText="publicIntroText"
+            :practices="practices"
+            :retakes="retakes"
+            :teachers="teachers"
+            :rooms="rooms"
+            :groups="groups"
             :getGroupName="getGroupName"
             :getSubjectName="getSubjectName"
             :getTeacherName="getTeacherName"
             :getRoomName="getRoomName"
+            :getRoomDetails="getRoomDetails"
             :getRoomLocation="getRoomLocation"
             :getLessonTypeName="getLessonTypeName"
             :getPeriodTime="getPeriodTime"
@@ -97,6 +112,9 @@
             :role="selectedKind"
             :items="currentItemsList"
             :departments="departments"
+            :roomTypes="roomTypes"
+            :roomSizes="roomSizes"
+            :semesterConfig="semesterConfig"
             @select="handleSelectEntity"
           />
         </template>
@@ -132,7 +150,7 @@
     <AdminAuthModal
       :isOpen="isAuthModalOpen"
       @close="isAuthModalOpen = false"
-      @login-success="handleOpenAdmin"
+      @login-success="isAdminMode = true"
     />
   </div>
 </template>
@@ -178,16 +196,25 @@ const {
   teachers,
   departments,
   rooms,
+  roomTypes,
+  roomSizes,
   subjects,
   specialties,
   lessonTypes,
   substitutions,
+  announcements,
+  publicIntroText,
+  retakes,
+  practices,
+  publishedWeeks,
+  publicWeekSelectionEnabled,
   semesterConfig,
   loadPublicIndex,
   loadScheduleShard,
   getTeacherName,
   getSubjectName,
   getRoomName,
+  getRoomDetails,
   getRoomLocation,
   getGroupName,
   getLessonTypeName,
@@ -267,8 +294,11 @@ function handleSelectTeacher(teacherId) {
 
 // 9. Открытие панели администратора
 function handleOpenAdmin() {
-  // Always enter the original administration interface regardless of public theme.
-  window.location.assign('/admin');
+  if (currentUser.value) {
+    isAdminMode.value = true;
+  } else {
+    isAuthModalOpen.value = true;
+  }
 }
 
 // 10. Обновление замен
@@ -278,7 +308,18 @@ function handleUpdateSubs(updatedSubs) {
 
 // 11. Экспорт в CSV
 function handleExportCSV() {
-  exportScheduleCSV(currentSchedule.value.instances, currentEntityName.value, getSubjectName, getTeacherName, getRoomName);
+  exportScheduleCSV(
+    currentSchedule.value.instances,
+    currentEntityName.value,
+    getSubjectName,
+    getTeacherName,
+    getRoomName,
+    {
+      getGroupName,
+      getLessonTypeName,
+      getPeriodTime
+    }
+  );
 }
 
 // 12. Печать расписания

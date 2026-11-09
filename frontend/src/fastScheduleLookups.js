@@ -131,3 +131,56 @@ export function findMovedSourceInstanceFast(instances, sourceId) {
   }
   return index.get(String(sourceId || "")) || null;
 }
+
+export function isShortenedDate(config, dateStr) {
+  return Boolean(dateStr && Array.isArray(config?.shortenedDates) && config.shortenedDates.includes(dateStr));
+}
+
+export function compactWeekNumbers(nums = []) {
+  const xs = [...new Set((nums || []).map(Number).filter((n) => Number.isFinite(n) && n > 0))].sort((a, b) => a - b);
+  if (!xs.length) return "";
+  const parts = [];
+  let start = xs[0], prev = xs[0];
+  for (let i = 1; i <= xs.length; i++) {
+    const cur = xs[i];
+    if (cur === prev + 1) { prev = cur; continue; }
+    parts.push(start === prev ? `${start}` : `${start}–${prev}`);
+    start = cur; prev = cur;
+  }
+  return parts.join(", ");
+}
+
+export function weekNumbersForInstance(config, inst) {
+  const total = Number(config?.semesterWeeks || config?.totalWeeks || 24);
+  const pattern = inst?.weekPattern || "all";
+  if (pattern === "custom") {
+    return [...new Set((inst.customWeeks || []).map(Number).filter((n) => Number.isFinite(n) && n >= 1 && n <= total))].sort((a, b) => a - b);
+  }
+  if (pattern === "perWeek") {
+    const wp = inst?.weeklyPairs || {};
+    return Object.keys(wp).map(Number).filter((n) => n >= 1 && n <= total && Number(wp[n] || wp[String(n)] || 0) > 0).sort((a, b) => a - b);
+  }
+  if (pattern === "all") return Array.from({ length: total }, (_, i) => i + 1);
+  return Array.from({ length: total }, (_, i) => i + 1).filter((n) => (n % 2 === 1 ? "odd" : "even") === pattern);
+}
+
+export function weekNumbersLabel(config, inst) {
+  const nums = weekNumbersForInstance(config, inst);
+  const compact = compactWeekNumbers(nums);
+  return compact ? `недели: ${compact}` : "";
+}
+
+export function isNoClassDateFast(data, dateStr) {
+  if (!dateStr) return false;
+  if (isHolidayFast(data?.config, dateStr)) return true;
+  const exc = calendarExceptionForFast(data, dateStr);
+  return Boolean(exc?.noClasses);
+}
+
+export function groupCourseNumberFast(group) {
+  const sem = Number(group?.curriculumSemester || 0);
+  if (sem > 0) return Math.ceil(sem / 2);
+  const m = String(group?.name || "").match(/^(\d+)/);
+  return m ? Number(m[1]) : 1;
+}
+

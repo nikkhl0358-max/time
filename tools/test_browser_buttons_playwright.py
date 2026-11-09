@@ -213,7 +213,7 @@ class TestBrowserButtonsPlaywright(unittest.TestCase):
             page.click('.role-btn:has-text("Аудитории")')
             page.wait_for_selector(".room-pick-btn")
             room_btn = page.locator(".room-pick-btn").first
-            room_name = room_btn.inner_text().strip()
+            room_name = room_btn.locator(".room-pick-name").inner_text().strip() if room_btn.locator(".room-pick-name").count() else room_btn.inner_text().split('\n')[0].strip()
             room_btn.click()
             page.wait_for_selector(".entity-name")
             self.assertIn("room/", page.url)

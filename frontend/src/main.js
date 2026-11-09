@@ -1,60 +1,16 @@
-/** Public design selector. Administrative routes always use the original React interface. */
-const DESIGN_KEY = 'ktmu-design-version';
-const readDesign = () => {
-  try { return localStorage.getItem(DESIGN_KEY) === 'old' ? 'old' : 'new'; }
-  catch { return 'new'; }
-};
-const isAdminRoute = () => location.pathname === '/admin' || location.pathname.startsWith('/admin/') || location.hash.startsWith('#admin');
+function isAdminRoute() {
+  const path = window.location.pathname;
+  const hash = window.location.hash;
+  return path.startsWith("/admin") || hash.startsWith("#admin");
+}
 
-async function bootstrapApplication() {
-  const design = readDesign();
-  const admin = isAdminRoute();
-  const root = document.getElementById('app');
-  if (!root) return;
-  root.id = admin || design === 'old' ? 'root' : 'app';
-  document.documentElement.dataset.design = admin ? 'old' : design;
-  document.documentElement.dataset.view = admin ? 'admin' : 'public';
-
-  // Legacy React interface retains its original built-in styles; modern theme is opt-in.
-  if (admin || design === 'old') {
-    const { mountAdmin } = await import('./mountAdmin.jsx');
-    await mountAdmin('old');
+function bootstrapApplication() {
+  if (isAdminRoute()) {
+    import("./mountAdmin.jsx").then(m => m.mountAdmin());
   } else {
-    document.title = 'Расписание — КТМУ';
-    const { mountVue } = await import('./mountVue.js');
-    mountVue();
+    document.title = "Расписание — КТМУ";
+    import("./mountVue.js").then(m => m.mountVue());
   }
-  mountDesignSwitch(design);
 }
 
-function mountDesignSwitch(design) {
-  const host = document.createElement('div');
-  host.id = 'design-switcher';
-  host.setAttribute('role', 'group');
-  host.setAttribute('aria-label', 'Выбор оформления публичного расписания');
-  const label = document.createElement('span');
-  label.textContent = 'Дизайн сайта:';
-  host.append(label);
-  if (isAdminRoute()) host.title = 'Настройка влияет только на публичное расписание. Админ-панель всегда в старом формате.';
-  for (const [value, title] of [['old', 'Старый'], ['new', 'Новый']]) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = title;
-    btn.className = design === value ? 'design-choice active' : 'design-choice';
-    btn.setAttribute('aria-pressed', String(design === value));
-    btn.addEventListener('click', () => {
-      if (value === design) return;
-      try { localStorage.setItem(DESIGN_KEY, value); } catch {}
-      location.reload();
-    });
-    host.append(btn);
-  }
-  document.body.append(host);
-}
-
-bootstrapApplication().catch(err => {
-  console.error('Не удалось запустить интерфейс', err);
-  const root = document.querySelector('#app, #root');
-  if (root) root.textContent = 'Не удалось загрузить интерфейс. Обновите страницу.';
-  mountDesignSwitch(readDesign());
-});
+bootstrapApplication();

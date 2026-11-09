@@ -1,8 +1,32 @@
 <template>
   <div class="bells-container">
+    <div class="bells-tabs" role="tablist">
+      <button 
+        type="button" 
+        :class="['bell-tab-btn', { active: currentTab === 'standard' }]"
+        @click="currentTab = 'standard'"
+      >
+        🏛 Главный корпус
+      </button>
+      <button 
+        type="button" 
+        :class="['bell-tab-btn', { active: currentTab === 'voz' }]"
+        @click="currentTab = 'voz'"
+      >
+        🏢 Вознесенский пр.
+      </button>
+      <button 
+        type="button" 
+        :class="['bell-tab-btn', { active: currentTab === 'short' }]"
+        @click="currentTab = 'short'"
+      >
+        ⏱ Сокращённый
+      </button>
+    </div>
+
     <div class="bells-list">
       <div 
-        v-for="bell in bells" 
+        v-for="bell in displayedBells" 
         :key="bell.period"
         :class="['bell-row', { active: activePeriodNumber === bell.period }]"
       >
@@ -21,9 +45,21 @@
 </template>
 
 <script setup>
-defineProps({
-  bells: { type: Array, required: true },
+import { ref, computed } from 'vue';
+import { STANDARD_BELLS, VOZNESENSKY_BELLS, SHORTENED_BELLS } from '../../composables/useCurrentTime.js';
+
+const props = defineProps({
+  bells: { type: Array, default: () => [] },
   activePeriodNumber: { type: Number, default: null }
+});
+
+const currentTab = ref('standard');
+
+const displayedBells = computed(() => {
+  if (currentTab.value === 'voz') return VOZNESENSKY_BELLS;
+  if (currentTab.value === 'short') return SHORTENED_BELLS;
+  if (props.bells && props.bells.length) return props.bells;
+  return STANDARD_BELLS;
 });
 </script>
 
@@ -31,6 +67,35 @@ defineProps({
 .bells-container {
   display: flex;
   flex-direction: column;
+}
+
+.bells-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+  background: var(--blue-50, #eff6ff);
+  padding: 4px;
+  border-radius: 10px;
+}
+
+.bell-tab-btn {
+  flex: 1;
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ink-secondary, #64748b);
+  border-radius: 7px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  white-space: nowrap;
+}
+
+.bell-tab-btn.active {
+  background: #ffffff;
+  color: var(--blue-700, #1d4ed8);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.06);
 }
 
 .bells-list {

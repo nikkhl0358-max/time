@@ -2,6 +2,7 @@
 # Локальная сборка для проверки. На Amvera фронтенд собирается автоматически Dockerfile'ом.
 set -euo pipefail
 cd "$(dirname "$0")"
+python3 tools/check_scheduler_parity.py
 cd frontend
 npm install --no-audit --no-fund
 npm run build

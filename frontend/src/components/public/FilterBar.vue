@@ -6,6 +6,7 @@
         <span class="entity-type-label">{{ entityRoleLabel }}</span>
         <div class="entity-name-row">
           <h2 class="entity-name">{{ selectedName || 'Не выбрано' }}</h2>
+          <span v-if="entitySubtitle" class="entity-subtitle-badge" :title="entitySubtitle">{{ entitySubtitle }}</span>
         </div>
       </div>
 
@@ -29,8 +30,8 @@
       <div class="week-navigation">
         <button 
           class="week-nav-btn" 
-          :disabled="selectedWeek <= 1"
-          @click="changeWeek(selectedWeek - 1)"
+          :disabled="!canPrevWeek"
+          @click="stepWeek(-1)"
           title="Предыдущая неделя"
           aria-label="Предыдущая неделя"
         >
@@ -46,8 +47,8 @@
 
         <button 
           class="week-nav-btn" 
-          :disabled="selectedWeek >= 24"
-          @click="changeWeek(selectedWeek + 1)"
+          :disabled="!canNextWeek"
+          @click="stepWeek(1)"
           title="Следующая неделя"
           aria-label="Следующая неделя"
         >
@@ -98,14 +99,27 @@ const props = defineProps({
   items: { type: Array, default: () => [] },
   selectedId: { type: [String, Number], default: '' },
   selectedName: { type: String, default: '' },
+  entitySubtitle: { type: String, default: '' },
   selectedWeek: { type: Number, default: 10 },
-  hasSchedule: { type: Boolean, default: true }
+  hasSchedule: { type: Boolean, default: true },
+  publishedWeeks: { type: Array, default: () => [] },
+  publicWeekSelectionEnabled: { type: Boolean, default: true }
 });
 
 const emit = defineEmits(['change-selection', 'update:selectedWeek', 'export-csv', 'print']);
 
 const hasItems = computed(() => Boolean(props.selectedId));
 const canExport = computed(() => Boolean(props.selectedId) && props.hasSchedule);
+
+const availableWeeks = computed(() => {
+  if (props.publicWeekSelectionEnabled && Array.isArray(props.publishedWeeks) && props.publishedWeeks.length) {
+    return [...new Set(props.publishedWeeks.map(Number).filter(n => Number.isFinite(n) && n >= 1 && n <= 24))].sort((a, b) => a - b);
+  }
+  return Array.from({ length: 24 }, (_, i) => i + 1);
+});
+
+const canPrevWeek = computed(() => availableWeeks.value.some(w => w < props.selectedWeek));
+const canNextWeek = computed(() => availableWeeks.value.some(w => w > props.selectedWeek));
 
 // 1. Отображение типа сущности
 const entityRoleLabel = computed(() => {
@@ -122,9 +136,16 @@ const entityRoleGenitive = computed(() => {
 });
 
 // 3. Смена учебной недели
-function changeWeek(newWeek) {
-  const clamped = Math.max(1, Math.min(24, newWeek));
-  emit('update:selectedWeek', clamped);
+function stepWeek(direction) {
+  const list = availableWeeks.value;
+  if (!list.length) return;
+  let target = null;
+  if (direction < 0) {
+    target = [...list].reverse().find(w => w < props.selectedWeek) ?? null;
+  } else {
+    target = list.find(w => w > props.selectedWeek) ?? null;
+  }
+  if (target !== null) emit('update:selectedWeek', target);
 }
 
 // 5. Клик по кнопке смены сущности
@@ -176,6 +197,21 @@ function handleChangeClick() {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.entity-subtitle-badge {
+  font-size: 12px;
+  font-weight: 600;
+  color: #0369a1;
+  background: #e0f2fe;
+  border: 1px solid #bae6fd;
+  padding: 3px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .entity-icon {

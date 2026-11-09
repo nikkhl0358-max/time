@@ -1,6 +1,6 @@
 # UML проекта timetable22
 
-Обновлено: 2026-11-06 — разделение 50+ МБ проекта на легкий bootstrap, частичную загрузку разделов, потоковый экспорт, изоляцию планировщиков и строгий аудит бизнес-логики.
+Обновлено: 2026-11-09 — устранение потери переносов занятий в шардах сущностей, предотвращение усечения ФИО преподавателей, очистка тегов аудиторий и паритет с оригинальным расписанием.
 
 ## Компоненты
 
@@ -11,19 +11,22 @@ flowchart LR
         Navbar[Navbar.vue · Responsive Nav & Roles]
         Hero[HeroScene3D.vue · Three.js Central Orange Orb]
         DrillDown[GroupDrillDown.vue · Specialty->Year->Group Drilldown & A11y]
-        EntityPicker[TeacherRoomPicker.vue · Teachers 8-CK & Campus Tabs]
-        Viewer[ScheduleViewer.vue · Spatial Grid]
-        Card[LessonCard.vue · Lesson Card]
+        EntityPicker[TeacherRoomPicker.vue · Teachers 8-CK, Rooms Search & Category Tabs]
+        Viewer[ScheduleViewer.vue · Spatial Grid, Free Room Periods, Gaps & Practices]
+        Card[LessonCard.vue · Lesson Card, Target Moves, Week Numbers & Room Badges]
         SpatialCard[SpatialCard.vue · 3D Specular Tilt]
-        Filter[FilterBar.vue · Breadcrumb & Week Navigation]
+        Filter[FilterBar.vue · Breadcrumb, Subtitle & Published Weeks Nav]
+        PublicNotices[PublicNotices.vue · Official Announcements & Intro Banner]
+        SubUtil[frontend/src/utils/scheduleSubstitutions.js · Moved Subs, Sibling Collapse, Change Details & Free Periods]
         Modal[Modal.vue · Accessible Modal & Esc]
-        Bells[BellsSchedule.vue · Live Timer]
+        Bells[BellsSchedule.vue · Multi-Campus Live Timer & Tabs]
         Subs[SubstitutionsFeed.vue · Substitutions]
         AuthModal[AdminAuthModal.vue · Safe Login]
         Admin[AdminLayout.vue · Manager Dashboard]
         AdminSubs[AdminSubstitutionsEditor.vue · Reactive CRUD]
         TestClientFlows[tools/test_client_flows_e2e.py · E2E DOM & Flows Auditor]
         TestUIVisual[tools/test_ui_visual_interactions.py · Visual, Responsive & Mobile Auditor]
+        TestRoomSubs[tools/test_room_substitutions_parity.py · Room Substitutions & Free Periods Parity]
         
         App --> Navbar
         App --> Hero
@@ -31,6 +34,10 @@ flowchart LR
         App --> EntityPicker
         App --> Viewer
         Viewer --> Card
+        Viewer --> PublicNotices
+        Viewer --> SubUtil
+        EntityPicker --> SubUtil
+        Card --> SubUtil
         Card --> SpatialCard
         App --> Filter
         App --> Modal
@@ -86,12 +93,14 @@ flowchart LR
         PerformanceTester["test_performance_and_leaks.py · Bundle & Memory Audit"]
         VueIntegration["test_vue_frontend_e2e.py · Flask & Static Integration"]
         DataContractTester["test_schedule_data_contract.py · Live API Data Stress & Shard Contract"]
+        RoomSubsTester["test_room_substitutions_parity.py · Room Substitutions & Free Periods Parity"]
         PlaywrightTester --> Frontend
         PlaywrightTester --> API
         VueIntegration --> API
         DataContractTester --> API
         DataContractTester --> SQLite
         DataContractTester --> Public
+        RoomSubsTester --> API
     end
 ```
 
@@ -391,5 +400,19 @@ flowchart TD
     - **Изоляция исторических замен и привязка к датам:** Подтверждено, что ни одна из 153 исторических замен сентября/октября не проникает в ноябрьские недели. Все типы замен (`cancel`, `cancel_assignment`, `pending_move`, `moved`, `excursion`, `join_subgroup`, `sub`) проверены на соответствие каноническим дням недели и корректность полей переходов (`targetDate`, `targetPeriod`, `newTeacherId`, `note`).
     - **Целостность справочников и устойчивость к null:** Проверена валидность ссылок `subjectId`, `teacherId`, `roomId`, `groupId`. Доказана бессбойная работа генерации шардов при наличии `roomId: null` (дистанционные занятия), пустых или отсутствующих идентификаторах.
     - **Протокольный контракт:** Валидированы генерация `ETag`, корректность ответа `304 Not Modified`, заголовки `Cache-Control: no-store` и сжатие `gzip` с полной эквивалентностью распакованных данных.
+28. **Восстановление переносов занятий, классификатора кабинетов и чекера занятости аудиторий:**
+    - **Устранение потери переносов занятий (`moved`, `excursion`):** В генераторе шардов бэкенда (`app.py`), утилитах `scheduleSubstitutions.js` и парсинге `useScheduleData.js` нормализовано каноническое сопоставление составных идентификаторов (`__EXACT_W8_2__EXACT_W10_2`), включена поддержка импортированных переносов (`importGroupId`, `importOldTeacherId`, `importOldRoom`, `importNewRoom`) и сохранение вспомогательных `_publicMoveSupportOnly` инстансов без их преждевременного усечения. Перенесённые занятия корректно отображаются на целевых датах в расписании групп, преподавателей и аудиторий.
+    - **Классификация кабинетов по типам и вместимости:** Реализованы категории: `💻 Компьютерные`, `🎨 Художественные`, `🔬 Лаборатории`, `🏛 Большие (40+ мест)`, `📐 Средние (20–40 мест)`, `🛋 Малые (до 20 мест)`. На карточках аудиторий и в расписании выводятся соответствующие теги и вместимость мест.
+    - **Интерактивный чекер занятости аудиторий (`public-room-overview`):** В `TeacherRoomPicker.vue` интегрирован раскрывающийся блок проверки занятости аудиторий на любую дату и номер пары семестра по опубликованному расписанию (`/api/public-room-availability`), с раздельным выводом интерактивных чипов свободных кабинетов и списка занятых аудиторий с деталями занятий (группа, предмет, преподаватель).
+    - **Синхронизация карточки занятия по оригинальному сайту:** В `LessonCard.vue` восстановлено одновременное отображение строки исходного переноса (`↪ Перенесено с 04.11 · 1 пары`), деталей изменений (`↪ Перенос занятия`) и нижнего статус-бейджа (`ПЕРЕНОС`, `ОТМЕНА`, `ЗАМЕНА`).
+29. **Устранение потери переносов занятий в шардах сущностей, предотвращение усечения ФИО преподавателей и очистка UI:**
+    - **Глубокое сопоставление замен в шардах расписания (`app.py`):** Ранее шарды сущностей (`_build_public_schedule_shard` и `_public_entity_data_patch`) фильтровали замены только по явному полю `sub.groupId == entity_id`. Однако более 80% замен (и 24 из 31 переносов) хранят группу только в исходном инстансе (`instId`). Внедрены функции `_public_sub_direct_matches`, `_public_sub_instance_matches`, `_public_substitution_matches_entity`, `_collect_entity_sub_support_ids`, разыменовывающие инстансы через `inst_by_id` и `_canonical_public_inst_id`. Это гарантирует, что перенесённые занятия (например, 4 пары рисунка/живописи группы `3-КДД-36` с 04.11 на 12.11) не теряются на целевой неделе и корректно отображаются во всех режимах (группа, преподаватель, аудитория).
+    - **Предотвращение усечения ФИО преподавателя в карточке занятия (`LessonCard.vue`):** При отображении длинных тегов кабинетов (`📍 Спортивный зал (1) большая · спортзал`, `📍 ауд. В-452 большая · компьютерная`) блок преподавателя сжимался в многоточие (`👤 Гол...`, `👤 Шустов ...`). Для `.lesson-footer` включен перенос строк `flex-wrap: wrap; gap: 6px 10px;`, для преподавателя задан `min-width: 120px; flex: 1 1 auto; white-space: normal; overflow-wrap: break-word;`, а чип аудитории смещается на новую строку при нехватке места. ФИО отображается полностью.
+    - **Устранение избыточного тега «обычная» для стандартных кабинетов (`scheduleSubstitutions.js`):** Обычные аудитории (например, `ауд. 5`) больше не засоряются техническим тегом `обычная`. Отображаются только специализированные теги (`компьютерная`, `художественная`, `спортзал`, `лаборатория`) или градации вместимости для больших аудиторий.
+    - **Исключение дублирования индикатора потока:** Устранено одновременное появление верхнего бейджа `[Поток]` и инлайн-префикса `· 🔗 поток` в названии дисциплины при наличии верхнего бейджа.
+30. **Ликвидация разрыва строки в футере карточки, устранение тавтологий тегов аудиторий и акцентный стиль «Дистант»:**
+    - **Устранение «лесенки» в футере карточки (`LessonCard.vue`):** Удалён `margin-left: auto;` у `.room-chip`, который при переносе строки на мобильных устройствах отбрасывал чип кабинета в противоположный угол, оставляя ФИО преподавателя на пустой строке. Для `.teacher-info` и `.teacher-btn` установлена естественная ширина контента `flex: 0 1 auto; min-width: 0;` вместо искусственного растягивания, а для текста имени — строгая средняя насыщенность `font-weight: 500; white-space: nowrap;`. Теперь ФИО педагога и аудитория располагаются гармонично в одну аккуратную строку.
+    - **Интеллектуальная дедупликация тегов помещений (`scheduleSubstitutions.js`):** В функции `resolveMeaningfulTypeLabel` и `buildRoomTagLabel` добавлена проверка названия помещения: если аудитория уже содержит указание на тип (например, `Спортивный зал (1)`, `Художественная мастерская`), слово `спортзал` или `художественная` не дублируется в тегах. Для спортивных залов также исключён избыточный тег `большая`. Это сократило ширину чипа почти вдвое и полностью исключило визуальный шум.
+    - **Визуальный акцент на плашке «Дистант» (`LessonCard.vue`):** Бейдж формата `.format-badge.remote` переработан в яркий современный акцент с градиентной заливкой `linear-gradient(135deg, #2563eb, #1d4ed8)`, белым контрастным шрифтом, мягкой тенью и векторной SVG-иконкой онлайна (экран/ноутбук). В нижнем блоке аудитории статус `дистанционно` переведён на семантическую иконку онлайна 💻 вместо неуместного геолокационного пина 📍.
 
 Устаревшие архивные копии (`tools/frontend/`, дубликаты планировщиков и временные отчёты) удалены из кодовой базы для поддержания чистоты репозитория.

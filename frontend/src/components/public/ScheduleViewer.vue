@@ -19,6 +19,9 @@
     </div>
 
     <div v-else class="schedule-content-wrap">
+      <!-- Баннер официальных объявлений колледжа -->
+      <PublicNotices :announcements="announcements" :publicIntroText="publicIntroText" />
+
       <!-- Панель быстрого фильтра по дням недели (по центру) -->
       <nav class="day-filter-bar" aria-label="Фильтр дней недели">
         <button
@@ -58,10 +61,41 @@
           <div class="day-header">
             <span class="day-title">{{ dayObj.name }}</span>
             <span v-if="dayObj.dateFormatted" class="day-date">{{ dayObj.dateFormatted }}</span>
+            <span v-if="isShortenedDay(dayObj.dateISO)" class="public-shortened-day"> · ⏱ сокращённый день</span>
+          </div>
+
+          <!-- Свободные пары для кабинета (по скриншоту 1) -->
+          <div 
+            v-if="role === 'room' && getFreePeriodsForDay(dayObj.index).length" 
+            class="room-free-bar"
+            title="Пары, на которых кабинет свободен по опубликованному расписанию"
+          >
+            <span class="room-free-check">✓</span>
+            <span class="room-free-text">Свободно: {{ formatFreePeriods(getFreePeriodsForDay(dayObj.index)) }}</span>
+          </div>
+          <div 
+            v-else-if="role !== 'room' && getGapsForDay(dayObj.index).length" 
+            class="day-gaps-bar"
+            title="Свободное время между занятиями в этот день"
+          >
+            <span class="day-gaps-icon">🕳</span>
+            <span class="day-gaps-text">{{ getGapsForDay(dayObj.index).length === 1 ? 'Окно' : 'Окна' }}: {{ formatFreePeriods(getGapsForDay(dayObj.index)) }}</span>
           </div>
 
           <div class="day-lessons">
-            <template v-if="getLessonsForDay(dayObj.index).length">
+            <div v-if="isHolidayDay(dayObj.dateISO)" class="day-holiday-banner">
+              🎉 Праздничный день — занятий нет
+            </div>
+            <div v-else-if="getGroupPractice(dayObj.dateISO)" class="practice-card">
+              <div class="practice-title">🧰 {{ getGroupPractice(dayObj.dateISO).name || 'Производственная/учебная практика' }}</div>
+              <div v-if="getGroupPractice(dayObj.dateISO).teacherName" class="practice-row">
+                <span class="practice-icon">👤</span> Руководитель: {{ getGroupPractice(dayObj.dateISO).teacherName }}
+              </div>
+              <div v-if="getGroupPractice(dayObj.dateISO).note" class="practice-row practice-note">
+                {{ getGroupPractice(dayObj.dateISO).note }}
+              </div>
+            </div>
+            <template v-else-if="getLessonsForDay(dayObj.index).length || getRetakesForDay(dayObj.dateISO).length">
               <LessonCard
                 v-for="inst in getLessonsForDay(dayObj.index)"
                 :key="inst.instId || inst.id"
@@ -69,6 +103,9 @@
                 :instance="inst"
                 :period="Number(inst.period) || 1"
                 :dateISO="dayObj.dateISO"
+                :semesterConfig="semesterConfig"
+                :teachers="teachers"
+                :rooms="rooms"
                 :subjectName="getSubjectName(inst.subjectId)"
                 :teacherName="getTeacherName(inst.teacherId)"
                 :roomName="getRoomName(inst.roomId || inst.dedicatedRoomId || inst.preferredRoomIds?.[0])"
@@ -76,6 +113,7 @@
                 :getGroupName="getGroupName"
                 :getTeacherName="getTeacherName"
                 :getRoomName="getRoomName"
+                :getRoomDetails="getRoomDetails"
                 :getRoomLocation="getRoomLocation"
                 :getSubjectName="getSubjectName"
                 :getLessonTypeName="getLessonTypeName"
@@ -83,6 +121,29 @@
                 @select-teacher="handleSelectTeacher"
                 @select-group="handleSelectGroup"
               />
+
+              <div 
+                v-for="retake in getRetakesForDay(dayObj.dateISO)" 
+                :key="retake.id" 
+                class="public-event-retake"
+              >
+                <div class="retake-time">
+                  🕐 {{ retake.period != null ? getPeriodTime(retake.period + 1, { groupId: retake.groupId, dayIndex: dayObj.index, dateStr: dayObj.dateISO, roomId: retake.roomId }) : 'время уточняется' }}
+                </div>
+                <div class="retake-title">
+                  🔁 {{ retake.kind === 'transfer' ? 'Перенос' : 'Пересдача' }}: {{ getSubjectName(retake.subjectId) || retake.subject || 'Консультация' }}
+                </div>
+                <div v-if="retake.roomId" class="retake-row">
+                  📍 ауд. {{ getRoomName(retake.roomId) }}
+                </div>
+                <div class="retake-row">
+                  <span v-if="role === 'group'">👤 {{ getTeacherName(retake.teacherId) }}</span>
+                  <span v-else>👥 {{ getGroupName(retake.groupId) }}</span>
+                </div>
+                <div v-if="retake.note" class="retake-note">
+                  {{ retake.note }}
+                </div>
+              </div>
             </template>
             <div v-else class="day-no-lessons">
               <span class="no-lessons-label">Нет запланированных пар</span>
@@ -97,20 +158,35 @@
 <script setup>
 import { ref, computed } from 'vue';
 import LessonCard from './LessonCard.vue';
+import PublicNotices from './PublicNotices.vue';
+import { isShortenedDate, isNoClassDateFast } from '../../fastScheduleLookups.js';
+import { collectMovedLessonsForDate, calculateFreePeriods, calculateDayGaps, collapsePublicSiblingSubgroups } from '../../utils/scheduleSubstitutions.js';
 
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 const SHORT_DAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
 
 const props = defineProps({
   role: { type: String, default: 'group' },
+  selectedId: { type: String, default: '' },
   instances: { type: Array, default: () => [] },
+  substitutions: { type: Array, default: () => [] },
+  subjects: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
   selectedWeek: { type: Number, default: 10 },
   semesterStart: { type: String, default: '' },
+  semesterConfig: { type: Object, default: () => ({}) },
+  announcements: { type: Array, default: () => [] },
+  publicIntroText: { type: String, default: '' },
+  practices: { type: Array, default: () => [] },
+  retakes: { type: Array, default: () => [] },
+  teachers: { type: Array, default: () => [] },
+  rooms: { type: Array, default: () => [] },
+  groups: { type: Array, default: () => [] },
   getGroupName: { type: Function, default: () => '' },
   getSubjectName: { type: Function, required: true },
   getTeacherName: { type: Function, required: true },
   getRoomName: { type: Function, required: true },
+  getRoomDetails: { type: Function, default: null },
   getRoomLocation: { type: Function, default: () => '' },
   getLessonTypeName: { type: Function, default: () => '' },
   getPeriodTime: { type: Function, default: () => '' },
@@ -190,43 +266,113 @@ function parseClockMinutes(timeStr) {
   return Number(match[1]) * 60 + Number(match[2]);
 }
 
-function getLessonOrder(inst, getPeriodTimeFn, dayIdx) {
+function getLessonOrder(inst, getPeriodTimeFn, dayIdx, dateStr = '') {
   if (inst.eventStartTime) {
     const mins = parseClockMinutes(inst.eventStartTime);
     if (mins !== null) return mins;
   }
   const period = Number(inst.period) || 1;
-  const time = getPeriodTimeFn ? getPeriodTimeFn(period, { groupId: inst.groupId, dayIndex: dayIdx, roomId: inst.roomId }) : '';
+  const time = getPeriodTimeFn ? getPeriodTimeFn(period, { groupId: inst.groupId, dayIndex: dayIdx, roomId: inst.roomId, dateStr }) : '';
   const timeMins = parseClockMinutes(time);
   return timeMins !== null ? timeMins : period * 100;
 }
 
-function sortDayLessons(lessons, getPeriodTimeFn, dayIdx) {
+function sortDayLessons(lessons, getPeriodTimeFn, dayIdx, dateStr = '') {
   if (lessons.length <= 1) return lessons;
-  // Кэшируем порядок сортировки один раз (Schwartzian transform)
   const decorated = lessons.map(inst => ({
     inst,
-    order: getLessonOrder(inst, getPeriodTimeFn, dayIdx)
+    order: getLessonOrder(inst, getPeriodTimeFn, dayIdx, dateStr)
   }));
   decorated.sort((a, b) => a.order - b.order);
   return decorated.map(d => d.inst);
 }
 
-const lessonsByDay = computed(() => {
+function populateBaseInstances(safeInsts) {
   const map = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
-  safeInstances.value.forEach(inst => {
+  safeInsts.forEach(inst => {
+    if (inst._publicMoveSupportOnly) return;
     const d = Number(inst.day !== undefined ? inst.day : inst.blockIndex);
     if (map[d]) map[d].push(inst);
   });
+  return map;
+}
+
+function injectMovedLessons(map, p) {
+  for (let dayIdx = 0; dayIdx < 6; dayIdx += 1) {
+    const dateISO = formatISODate(p.semesterStart, p.selectedWeek, dayIdx);
+    const moved = collectMovedLessonsForDate(p.substitutions, p.instances, p.role, p.selectedId, dateISO, dayIdx, p.subjects);
+    if (moved.length) map[dayIdx].push(...moved);
+  }
+}
+
+const lessonsByDay = computed(() => {
+  const map = populateBaseInstances(safeInstances.value);
+  injectMovedLessons(map, props);
   Object.keys(map).forEach(key => {
     const dayIdx = Number(key);
-    map[key] = sortDayLessons(map[key], props.getPeriodTime, dayIdx);
+    const dateISO = formatISODate(props.semesterStart, props.selectedWeek, dayIdx);
+    const sorted = sortDayLessons(map[key], props.getPeriodTime, dayIdx, dateISO);
+    map[key] = collapsePublicSiblingSubgroups(sorted);
   });
   return map;
 });
 
 function getLessonsForDay(dayIdx) {
   return lessonsByDay.value[dayIdx] || [];
+}
+
+function getActiveOccupiedPeriods(dayIdx) {
+  const dayLessons = getLessonsForDay(dayIdx);
+  const dateISO = formatISODate(props.semesterStart, props.selectedWeek, dayIdx);
+  return dayLessons
+    .filter(inst => {
+      const sub = props.findSub ? props.findSub(inst, dateISO, dayIdx, inst.period || 1) : null;
+      const isCancelled = sub && ['cancel', 'cancel_assignment', 'pending_move', 'moved', 'excursion'].includes(sub.type) && !sub.isMovedTarget;
+      return !isCancelled;
+    })
+    .map(inst => Number(inst.period) || 1);
+}
+
+function getFreePeriodsForDay(dayIdx) {
+  if (props.role !== 'room') return [];
+  const occupied = getActiveOccupiedPeriods(dayIdx);
+  return calculateFreePeriods(occupied, 7);
+}
+
+function getGapsForDay(dayIdx) {
+  if (props.role === 'room') return [];
+  const occupied = getActiveOccupiedPeriods(dayIdx);
+  return calculateDayGaps(occupied);
+}
+
+function formatFreePeriods(periods) {
+  return (periods || []).map(p => `${p} пара`).join(', ');
+}
+
+function isShortenedDay(dateISO) {
+  return isShortenedDate(props.semesterConfig, dateISO);
+}
+
+function isHolidayDay(dateISO) {
+  return isNoClassDateFast({ config: props.semesterConfig, calendarExceptions: props.semesterConfig?.calendarExceptions }, dateISO);
+}
+
+function getGroupPractice(dateISO) {
+  if (props.role !== 'group' || !dateISO) return null;
+  const p = (props.practices || []).find(x => String(x.groupId) === String(props.selectedId) && x.dateStart <= dateISO && dateISO <= x.dateEnd);
+  if (!p) return null;
+  const t = props.getTeacherName ? props.getTeacherName(p.teacherId) : '';
+  return { ...p, teacherName: t };
+}
+
+function getRetakesForDay(dateISO) {
+  if (!dateISO || !Array.isArray(props.retakes)) return [];
+  return props.retakes.filter(r => {
+    if (String(r.date) !== String(dateISO)) return false;
+    if (props.role === 'group') return String(r.groupId) === String(props.selectedId);
+    if (props.role === 'teacher') return String(r.teacherId) === String(props.selectedId);
+    return String(r.roomId || '') === String(props.selectedId);
+  }).sort((a, b) => (Number(a.period) || 0) - (Number(b.period) || 0));
 }
 </script>
 
@@ -361,6 +507,40 @@ function getLessonsForDay(dayIdx) {
   padding: 3px 8px;
   border-radius: 8px;
   border: 1px solid rgba(249, 115, 22, 0.2);
+}
+
+.room-free-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: #fefce8;
+  border: 1px solid #fef08a;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #854d0e;
+}
+
+.room-free-check {
+  color: #16a34a;
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.day-gaps-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #475569;
 }
 
 .day-count {
@@ -498,5 +678,88 @@ function getLessonsForDay(dayIdx) {
     font-size: 11px;
     min-height: 32px;
   }
+}
+.public-shortened-day {
+  font-size: 11px;
+  font-weight: 700;
+  color: #d97706;
+  background: #fef3c7;
+  padding: 2px 6px;
+  border-radius: 6px;
+  margin-left: 6px;
+}
+
+.day-holiday-banner {
+  background: #eff6ff;
+  border: 1px dashed #60a5fa;
+  color: #1d4ed8;
+  padding: 16px 14px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 700;
+  text-align: center;
+  margin: 6px 0 12px;
+}
+
+.practice-card {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-left: 4px solid #0284c7;
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 10px;
+}
+
+.practice-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--ink-primary);
+}
+
+.practice-row {
+  font-size: 13px;
+  color: var(--ink-secondary);
+}
+
+.practice-note {
+  font-style: italic;
+  font-size: 12px;
+}
+
+.public-event-retake {
+  background: #fbf3e3;
+  border: 1px solid #ead9a0;
+  border-left: 4px solid #f59e0b;
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.retake-time {
+  font-size: 11px;
+  font-weight: 700;
+  color: #b45309;
+}
+
+.retake-title {
+  font-weight: 700;
+  color: #92400e;
+}
+
+.retake-row {
+  color: var(--ink-secondary);
+}
+
+.retake-note {
+  font-size: 11px;
+  color: var(--ink-soft);
+  font-style: italic;
 }
 </style>

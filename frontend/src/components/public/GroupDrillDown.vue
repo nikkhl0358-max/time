@@ -101,11 +101,11 @@
         @keydown.space.prevent="selectYear(year)"
       >
         <div class="year-circle">
-          <span class="year-num">{{ year }}</span>
-          <span class="year-label">год</span>
+          <span class="year-num">{{ year === '__none' ? 'Заоч.' : year }}</span>
+          <span class="year-label">{{ year === '__none' ? 'курс' : 'год' }}</span>
         </div>
         <div class="year-info">
-          <h3 class="year-title">{{ year }} год поступления</h3>
+          <h3 class="year-title">{{ year === '__none' ? 'Заочное отделение / без года' : `${year} год поступления` }}</h3>
           <span class="course-badge">{{ calculateCourse(year) }}</span>
         </div>
         <span class="arrow-icon large">→</span>
@@ -160,9 +160,11 @@ function parseSpecialtyTitle(name) {
 
 // 3. Расчёт курса обучения по году поступления
 function calculateCourse(admissionYear) {
-  const currentYear = 2026;
-  const course = Math.max(1, Math.min(4, currentYear - Number(admissionYear) + 1));
-  return `${course} курс`;
+  if (!admissionYear || admissionYear === '__none') return 'Заочное / без года';
+  const now = new Date();
+  const academicStartYear = now.getMonth() >= 7 ? now.getFullYear() : now.getFullYear() - 1;
+  const course = academicStartYear - Number(admissionYear) + 1;
+  return course > 0 ? `${course} курс` : `${admissionYear} год`;
 }
 
 // 4. Активные специальности колледжа с количеством групп
@@ -195,11 +197,11 @@ const currentSpecialtyTitle = computed(() => {
 
 // 7. Доступные года поступления для выбранной специальности
 const availableYears = computed(() => {
-  const specGroups = props.groups.filter(g => {
-    return (g.specialtyId || '') === (chosenSpecialtyId.value || '');
-  });
-  const years = [...new Set(specGroups.map(g => g.admissionYear).filter(Boolean))];
-  return years.sort((a, b) => Number(b) - Number(a));
+  const specGroups = props.groups.filter(g => (g.specialtyId || '') === (chosenSpecialtyId.value || ''));
+  const hasNoYear = specGroups.some(g => !g.admissionYear);
+  const years = [...new Set(specGroups.map(g => g.admissionYear).filter(Boolean))].sort((a, b) => Number(b) - Number(a));
+  if (hasNoYear && years.length > 0) years.push('__none');
+  return years;
 });
 
 // 8. Список групп для выбранной специальности и года
@@ -208,6 +210,7 @@ const availableGroups = computed(() => {
     .filter(g => {
       const matchSpec = (g.specialtyId || '') === (chosenSpecialtyId.value || '');
       if (chosenYear.value === null) return matchSpec;
+      if (chosenYear.value === '__none') return matchSpec && !g.admissionYear;
       return matchSpec && Number(g.admissionYear) === Number(chosenYear.value);
     })
     .sort((a, b) => a.name.localeCompare(b.name, 'ru', { numeric: true }));

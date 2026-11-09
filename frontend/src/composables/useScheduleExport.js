@@ -2,15 +2,23 @@
  * Экспорт расписания в формат CSV и печать расписания.
  */
 
-function formatLessonRow(inst, dayName, period, getSubject, getTeacher, getRoom) {
+function formatLessonRow(inst, dayName, period, getSubject, getTeacher, getRoom, opts = {}) {
   const room = inst.roomId || inst.dedicatedRoomId || inst.preferredRoomIds?.[0] || '';
+  const time = opts.getPeriodTime ? opts.getPeriodTime(period, { groupId: inst.groupId, roomId: room }) : '';
+  const type = opts.getLessonTypeName ? opts.getLessonTypeName(inst.lessonTypeId || inst.typeId) : '';
+  const group = opts.getGroupName ? opts.getGroupName(inst.groupId) : (inst.groupId || '');
+  const subNote = inst.substitution?.note || (inst.substitution?.moved ? 'Перенос' : (inst.substitution?.cancelled ? 'Отмена' : ''));
   return {
     'День недели': dayName,
     'Пара': period,
-    'Дисциплина': getSubject ? getSubject(inst.subjectId) : (inst.subjectId || ''),
+    'Время': time,
+    'Предмет': getSubject ? getSubject(inst.subjectId) : (inst.subjectId || ''),
+    'Тип': type,
     'Преподаватель': getTeacher ? getTeacher(inst.teacherId) : (inst.teacherId || ''),
     'Аудитория': getRoom ? getRoom(room) : room,
-    'Подгруппа': inst.subgroup ? `${inst.subgroup} п/г` : 'Вся группа'
+    'Группа': group,
+    'Подгруппа': inst.subgroup ? `${inst.subgroup} п/г` : 'Вся группа',
+    'Изменения': subNote
   };
 }
 
@@ -51,7 +59,7 @@ function downloadFile(content, fileName, mimeType) {
 }
 
 export function useScheduleExport() {
-  function exportScheduleCSV(instances, entityName, getSubject, getTeacher, getRoom) {
+  function exportScheduleCSV(instances, entityName, getSubject, getTeacher, getRoom, opts = {}) {
     if (!Array.isArray(instances) || !instances.length) {
       alert('Нет занятий для экспорта на текущую неделю');
       return;
@@ -59,7 +67,7 @@ export function useScheduleExport() {
     const dayNames = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
     const rows = instances.map(inst => {
       const d = inst.day !== undefined ? inst.day : (inst.blockIndex || 0);
-      return formatLessonRow(inst, dayNames[d] || '', inst.period || 1, getSubject, getTeacher, getRoom);
+      return formatLessonRow(inst, dayNames[d] || '', inst.period || 1, getSubject, getTeacher, getRoom, opts);
     });
     const csv = convertToCSV(rows);
     const safeName = sanitizeFileName(entityName);
