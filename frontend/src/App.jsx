@@ -102,13 +102,11 @@ function weekdayOf(dateStr) {
   return (d.getDay() + 6) % 7;
 }
 function addDays(dateStr, n) {
-  if (!dateStr) return "";
   const d = new Date(dateStr + "T00:00:00");
-  d.setDate(d.getDate() + Number(n));
+  d.setDate(d.getDate() + n);
   return isoDate(d);
 }
 function mondayOf(dateStr) {
-  if (!dateStr) return "";
   return addDays(dateStr, -weekdayOf(dateStr));
 }
 const RU_MONTHS = [
@@ -160,10 +158,10 @@ function isStaffTeacher(teacher) {
   return (teacher?.employmentType || "staff") === "staff";
 }
 function weekNumberOf(semesterStart, dateStr) {
-  if (!semesterStart || !dateStr) return null;
+  if (!semesterStart) return null;
   const start = mondayOf(semesterStart);
   const diffDays = Math.round((new Date(dateStr + "T00:00:00") - new Date(start + "T00:00:00")) / 86400000);
-  if (diffDays < 0 || isNaN(diffDays)) return null;
+  if (diffDays < 0) return null;
   return Math.floor(diffDays / 7) + 1; // 1-indexed
 }
 // v1603: `weekNumberOf` deliberately measures whole-week offsets from the
@@ -10766,10 +10764,9 @@ function lessonLabel(inst, data) {
 
 function canonicalPublicInstId(value) {
   let id = String(value || "");
-  const rx = /__(?:PUBW\d+|EXACT_W\d+|TRANSFER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|CANONICAL_RECOVER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|REMOTE_ONE_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)$/i;
-  while (rx.test(id)) {
-    id = id.replace(rx, "");
-  }
+  // Publication may wrap a previously published week occurrence again.
+  // Compare replacements against the original working instance identity.
+  while (/__PUBW\d+$/i.test(id)) id = id.replace(/__PUBW\d+$/i, "");
   return id;
 }
 
@@ -25024,7 +25021,7 @@ function VersionsPanel({data,onRestore,currentUser}){
       </div>
     </div>
 
-    <div className="card" style={{padding:16,marginBottom:18}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><div><b>Серверные резервные копии</b><div className="muted" style={{marginTop:4}}>Скачивание идёт напрямую из <code>/data/backups</code> рабочего контейнера и не использует загрузчик файлов Amvera.</div></div><button className="btn ghost sm" onClick={refreshBackups}>Обновить список</button></div>
+    <div className="card" style={{padding:16,marginBottom:18}}><div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><div><b>Серверные резервные копии</b><div className="muted" style={{marginTop:4}}>Скачивание идёт напрямую из <code>/data/backups</code> рабочего контейнера и не зависит от загрузчика файлов хостинга.</div></div><button className="btn ghost sm" onClick={refreshBackups}>Обновить список</button></div>
       {backupLoadError&&<div className="notice danger" style={{marginTop:10}}>{backupLoadError}</div>}
       <div style={{display:"grid",gap:6,marginTop:12,maxHeight:360,overflow:"auto"}}>{serverBackups.map((b)=><div key={b.name} style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,padding:"8px 10px",border:"1px solid #e5e7eb",borderRadius:8}}><span><b>{b.name}</b>{b.size?` · ${Math.round(b.size/1024)} КБ`:""}{b.valid===false?<span style={{marginLeft:8,color:"#b91c1c"}}>повреждён</span>:""}</span><button className="btn ghost sm" disabled={backupDownloadBusy===b.name||b.valid===false} onClick={()=>downloadBackup(b.name)}>{backupDownloadBusy===b.name?"Скачивание…":"Скачать backup"}</button></div>)}{!serverBackups.length&&!backupLoadError&&<div className="muted">Резервных копий не найдено.</div>}</div>
     </div>
@@ -26978,6 +26975,9 @@ export default function App() {
   const latestDataRef = useRef(null);
   const [passwordModal, setPasswordModal] = useState(null); // 'set' | 'enter' | 'change' | null
   const [pwError, setPwError] = useState("");
+  const [loginBusy, setLoginBusy] = useState(false);
+  const [loginStage, setLoginStage] = useState("");
+  const loginInFlightRef = useRef(false);
   const [currentUser, setCurrentUser] = useState(null); // { id, name, login, role } — без хеша пароля
   const [activeUsers, setActiveUsers] = useState([]);
   // v1675: while a browser Back/Forward route is being applied, URL-sync
@@ -28187,13 +28187,30 @@ export default function App() {
     finishServerLogin(sessionUser);
   };
   const submitLogin = async (login, pw) => {
-    let sessionUser;
+    // Prevent parallel password checks and editor bootstrap requests from
+    // repeated clicks/Enter. Keep the loading state visible until BOTH finish.
+    if (loginInFlightRef.current) return;
+    if (!login.trim() || !pw) {
+      setPwError("Введите логин и пароль");
+      return;
+    }
+    loginInFlightRef.current = true;
+    setLoginBusy(true);
+    setPwError("");
+    setLoginStage("Проверяем учётные данные…");
     try {
       const result = await authRequest("login", { login, password: pw });
-      sessionUser = result.user;
+      if (!result?.user) throw new Error("Сервер не вернул данные сотрудника");
+      setLoginStage("Вход подтверждён. Загружаем рабочее расписание…");
       await ensureEditorLoaded();
-    } catch (error) { setPwError(error.message); return; }
-    finishServerLogin(sessionUser);
+      finishServerLogin(result.user);
+    } catch (error) {
+      setPwError(error?.message || "Не удалось выполнить вход");
+    } finally {
+      loginInFlightRef.current = false;
+      setLoginBusy(false);
+      setLoginStage("");
+    }
   };
   const finishServerLogin = (user) => {
     setCurrentUser(user);
@@ -28453,7 +28470,7 @@ export default function App() {
     return <div className="app-root loading-root"><style>{CSS}</style><div className="card" style={{maxWidth:760,padding:24}}>
       <h2 style={{marginTop:0}}>Не удалось загрузить рабочие данные</h2>
       <p className="muted">{loadError || storageProblem?.message}</p>
-      <p><b>Ничего не создано и не перезаписано.</b> Загрузка автоматически повторялась несколько раз, чтобы переждать перезапуск Amvera.</p>
+      <p><b>Рабочие данные не создавались и не перезаписывались.</b> Сайт повторил запросы чтения. Если ошибка сохраняется, проверьте доступ приложения Timeweb к PostgreSQL и переменную DATABASE_URL. Не создавайте новое хранилище и не сбрасывайте пользователей.</p>
       <div style={{display:"flex",gap:8,flexWrap:"wrap",marginTop:14}}>
         <button className="btn primary" onClick={()=>location.reload()}>Повторить загрузку</button>
         {latestBackup && <button className="btn ghost" disabled={backupBusy} onClick={()=>restoreLatestBackup(latestBackup.name)}>
@@ -28469,13 +28486,13 @@ export default function App() {
           </div>)}
         </div>
       </details>}
-      {backupOptions.length === 0 && <p className="muted" style={{marginTop:14}}>Сервер не сообщил о доступных резервных копиях. Если деплой ещё идёт, повторите загрузку через несколько секунд.</p>}
+      {backupOptions.length === 0 && <p className="muted" style={{marginTop:14}}>Сервер не сообщил о доступных локальных резервных копиях. Это не означает, что резервных копий PostgreSQL в Timeweb нет.</p>}
     </div></div>;
   }
   if (storageMissing) {
     return <div className="app-root loading-root"><style>{CSS}</style><div className="card" style={{maxWidth:680,padding:24}}>
       <h2 style={{marginTop:0}}>Хранилище данных не найдено</h2>
-      <p><b>Данные автоматически не создаются и не перезаписываются.</b> Если это произошло после пересборки существующего сайта, не создавайте новое хранилище — проверьте подключение постоянного диска <code>/data</code> в Amvera.</p>
+      <p><b>Данные автоматически не создаются и не перезаписываются.</b> Если это произошло после пересборки существующего сайта, не создавайте новое хранилище — проверьте подключение базы данных PostgreSQL или постоянного хранилища <code>/data</code> у провайдера.</p>
       <p className="muted">Кнопка ниже нужна только при самом первом запуске нового проекта.</p>
       <button className="btn primary" onClick={initializeEmptyStorage}>Создать новое хранилище вручную</button>
       <button className="btn ghost" style={{marginLeft:8}} onClick={()=>location.reload()}>Повторить загрузку</button>
@@ -30459,7 +30476,10 @@ export default function App() {
         <PasswordGateModal
           mode={passwordModal}
           error={pwError}
+          busy={loginBusy}
+          stage={loginStage}
           onClose={() => {
+            if (loginInFlightRef.current) return;
             setPasswordModal(null);
             setPwError("");
             if (typeof window !== "undefined" && role !== "admin") {
@@ -30531,7 +30551,7 @@ function SmartFormatPanel({ data, set }) {
   </div>;
 }
 
-function PasswordGateModal({ mode, error, onClose, onSet, onEnter, onChange }) {
+function PasswordGateModal({ mode, error, busy = false, stage = "", onClose, onSet, onEnter, onChange }) {
   const [name, setName] = useState("");
   const [login, setLogin] = useState("");
   const [pw, setPw] = useState("");
@@ -30545,10 +30565,11 @@ function PasswordGateModal({ mode, error, onClose, onSet, onEnter, onChange }) {
       <div className="pw-form">
         {mode === "enter" && (
           <>
-            <input autoFocus placeholder="Логин" value={login} onChange={(e) => setLogin(e.target.value)} />
-            <input type="password" placeholder="Пароль" value={pw} onChange={(e) => setPw(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && onEnter(login, pw)} />
-            <button className="btn primary sm" onClick={() => onEnter(login, pw)}>Войти</button>
+            <input autoFocus placeholder="Логин" value={login} disabled={busy} onChange={(e) => setLogin(e.target.value)} />
+            <input type="password" placeholder="Пароль" value={pw} disabled={busy} onChange={(e) => setPw(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !busy && onEnter(login, pw)} />
+            <button className="btn primary sm" disabled={busy} onClick={() => onEnter(login, pw)}>{busy ? "Выполняется вход…" : "Войти"}</button>
+            {busy && <div role="status" aria-live="polite" className="avail-hint">{stage}</div>}
           </>
         )}
         {mode === "set" && (
@@ -31074,15 +31095,15 @@ function ConfigPanel({ config, setConfig }) {
 /* ============================== styles ============================== */
 
 const CSS = `
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root {
-  --ink: #0F172A; --ink-2: #1E293B; --paper: #F8FAFC; --paper-2: #F1F5F9;
-  --chalk: #FFFFFF; --board: #0284C7; --amber: #F97316; --amber-soft: #FFEDD5;
-  --ink-soft: #64748B; --line: #E2E8F0; --red: #EF4444; --green: #10B981; --blue: #0284C7;
+  --ink: #1B2430; --ink-2: #232E3D; --paper: #F6F4EE; --paper-2: #ECE9DF;
+  --chalk: #EDEAE0; --board: #1E3A5F; --amber: #2F6FB0; --amber-soft: #CFE3F5;
+  --ink-soft: #5B6472; --line: #DAD5C7; --red: #B23A3A; --green: #3E7A52; --blue: #2E8B7A;
 }
 
-.app-root { display: flex; min-height: 100vh; background: var(--paper); font-family: 'Plus Jakarta Sans', sans-serif; color: var(--ink); }
+.app-root { display: flex; min-height: 100vh; background: var(--paper); font-family: 'Manrope', sans-serif; color: var(--ink); }
 .loading-root { align-items: center; justify-content: center; }
 .spin { animation: spin 1s linear infinite; color: var(--amber); }
 @keyframes spin { to { transform: rotate(360deg); } }

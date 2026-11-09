@@ -25,7 +25,7 @@ export function buildScheduleDateLookup(config = {}, calendarExceptions = [], pr
     }
   }
   return {
-    date: (week, day) => dateByWeekDay.get(`${week}:${day}`) || (monday ? addDays(monday, (Number(week) - 1) * 7 + Number(day)) : null),
+    date: (week, day) => dateByWeekDay.get(`${week}:${day}`) || (monday ? addDays(addDays(monday, (week - 1) * 7), day) : null),
     isNoClass: (date) => holidays.has(date) || !!firstExceptionByDate.get(date)?.noClasses,
     isGroupOnPractice: (groupId, date) => (practiceRanges.get(groupId) || []).some((p) => p.dateStart <= date && date <= p.dateEnd),
   };

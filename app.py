@@ -14,6 +14,7 @@ import tempfile
 import select
 import sqlite3
 from pg_compat import pg_connect, pg_storage_exists
+import auth_store
 import re
 from collections import OrderedDict
 from datetime import datetime
@@ -911,13 +912,10 @@ def _canonical_public_inst_id(value):
     """Stable identity shared by working and week-publication occurrence ids."""
     import re
     sid = str(value or "")
-    # Compare original working id, stripping disposable publication & recovery suffixes
-    rx = re.compile(
-        r"__(?:PUBW\d+|EXACT_W\d+|TRANSFER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|CANONICAL_RECOVER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|REMOTE_ONE_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)$",
-        re.IGNORECASE,
-    )
-    while rx.search(sid):
-        sid = rx.sub("", sid)
+    # Week publication may wrap an already published occurrence more than once.
+    # Always compare the original working id, not the disposable __PUBW suffix.
+    while re.search(r"__PUBW\d+$", sid, flags=re.I):
+        sid = re.sub(r"__PUBW\d+$", "", sid, flags=re.I)
     return sid
 
 
@@ -2255,7 +2253,7 @@ def load_store():
     # All application writes go through save_store(), which refreshes this cache.
     # On process start the cache is empty and SQLite is read once.
     if _store_cache.get("store") is not None:
-        return dict(_store_cache["store"])
+        return _auth_overlay_store_for_request(dict(_store_cache["store"]))
     conn = _sqlite_connect()
     try:
         rows = conn.execute("SELECT key, value_json FROM kv_store").fetchall()
@@ -2275,7 +2273,7 @@ def load_store():
         parsed = _replace_sqlite_store(parsed, durable=True)
     _store_cache["mtime"] = None
     _store_cache["store"] = parsed
-    return dict(parsed)
+    return _auth_overlay_store_for_request(dict(parsed))
 
 def _is_valid_working_value(value):
     """Рабочее расписание не может быть null/пустой строкой/пустым объектом."""
@@ -2409,6 +2407,10 @@ def _replace_sqlite_store(store, durable=True):
                 "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
                 (str(key), payload, now),
             )
+        # User-management changes are committed with the matching project JSON.
+        # Ordinary schedule saves do not touch the small credentials table.
+        if USE_POSTGRES and has_request_context() and getattr(g, "auth_users_write", None) is not None:
+            auth_store.write_users_in_transaction(conn, g.auth_users_write)
         conn.commit()
         return compacted_store
     except Exception:
@@ -2483,6 +2485,8 @@ def _save_store_key_fast(key, value, durable=False, revision_map=None, revision_
             "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
             (str(key), payload, now),
         )
+        if USE_POSTGRES and has_request_context() and getattr(g, "auth_users_write", None) is not None:
+            auth_store.write_users_in_transaction(conn, g.auth_users_write)
         if revision_map:
             try:
                 for sid, revision in revision_map.items():
@@ -2623,6 +2627,31 @@ APP_BUILD_ID = _compute_app_build_id()
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 
 
+# A failed database connection is a temporary outage, NOT an empty user list.
+# Keep authentication/API responses machine-readable and never expose DB secrets.
+@app.errorhandler(sqlite3.OperationalError)
+def _sqlite_unavailable(exc):
+    app.logger.error("storage operation failed for %s: %s", request.path, type(exc).__name__)
+    response = jsonify(error="Не удалось подключиться к хранилищу PostgreSQL/SQLite. Проверьте доступность базы в Timeweb; существующие данные не изменены.", code="STORAGE_UNAVAILABLE", retryable=True)
+    response.headers["Retry-After"] = "5"
+    return response, 503
+
+try:
+    from psycopg import OperationalError as _PgOperationalError
+except ImportError:
+    _PgOperationalError = None
+if _PgOperationalError is not None:
+    app.register_error_handler(_PgOperationalError, _sqlite_unavailable)
+
+@app.errorhandler(auth_store.AuthDataError)
+def _auth_data_unavailable(exc):
+    app.logger.error("account migration unavailable: %s", type(exc).__name__)
+    response = jsonify(error="Учётные записи пока не перенесены. Не создавайте новую базу; проверьте PostgreSQL и журналы сервера.", code="AUTH_MIGRATION_UNAVAILABLE", retryable=False)
+    response.headers["Cache-Control"] = "no-store"
+    return response, 503
+
+
+
 def _auth_project(store):
     """Читает рабочий проект без изменения ссылок кеша хранилища."""
     raw = store.get("schedule-data-v2")
@@ -2630,12 +2659,25 @@ def _auth_project(store):
 
 
 def _auth_read_users():
-    """Выдаёт отдельную копию учётных записей для проверки и изменения пароля."""
-    return copy.deepcopy(_auth_project(load_store()).get("users") or [])
+    """Читайте только credentials: не загружайте большой проект при каждом API.
+
+    Ошибка PostgreSQL НЕ трактуется как пустая база: иначе экран может
+    ошибочно предложить создать нового администратора.
+    """
+    return copy.deepcopy(_auth_current_users())
 
 
 def _auth_update_users(users):
-    """Пишет проверенное сервером изменение пользователей под общей блокировкой."""
+    """Password upgrades/changes on PostgreSQL never rewrite timetable JSON.
+
+    Existing project JSON remains backward-compatible. The editor gets current
+    identities from auth_user_store, so stale passwords in old snapshots can
+    never authorize a login or overwrite a fresh server-side password.
+    """
+    if USE_POSTGRES:
+        import psycopg
+        auth_store.write_users(os.environ["DATABASE_URL"], psycopg.connect, users)
+        return
     store = load_store()
     project = dict(_auth_project(store))
     project["users"] = users
@@ -2648,23 +2690,74 @@ def _auth_update_users(users):
 
 
 def _auth_current_users():
-    """Читает свежие credentials проекцией JSON, не передавая большой проект."""
-    if not _storage_exists():
-        return []
-    conn = _sqlite_connect()
-    try:
-        projection = "(value_json::jsonb -> 'users')::text" if USE_POSTGRES else "json_extract(value_json, '$.users')"
-        row = conn.execute(f"SELECT {projection} FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
-        if row and row[0] is not None:
-            return json.loads(row[0]) or []
-        # Старый формат содержит JSON-строку внутри value_json, а не объект.
-        row = conn.execute("SELECT value_json FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
-        project = json.loads(row[0]) if row else {}
-        project = json.loads(project) if isinstance(project, str) else project
-        return project.get("users") or []
-    finally:
-        conn.close()
+    """One small Postgres row per request; no JSONB conversion of timetable."""
+    if USE_POSTGRES:
+        import psycopg
+        return auth_store.read_users(os.environ["DATABASE_URL"], psycopg.connect)
 
+    if not os.path.exists(SQLITE_PATH):
+        if os.path.exists(LEGACY_DATA_FILE):
+            return (_auth_project(load_store()).get("users") or [])
+        return []
+    # SQLite has native json_extract: only the tiny users JSON is returned.
+    with sqlite3.connect(SQLITE_PATH, timeout=5) as conn:
+        row = conn.execute(
+            "SELECT json_extract(value_json, '$.users') FROM kv_store WHERE key=?",
+            ("schedule-data-v2",),
+        ).fetchone()
+        if row and row[0] is not None:
+            users = json.loads(row[0])
+            return users if isinstance(users, list) else []
+        legacy = conn.execute(
+            "SELECT value_json FROM kv_store WHERE key=?", ("schedule-data-v2",),
+        ).fetchone()
+        if not legacy:
+            return []
+        project = json.loads(legacy[0])
+        project = json.loads(project) if isinstance(project, str) else project
+        return (project.get("users") or []) if isinstance(project, dict) else []
+
+
+def _auth_merge_existing_hashes(incoming, existing):
+    """Credentials table wins over stale hashes in the legacy JSON snapshot."""
+    if not isinstance(incoming, list):
+        return incoming
+    identities = {str(u.get("id")): u for u in existing if isinstance(u, dict)}
+    by_login = {str(u.get("login", "")).casefold(): u for u in existing if isinstance(u, dict)}
+    out = []
+    for candidate in incoming:
+        if not isinstance(candidate, dict):
+            out.append(candidate)
+            continue
+        candidate = dict(candidate)
+        previous = identities.get(str(candidate.get("id"))) or by_login.get(str(candidate.get("login", "")).casefold())
+        if previous and previous.get("passwordHash"):
+            candidate["passwordHash"] = previous["passwordHash"]
+        out.append(candidate)
+    return out
+
+
+def _auth_visible_project(project):
+    """Overlay current accounts in responses without modifying the global cache."""
+    if not USE_POSTGRES or not isinstance(project, dict) or not has_request_context():
+        return project
+    users = getattr(g, "auth_users", None)
+    if users is None:
+        return project
+    return {**project, "users": copy.deepcopy(users)}
+
+
+def _auth_overlay_store_for_request(store):
+    """Keep stale project snapshots from replacing roles or password hashes.
+
+    Project and cached objects are copied shallowly: the large schedule remains
+    shared and is not serialized or duplicated to serve one small user list.
+    """
+    if USE_POSTGRES and "schedule-data-v2" in store:
+        original = store["schedule-data-v2"]
+        if isinstance(original, dict):
+            store["schedule-data-v2"] = _auth_visible_project(original)
+    return store
 
 def _validate_user_edit(incoming, existing, baseline):
     """Разрешает явное управление пользователями только актуальному superadmin."""
@@ -2675,28 +2768,49 @@ def _validate_user_edit(incoming, existing, baseline):
         raise Conflict("Учётные записи изменились; обновите страницу")
     if not isinstance(incoming, list) or not all(isinstance(u, dict) for u in incoming):
         raise Forbidden("Неверный список пользователей")
+    ids, logins = set(), set()
+    for user in incoming:
+        uid = str(user.get("id") or "").strip()
+        login = str(user.get("login") or "").strip().casefold()
+        if not uid or not login or user.get("role") not in {"admin", "superadmin"}:
+            raise Forbidden("У пользователя должны быть ID, логин и допустимая роль")
+        if uid in ids or login in logins:
+            raise Forbidden("Повторяются ID или логин учётной записи")
+        if not str(user.get("passwordHash") or ""):
+            raise Forbidden("У учётной записи отсутствует пароль")
+        ids.add(uid)
+        logins.add(login)
     if not any(u.get("role") == "superadmin" for u in incoming):
         raise Forbidden("Нельзя удалить последнего главного администратора")
 
 
 def _authorize_user_changes(store):
-    """Сохраняет свежие пароли при запоздавшем autosave и проверяет смену ролей."""
+    """Authorize explicit user edits and preserve server credentials on autosave.
+
+    The separate PostgreSQL row is authoritative. Stale editor snapshots may
+    include old password hashes; those are always replaced with fresh values.
+    Account-list edits are staged for the *same transaction* as the project.
+    """
     if not has_request_context() or getattr(g, "auth_internal_write", False):
         return store
     existing = _auth_current_users()
     baseline = getattr(g, "auth_users", existing)
     project = _auth_project(store)
-    incoming = project.get("users") or []
+    incoming = _auth_merge_existing_hashes(project.get("users") or [], existing)
     if incoming != baseline:
         try:
             _validate_user_edit(incoming, existing, baseline)
         except Exception:
             _invalidate_store_cache()
             raise
+        if USE_POSTGRES:
+            g.auth_users_write = copy.deepcopy(incoming)
     else:
-        project = dict(project)
-        project["users"] = existing
-        store["schedule-data-v2"] = project
+        if USE_POSTGRES:
+            g.auth_users_write = None
+    project = dict(project)
+    project["users"] = incoming if incoming != baseline else existing
+    store["schedule-data-v2"] = project
     return store
 
 
@@ -2710,6 +2824,7 @@ def _editor_read_project(key):
         return None
     raw = store[key]
     project = json.loads(raw) if isinstance(raw, str) else raw
+    project = _auth_visible_project(project) if key == "schedule-data-v2" else project
     conn = _sqlite_connect()
     try:
         row = conn.execute("SELECT updated_at FROM kv_store WHERE key=?", (key,)).fetchone()
@@ -2770,6 +2885,7 @@ def editor_export(key):
         portable = _store_with_snapshots_for_backup(store)
         raw = portable[key]
         project = json.loads(raw) if isinstance(raw, str) else raw
+        project = _auth_visible_project(project) if key == "schedule-data-v2" else project
         if isinstance(project, dict) and "users" in project:
             from editor_transport import sanitize_users
             project = dict(project)
@@ -2843,6 +2959,7 @@ def get_key(key):
     if key == "schedule-data-v2" and request.args.get("editor") == "1":
         try:
             parsed = json.loads(value) if isinstance(value, str) else value
+            parsed = _auth_visible_project(parsed)
             # v1758: revisions are transport metadata, not part of the project JSON.
             # Existing exports/backups/publication formats therefore remain unchanged.
             return jsonify({
@@ -2852,18 +2969,9 @@ def get_key(key):
             })
         except Exception:
             pass
-
     if key == "schedule-data-v2":
-        try:
-            parsed = json.loads(value) if isinstance(value, str) else value
-            if isinstance(parsed, dict) and "users" in parsed:
-                from editor_transport import sanitize_users
-                parsed = dict(parsed)
-                parsed["users"] = sanitize_users(parsed.get("users") or [])
-                value = parsed
-        except Exception:
-            pass
-
+        parsed = json.loads(value) if isinstance(value, str) else value
+        value = _auth_visible_project(parsed)
     return jsonify({"key": key, "value": value})
 
 
@@ -3030,7 +3138,8 @@ def set_key(key):
                 if "schedule" in remote_existing and not allow_create:
                     incoming_value["schedule"] = remote_existing.get("schedule")
                 if "users" in incoming_value and "users" in remote_existing:
-                    incoming_value["users"] = merge_users_preserve_hashes(incoming_value["users"], remote_existing["users"])
+                    canonical_users = _auth_current_users() if USE_POSTGRES else remote_existing["users"]
+                    incoming_value["users"] = merge_users_preserve_hashes(incoming_value["users"], canonical_users)
         store[key] = incoming_value
         save_store(store)
     if raw_mode:
@@ -8217,7 +8326,6 @@ def _serve_spa_index():
 @app.get("/")
 @app.get("/group/<path:route_id>")
 @app.get("/teacher/<path:route_id>")
-@app.get("/room/<path:route_id>")
 @app.get("/admin")
 @app.get("/admin/<path:spa_path>")
 @app.get("/specialty/<path:route_id>")
