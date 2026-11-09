@@ -51,6 +51,7 @@
         title="Текущая пара. Нажмите, чтобы открыть звонки"
         @click="handleBellsClick"
         @keydown.enter="handleBellsClick"
+        @keydown.space.prevent="handleBellsClick"
       >
         <span class="pulse-indicator"></span>
         <span class="pair-text">Пара {{ activePair.period }}</span>
@@ -336,6 +337,14 @@ function handleSubsClick() {
 @media (max-width: 520px) {
   .app-navbar {
     padding: 8px 12px;
+  }
+  .nav-left {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .role-selector {
+    width: 100%;
   }
   .brand-sub {
     display: none;

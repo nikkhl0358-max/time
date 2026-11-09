@@ -102,11 +102,13 @@ function weekdayOf(dateStr) {
   return (d.getDay() + 6) % 7;
 }
 function addDays(dateStr, n) {
+  if (!dateStr) return "";
   const d = new Date(dateStr + "T00:00:00");
-  d.setDate(d.getDate() + n);
+  d.setDate(d.getDate() + Number(n));
   return isoDate(d);
 }
 function mondayOf(dateStr) {
+  if (!dateStr) return "";
   return addDays(dateStr, -weekdayOf(dateStr));
 }
 const RU_MONTHS = [
@@ -158,10 +160,10 @@ function isStaffTeacher(teacher) {
   return (teacher?.employmentType || "staff") === "staff";
 }
 function weekNumberOf(semesterStart, dateStr) {
-  if (!semesterStart) return null;
+  if (!semesterStart || !dateStr) return null;
   const start = mondayOf(semesterStart);
   const diffDays = Math.round((new Date(dateStr + "T00:00:00") - new Date(start + "T00:00:00")) / 86400000);
-  if (diffDays < 0) return null;
+  if (diffDays < 0 || isNaN(diffDays)) return null;
   return Math.floor(diffDays / 7) + 1; // 1-indexed
 }
 // v1603: `weekNumberOf` deliberately measures whole-week offsets from the
@@ -10764,9 +10766,10 @@ function lessonLabel(inst, data) {
 
 function canonicalPublicInstId(value) {
   let id = String(value || "");
-  // Publication may wrap a previously published week occurrence again.
-  // Compare replacements against the original working instance identity.
-  while (/__PUBW\d+$/i.test(id)) id = id.replace(/__PUBW\d+$/i, "");
+  const rx = /__(?:PUBW\d+|EXACT_W\d+|TRANSFER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|CANONICAL_RECOVER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|REMOTE_ONE_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)$/i;
+  while (rx.test(id)) {
+    id = id.replace(rx, "");
+  }
   return id;
 }
 

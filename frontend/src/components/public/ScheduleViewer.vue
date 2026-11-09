@@ -57,6 +57,7 @@
         >
           <div class="day-header">
             <span class="day-title">{{ dayObj.name }}</span>
+            <span v-if="dayObj.dateFormatted" class="day-date">{{ dayObj.dateFormatted }}</span>
           </div>
 
           <div class="day-lessons">
@@ -67,10 +68,11 @@
                 :role="role"
                 :instance="inst"
                 :period="Number(inst.period) || 1"
+                :dateISO="dayObj.dateISO"
                 :subjectName="getSubjectName(inst.subjectId)"
                 :teacherName="getTeacherName(inst.teacherId)"
                 :roomName="getRoomName(inst.roomId || inst.dedicatedRoomId || inst.preferredRoomIds?.[0])"
-                :substitution="findSub(inst, dayObj.index, inst.period || 1)"
+                :substitution="findSub(inst, dayObj.dateISO, dayObj.index, inst.period || 1)"
                 :getGroupName="getGroupName"
                 :getTeacherName="getTeacherName"
                 :getRoomName="getRoomName"
@@ -103,6 +105,8 @@ const props = defineProps({
   role: { type: String, default: 'group' },
   instances: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
+  selectedWeek: { type: Number, default: 10 },
+  semesterStart: { type: String, default: '' },
   getGroupName: { type: Function, default: () => '' },
   getSubjectName: { type: Function, required: true },
   getTeacherName: { type: Function, required: true },
@@ -114,6 +118,41 @@ const props = defineProps({
 });
 
 const emit = defineEmits(['select-teacher', 'select-group']);
+
+const MONTH_NAMES = [
+  'января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
+  'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'
+];
+
+function computeScheduleDate(startStr, weekNum, dayIdx) {
+  if (!startStr || !weekNum || dayIdx === undefined || dayIdx === null) return null;
+  const p = String(startStr).split('-').map(Number);
+  if (p.length < 3 || p.some(isNaN)) return null;
+  const [y, m, d] = p;
+  if (m < 1 || m > 12 || d < 1 || d > 31) return null;
+  const dt = new Date(y, m - 1, d, 12, 0, 0);
+  if (isNaN(dt.getTime()) || dt.getMonth() !== m - 1 || dt.getDate() !== d) return null;
+  const numWeek = Number(weekNum);
+  const numDay = Number(dayIdx);
+  if (isNaN(numWeek) || isNaN(numDay)) return null;
+  const mondayOffset = (dt.getDay() + 6) % 7;
+  dt.setDate(dt.getDate() - mondayOffset + (numWeek - 1) * 7 + numDay);
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+function formatCalendarDate(startStr, weekNum, dayIdx) {
+  const dt = computeScheduleDate(startStr, weekNum, dayIdx);
+  return dt ? `${dt.getDate()} ${MONTH_NAMES[dt.getMonth()]}` : '';
+}
+
+function formatISODate(startStr, weekNum, dayIdx) {
+  const dt = computeScheduleDate(startStr, weekNum, dayIdx);
+  if (!dt || isNaN(dt.getTime())) return '';
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const d = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
 
 function handleSelectTeacher(teacherId) {
   emit('select-teacher', teacherId);
@@ -131,9 +170,17 @@ const safeInstances = computed(() => {
 
 const displayedDays = computed(() => {
   if (activeDayIndex.value >= 0 && activeDayIndex.value < DAY_NAMES.length) {
-    return [{ name: DAY_NAMES[activeDayIndex.value], index: activeDayIndex.value }];
+    const idx = activeDayIndex.value;
+    const dateFormatted = formatCalendarDate(props.semesterStart, props.selectedWeek, idx);
+    const dateISO = formatISODate(props.semesterStart, props.selectedWeek, idx);
+    return [{ name: DAY_NAMES[idx], index: idx, dateFormatted, dateISO }];
   }
-  return DAY_NAMES.map((name, index) => ({ name, index }));
+  return DAY_NAMES.map((name, index) => ({
+    name,
+    index,
+    dateFormatted: formatCalendarDate(props.semesterStart, props.selectedWeek, index),
+    dateISO: formatISODate(props.semesterStart, props.selectedWeek, index)
+  }));
 });
 
 function parseClockMinutes(timeStr) {
@@ -143,28 +190,37 @@ function parseClockMinutes(timeStr) {
   return Number(match[1]) * 60 + Number(match[2]);
 }
 
-function getLessonOrder(inst, getPeriodTimeFn) {
+function getLessonOrder(inst, getPeriodTimeFn, dayIdx) {
   if (inst.eventStartTime) {
     const mins = parseClockMinutes(inst.eventStartTime);
     if (mins !== null) return mins;
   }
   const period = Number(inst.period) || 1;
-  const periodTime = getPeriodTimeFn ? getPeriodTimeFn(period) : '';
-  const timeMins = parseClockMinutes(periodTime);
+  const time = getPeriodTimeFn ? getPeriodTimeFn(period, { groupId: inst.groupId, dayIndex: dayIdx, roomId: inst.roomId }) : '';
+  const timeMins = parseClockMinutes(time);
   return timeMins !== null ? timeMins : period * 100;
+}
+
+function sortDayLessons(lessons, getPeriodTimeFn, dayIdx) {
+  if (lessons.length <= 1) return lessons;
+  // Кэшируем порядок сортировки один раз (Schwartzian transform)
+  const decorated = lessons.map(inst => ({
+    inst,
+    order: getLessonOrder(inst, getPeriodTimeFn, dayIdx)
+  }));
+  decorated.sort((a, b) => a.order - b.order);
+  return decorated.map(d => d.inst);
 }
 
 const lessonsByDay = computed(() => {
   const map = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
-  const getOrder = (inst) => getLessonOrder(inst, props.getPeriodTime);
   safeInstances.value.forEach(inst => {
     const d = Number(inst.day !== undefined ? inst.day : inst.blockIndex);
-    if (map[d]) {
-      map[d].push(inst);
-    }
+    if (map[d]) map[d].push(inst);
   });
   Object.keys(map).forEach(key => {
-    map[key].sort((a, b) => getOrder(a) - getOrder(b));
+    const dayIdx = Number(key);
+    map[key] = sortDayLessons(map[key], props.getPeriodTime, dayIdx);
   });
   return map;
 });
@@ -218,11 +274,16 @@ function getLessonsForDay(dayIdx) {
   cursor: pointer;
   transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
   min-height: 38px;
+  user-select: none;
 }
 
 .day-pill-btn:hover {
   background: var(--blue-50);
   color: var(--blue-700);
+}
+
+.day-pill-btn:active {
+  transform: scale(0.96);
 }
 
 .day-pill-btn.active {
@@ -290,6 +351,16 @@ function getLessonsForDay(dayIdx) {
   font-weight: 800;
   color: var(--blue-700);
   letter-spacing: -0.01em;
+}
+
+.day-date {
+  font-size: 13px;
+  font-weight: 700;
+  color: #f97316;
+  background: rgba(249, 115, 22, 0.08);
+  padding: 3px 8px;
+  border-radius: 8px;
+  border: 1px solid rgba(249, 115, 22, 0.2);
 }
 
 .day-count {
@@ -386,14 +457,24 @@ function getLessonsForDay(dayIdx) {
     box-sizing: border-box;
   }
   .day-filter-bar {
+    justify-content: flex-start;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
     border-radius: 12px;
-    gap: 4px;
-    padding: 4px;
+    gap: 6px;
+    padding: 6px 8px;
     width: 100%;
     max-width: 100%;
     box-sizing: border-box;
   }
+  .day-filter-bar::-webkit-scrollbar {
+    display: none;
+  }
   .day-pill-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
     padding: 6px 10px;
     font-size: 12px;
   }
@@ -409,8 +490,8 @@ function getLessonsForDay(dayIdx) {
     border-radius: 12px;
   }
   .day-filter-bar {
-    gap: 3px;
-    padding: 3px;
+    gap: 4px;
+    padding: 4px 6px;
   }
   .day-pill-btn {
     padding: 5px 8px;

@@ -161,5 +161,107 @@ class TestVueFrontendE2E(unittest.TestCase):
             self.assertIn("group-tag-btn", card_code)
             self.assertIn("role === 'teacher'", card_code)
 
+    def test_12_deep_specialty_year_group_route_serving(self):
+        """Проверяет, что иерархический URL /specialty/.../year/.../group/... отдаёт SPA index.html."""
+        res = self.client.get("/specialty/6st0vnqt/year/2025/group/7rg4gz7s")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('<div id="app"></div>', res.data.decode("utf-8"))
+
+    def test_13_route_sync_deep_link_parser(self):
+        """Проверяет, что useRouteSync.js содержит логику парсинга /specialty/.../group/... и построения URL."""
+        sync_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "composables", "useRouteSync.js"))
+        with open(sync_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("findEntityInParts", code)
+            self.assertIn("parts.indexOf('group')", code)
+            self.assertIn("buildGroupUrl", code)
+            self.assertIn("/specialty/", code)
+
+    def test_14_teacher_departments_and_search_integration(self):
+        """Проверяет интеграцию цикловых комиссий (ЦК) и поиска по фамилии в TeacherRoomPicker.vue."""
+        picker_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "public", "TeacherRoomPicker.vue"))
+        with open(picker_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("searchQuery", code)
+            self.assertIn("teacher-search-input", code)
+            self.assertIn("dept-tabs-scroll", code)
+            self.assertIn("teachersGroupedByDept", code)
+            self.assertIn("resolveDeptBadge", code)
+
+    def test_15_hero_scene_3d_mounted_and_centered(self):
+        """Проверяет, что 3D Chrono-Orb смонтирован в App.vue и корректно инициализирует WebGL с ResizeObserver."""
+        app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "App.vue"))
+        with open(app_path, "r", encoding="utf-8") as f:
+            app_code = f.read()
+            self.assertIn("<HeroScene3D v-if=\"!selectedId\"", app_code)
+
+        hero_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "visual3d", "HeroScene3D.vue"))
+        with open(hero_path, "r", encoding="utf-8") as f:
+            hero_code = f.read()
+            self.assertIn("createCoreMesh", hero_code)
+            self.assertIn("createOrangeGradientTexture", hero_code)
+            self.assertIn("ResizeObserver", hero_code)
+            self.assertIn("ambient-fallback-orb", hero_code)
+
+    def test_16_day_dates_in_schedule_viewer(self):
+        """Проверяет расчёт и вывод календарных дат недели в заголовках дней ScheduleViewer.vue."""
+        viewer_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "public", "ScheduleViewer.vue"))
+        with open(viewer_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("formatCalendarDate", code)
+            self.assertIn("dayObj.dateFormatted", code)
+            self.assertIn("day-date", code)
+
+    def test_17_no_vue_3d_in_title(self):
+        """Проверяет, что в index.html и JS-коде нет преписки '(Vue 3D)' в title."""
+        index_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "static", "index.html"))
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_content = f.read()
+            self.assertIn("<title>Расписание — КТМУ</title>", index_content)
+            self.assertNotIn("(Vue 3D)", index_content)
+
+    def test_18_substitution_date_scoping_no_historical_cancellations(self):
+        """Проверяет, что замены строго привязаны к конкретной календарной дате dateISO и каноническому instId."""
+        sched_data_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "composables", "useScheduleData.js"))
+        with open(sched_data_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("canonicalPublicInstId", code)
+            self.assertIn("!dateISO", code)
+            self.assertIn("String(sub.date) !== String(dateISO)", code)
+
+    def test_19_browser_history_push_state_and_popstate_guard(self):
+        """Проверяет pushState на пользовательских переходах и защиту от гонки при popstate."""
+        app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "App.vue"))
+        with open(app_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("isPopStateNavigating", code)
+            self.assertIn("mode: 'push'", code)
+            self.assertIn("handlePopState", code)
+
+    def test_20_teacher_search_yo_normalization_and_unassigned_fallback(self):
+        """Проверяет нормализацию буквы 'ё' и устойчивость к нераспознанным ЦК."""
+        picker_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "public", "TeacherRoomPicker.vue"))
+        with open(picker_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("/ё/g, 'е'", code)
+            self.assertIn("'unassigned'", code)
+
+    def test_21_safe_local_date_computation_in_schedule_viewer(self):
+        """Проверяет вычисление календарных дат без смещения по часовым поясам."""
+        viewer_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "public", "ScheduleViewer.vue"))
+        with open(viewer_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("computeScheduleDate", code)
+            self.assertIn(":dateISO=\"dayObj.dateISO\"", code)
+
+    def test_22_cancelled_lessons_hide_room_chip(self):
+        """Проверяет скрытие аудитории для отмененных занятий и поддержку всех типов отмен."""
+        card_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "src", "components", "public", "LessonCard.vue"))
+        with open(card_path, "r", encoding="utf-8") as f:
+            code = f.read()
+            self.assertIn("!isCancelled", code)
+            self.assertIn("pending_move", code)
+            self.assertIn("moved", code)
+
 if __name__ == "__main__":
     unittest.main()

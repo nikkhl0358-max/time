@@ -1,14 +1,13 @@
 <template>
   <div class="scene-container" ref="containerRef" @mousemove="onMouseMove" @mouseenter="updateCachedRect">
     <canvas ref="canvasRef" class="webgl-canvas"></canvas>
+    <div class="ambient-fallback-orb" aria-hidden="true"></div>
     <div class="glass-overlay">
       <div class="scene-badge">
         <span class="badge-dot"></span>
         <span>ОФИЦИАЛЬНОЕ РАСПИСАНИЕ КТМУ</span>
       </div>
-      <h1 class="scene-title">
-        Расписание занятий
-      </h1>
+      <h1 class="scene-title">Расписание занятий</h1>
       <p class="scene-subtitle">
         Актуальные пары, расписание звонков и оперативные замены колледжа
       </p>
@@ -35,6 +34,7 @@ let ring2 = null;
 let satellitesGroup = null;
 let isVisible = true;
 let observer = null;
+let resizeObserver = null;
 let lastFrameTime = 0;
 let cachedWidth = 1;
 let cachedHeight = 1;
@@ -42,10 +42,8 @@ let cachedLeft = 0;
 let cachedTop = 0;
 
 const mouse = { x: 0, y: 0, targetX: 0, targetY: 0 };
-// Ограничение частоты рендеринга для легкости и плавности (35 FPS)
 const FPS_INTERVAL = 1000 / 35;
 
-// 1. Создание оптимизированной градиентной текстуры для оранжевого шара
 function createOrangeGradientTexture() {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
@@ -64,7 +62,6 @@ function createOrangeGradientTexture() {
   return tex;
 }
 
-// 2. Создание центрального оранжевого шара на быстром MeshStandardMaterial
 function createCoreMesh() {
   const coreGeo = new THREE.SphereGeometry(1.22, 32, 32);
   const tex = createOrangeGradientTexture();
@@ -79,7 +76,6 @@ function createCoreMesh() {
   return coreMesh;
 }
 
-// 3. Создание лёгкой ореоловой короны вокруг оранжевого круга
 function createCoronaSprite() {
   const canvas = document.createElement('canvas');
   canvas.width = 128;
@@ -98,7 +94,6 @@ function createCoronaSprite() {
   return coronaSprite;
 }
 
-// 4. Тонкие орбитальные кольца времени вокруг оранжевого центра
 function createGyroRings() {
   const rings = new THREE.Group();
   const ring1Geo = new THREE.TorusGeometry(1.95, 0.035, 12, 40);
@@ -118,7 +113,6 @@ function createGyroRings() {
   return rings;
 }
 
-// 5. Микро-спутники учебных слотов
 function createSatellites() {
   satellitesGroup = new THREE.Group();
   const chipGeo = new THREE.BoxGeometry(0.24, 0.16, 0.04);
@@ -134,7 +128,6 @@ function createSatellites() {
   return satellitesGroup;
 }
 
-// 6. Сборка сцены
 function setupChronoScene() {
   chronoGroup = new THREE.Group();
   chronoGroup.add(createCoronaSprite());
@@ -144,7 +137,6 @@ function setupChronoScene() {
   scene.add(chronoGroup);
 }
 
-// 7. Настройка освещения без перегрузки шейдеров
 function setupLights() {
   const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
   dirLight.position.set(5, 8, 7);
@@ -154,26 +146,38 @@ function setupLights() {
   scene.add(ambLight);
 }
 
-// 8. Инициализация WebGL с защитой от троттлинга на экранах высокого разрешения
 function initScene(width, height) {
-  const safeW = Math.max(width || 0, 1);
-  const safeH = Math.max(height || 0, 1);
+  const safeW = Math.max(width || containerRef.value?.clientWidth || window.innerWidth || 320, 1);
+  const safeH = Math.max(height || containerRef.value?.clientHeight || 260, 1);
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera(45, safeW / safeH, 0.1, 100);
   camera.position.set(0, 0, 7.2);
 
-  renderer = new THREE.WebGLRenderer({
-    canvas: canvasRef.value,
-    alpha: true,
-    antialias: false,
-    powerPreference: 'low-power'
-  });
-  renderer.setSize(safeW, safeH);
-  // Фиксируем пиксель-рейсио на 1.25x для максимального FPS без размытия
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+  try {
+    renderer = new THREE.WebGLRenderer({
+      canvas: canvasRef.value,
+      alpha: true,
+      antialias: false,
+      powerPreference: 'low-power'
+    });
+    renderer.setSize(safeW, safeH);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.25));
+  } catch (err) {
+    console.warn('WebGL init fallback:', err);
+  }
 }
 
-// 9. Анимационный цикл с ограничением кадров (FPS Throttling)
+function updateChronoPositions(time) {
+  if (chronoGroup) {
+    chronoGroup.rotation.y = time * 0.22 + mouse.x * 0.35;
+    chronoGroup.rotation.x = Math.sin(time * 0.15) * 0.08 + mouse.y * 0.2;
+    chronoGroup.position.y = Math.sin(time * 0.8) * 0.06;
+  }
+  if (ring1) ring1.rotation.z = time * 0.32;
+  if (ring2) ring2.rotation.z = -time * 0.25;
+  if (satellitesGroup) satellitesGroup.rotation.y = -time * 0.28;
+}
+
 function animate(now = 0) {
   if (!isVisible || !renderer || !scene || !camera) return;
   animationFrameId = requestAnimationFrame(animate);
@@ -185,20 +189,10 @@ function animate(now = 0) {
   mouse.x += (mouse.targetX - mouse.x) * 0.06;
   mouse.y += (mouse.targetY - mouse.y) * 0.06;
 
-  const time = now * 0.001;
-  if (chronoGroup) {
-    chronoGroup.rotation.y = time * 0.22 + mouse.x * 0.35;
-    chronoGroup.rotation.x = Math.sin(time * 0.15) * 0.08 + mouse.y * 0.2;
-    chronoGroup.position.y = Math.sin(time * 0.8) * 0.06;
-  }
-  if (ring1) ring1.rotation.z = time * 0.32;
-  if (ring2) ring2.rotation.z = -time * 0.25;
-  if (satellitesGroup) satellitesGroup.rotation.y = -time * 0.28;
-
+  updateChronoPositions(now * 0.001);
   renderer.render(scene, camera);
 }
 
-// 10. Кэширование размеров контейнера без постоянного вызова getBoundingClientRect
 function updateCachedRect() {
   if (!containerRef.value) return;
   const rect = containerRef.value.getBoundingClientRect();
@@ -208,13 +202,11 @@ function updateCachedRect() {
   cachedTop = rect.top;
 }
 
-// 11. Плавный параллакс курсора без пересчёта макета
 function onMouseMove(event) {
   mouse.targetX = ((event.clientX - cachedLeft) / cachedWidth) * 2 - 1;
   mouse.targetY = -(((event.clientY - cachedTop) / cachedHeight) * 2 - 1);
 }
 
-// 12. Адаптивный ресайз
 function handleResize() {
   if (!containerRef.value || !renderer || !camera) return;
   updateCachedRect();
@@ -225,7 +217,6 @@ function handleResize() {
   renderer.setSize(width, height);
 }
 
-// 13. Остановка анимации вне видимости экрана
 function setupVisibilityObserver() {
   if (!window.IntersectionObserver || !containerRef.value) return;
   observer = new IntersectionObserver(([entry]) => {
@@ -241,47 +232,40 @@ function setupVisibilityObserver() {
   observer.observe(containerRef.value);
 }
 
-// 14. Освобождение ресурсов Three.js
+function setupResizeObserver() {
+  if (!window.ResizeObserver || !containerRef.value) return;
+  resizeObserver = new ResizeObserver(() => handleResize());
+  resizeObserver.observe(containerRef.value);
+}
+
 function disposeThreeObject(obj) {
   if (!obj) return;
   if (obj.geometry) obj.geometry.dispose();
   if (obj.material) {
-    if (Array.isArray(obj.material)) {
-      obj.material.forEach(m => m.dispose());
-    } else {
-      obj.material.dispose();
-    }
+    const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+    mats.forEach(m => {
+      if (m.map) m.map.dispose();
+      m.dispose();
+    });
   }
 }
 
-// 15. Полная очистка памяти
 function cleanupWebGL() {
-  if (animationFrameId) {
-    cancelAnimationFrame(animationFrameId);
-    animationFrameId = null;
-  }
-  if (observer) {
-    observer.disconnect();
-    observer = null;
-  }
+  if (animationFrameId) cancelAnimationFrame(animationFrameId);
+  if (observer) observer.disconnect();
+  if (resizeObserver) resizeObserver.disconnect();
   window.removeEventListener('resize', handleResize);
   if (scene) {
     scene.traverse(disposeThreeObject);
     scene.clear();
-    scene = null;
   }
   if (renderer) {
     renderer.dispose();
-    renderer.forceContextLoss?.();
     renderer = null;
   }
+  scene = null;
   camera = null;
-  chronoGroup = null;
-  coreMesh = null;
-  coronaSprite = null;
-  ring1 = null;
-  ring2 = null;
-  satellitesGroup = null;
+  isVisible = false;
 }
 
 onMounted(() => {
@@ -290,6 +274,7 @@ onMounted(() => {
   setupLights();
   setupChronoScene();
   setupVisibilityObserver();
+  setupResizeObserver();
   lastFrameTime = performance.now();
   animate(lastFrameTime);
   window.addEventListener('resize', handleResize);
@@ -306,29 +291,51 @@ onUnmounted(() => {
   width: 100%;
   max-width: 100vw;
   box-sizing: border-box;
-  height: 280px;
+  min-height: 250px;
   background: linear-gradient(135deg, #ffffff 0%, #f0f9ff 50%, #fff7ed 100%);
   border-bottom: 1px solid var(--border-light);
   overflow: hidden;
   display: flex;
+  flex-direction: column;
   align-items: center;
-  justify-content: space-between;
-  padding: 0 48px;
+  justify-content: center;
+  text-align: center;
+  padding: 32px 24px;
 }
 
 .webgl-canvas {
   position: absolute;
-  right: 0;
   top: 0;
-  width: 55%;
+  left: 0;
+  width: 100%;
   height: 100%;
   pointer-events: none;
+  z-index: 1;
+}
+
+.ambient-fallback-orb {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 280px;
+  height: 280px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #f97316 0%, #ea580c 45%, rgba(249, 115, 22, 0.15) 70%, transparent 85%);
+  filter: blur(40px);
+  opacity: 0.35;
+  pointer-events: none;
+  z-index: 0;
 }
 
 .glass-overlay {
   position: relative;
   z-index: 2;
-  max-width: 640px;
+  max-width: 720px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: auto;
 }
 
 .scene-badge {
@@ -344,6 +351,8 @@ onUnmounted(() => {
   letter-spacing: 0.05em;
   color: var(--blue-700);
   margin-bottom: 14px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 
 .badge-dot {
@@ -366,50 +375,34 @@ onUnmounted(() => {
   font-size: 14px;
   color: var(--ink-muted);
   line-height: 1.5;
+  max-width: 580px;
 }
 
 @media (max-width: 768px) {
   .scene-container {
-    height: auto;
-    min-height: 200px;
-    padding: 24px 20px;
-    flex-direction: column;
-    align-items: flex-start;
-    justify-content: center;
-  }
-  .webgl-canvas {
-    position: absolute;
-    right: 0;
-    top: 0;
-    width: 60%;
-    height: 100%;
-    opacity: 0.35;
+    min-height: 210px;
+    padding: 24px 16px;
   }
   .scene-title {
     font-size: 24px;
+  }
+  .ambient-fallback-orb {
+    width: 220px;
+    height: 220px;
   }
 }
 
 @media (max-width: 480px) {
   .scene-container {
-    padding: 18px 14px;
-    min-height: 165px;
+    min-height: 180px;
+    padding: 20px 12px;
   }
   .scene-title {
-    font-size: 20px;
+    font-size: 21px;
     margin-bottom: 6px;
   }
   .scene-subtitle {
     font-size: 12.5px;
-  }
-  .webgl-canvas {
-    width: 75%;
-    opacity: 0.28;
-  }
-  .scene-badge {
-    padding: 4px 10px;
-    font-size: 10px;
-    margin-bottom: 10px;
   }
 }
 </style>

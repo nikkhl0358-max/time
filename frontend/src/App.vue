@@ -17,7 +17,12 @@
 
     <!-- Глобальный баннер ошибок -->
     <div v-if="error" class="global-error-banner" role="alert">
-      <span>⚠️ {{ error }}</span>
+      <svg class="error-alert-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
+        <line x1="12" y1="9" x2="12" y2="13"></line>
+        <line x1="12" y1="17" x2="12.01" y2="17"></line>
+      </svg>
+      <span>{{ error }}</span>
       <button class="retry-load-btn" @click="loadPublicIndex">Повторить</button>
     </div>
 
@@ -41,6 +46,9 @@
 
     <!-- Публичный портал -->
     <template v-else>
+      <!-- 3D Центральный Chrono-Orb с оранжевой сферой (только на экране выбора) -->
+      <HeroScene3D v-if="!selectedId" />
+
       <main class="main-content">
         <!-- Режим 1: Просмотр сетки пар (когда сущность выбрана) -->
         <template v-if="selectedId">
@@ -49,6 +57,7 @@
             :selectedId="selectedId"
             :selectedName="currentEntityName"
             v-model:selectedWeek="selectedWeek"
+            :hasSchedule="Boolean(currentSchedule.instances && currentSchedule.instances.length > 0)"
             @change-selection="handleChangeSelection"
             @export-csv="handleExportCSV"
             @print="handlePrint"
@@ -58,6 +67,8 @@
             :role="selectedKind"
             :instances="currentSchedule.instances"
             :loading="loading"
+            :selectedWeek="selectedWeek"
+            :semesterStart="semesterConfig.semesterStart"
             :getGroupName="getGroupName"
             :getSubjectName="getSubjectName"
             :getTeacherName="getTeacherName"
@@ -85,6 +96,7 @@
           <TeacherRoomPicker
             :role="selectedKind"
             :items="currentItemsList"
+            :departments="departments"
             @select="handleSelectEntity"
           />
         </template>
@@ -126,11 +138,11 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from 'vue';
 import Navbar from './components/common/Navbar.vue';
 import AppFooter from './components/common/AppFooter.vue';
 import Modal from './components/common/Modal.vue';
-import HeroScene3D from './components/visual3d/HeroScene3D.vue';
+const HeroScene3D = defineAsyncComponent(() => import('./components/visual3d/HeroScene3D.vue'));
 import FilterBar from './components/public/FilterBar.vue';
 import GroupDrillDown from './components/public/GroupDrillDown.vue';
 import TeacherRoomPicker from './components/public/TeacherRoomPicker.vue';
@@ -144,16 +156,18 @@ import { useScheduleData } from './composables/useScheduleData.js';
 import { useCurrentTime } from './composables/useCurrentTime.js';
 import { useAuth } from './composables/useAuth.js';
 import { useScheduleExport } from './composables/useScheduleExport.js';
-import { parseCurrentRoute } from './composables/useRouteSync.js';
+import { parseCurrentRoute, entityExists, clearSavedSelection } from './composables/useRouteSync.js';
 
 const isBellsOpen = ref(false);
 const isSubsOpen = ref(false);
 const isAuthModalOpen = ref(false);
 const isAdminMode = ref(false);
+const isPopStateNavigating = ref(false);
 
 const { exportScheduleCSV, printSchedule } = useScheduleExport();
 
 const {
+  indexData,
   currentSchedule,
   loading,
   error,
@@ -162,11 +176,13 @@ const {
   selectedWeek,
   groups,
   teachers,
+  departments,
   rooms,
   subjects,
   specialties,
   lessonTypes,
   substitutions,
+  semesterConfig,
   loadPublicIndex,
   loadScheduleShard,
   getTeacherName,
@@ -200,37 +216,45 @@ const currentEntityName = computed(() => {
   return getGroupName(selectedId.value);
 });
 
+function updateDocumentTitle() {
+  if (typeof document === 'undefined') return;
+  const prefix = currentEntityName.value ? `${currentEntityName.value} — ` : '';
+  document.title = `${prefix}Расписание — КТМУ`;
+}
+
 // 3. Сброс к главному выбору
 function handleResetView() {
   selectedKind.value = 'group';
   selectedId.value = '';
   isAdminMode.value = false;
-  saveSelection('group', '', selectedWeek.value);
-  syncBrowserUrl('group', '', selectedWeek.value);
+  clearSavedSelection();
+  syncBrowserUrl('group', '', selectedWeek.value, groups.value, { mode: 'push' });
 }
 
 // 4. Переключение роли (Студент / Преподаватель / Аудитории)
 function handleSelectRole(role) {
   selectedKind.value = role;
   selectedId.value = '';
-  syncBrowserUrl(role, '', selectedWeek.value);
+  syncBrowserUrl(role, '', selectedWeek.value, groups.value, { mode: 'push' });
 }
 
 // 5. Выбор студенческой группы через Drill-Down
 function handleSelectGroup(groupId) {
   selectedKind.value = 'group';
   selectedId.value = groupId;
+  syncBrowserUrl('group', groupId, selectedWeek.value, groups.value, { mode: 'push' });
 }
 
 // 6. Выбор преподавателя или кабинета
 function handleSelectEntity(entityId) {
   selectedId.value = entityId;
+  syncBrowserUrl(selectedKind.value, entityId, selectedWeek.value, groups.value, { mode: 'push' });
 }
 
 // 7. Смена сущности (возврат к пошаговому выбору)
 function handleChangeSelection() {
   selectedId.value = '';
-  syncBrowserUrl(selectedKind.value, '', selectedWeek.value);
+  syncBrowserUrl(selectedKind.value, '', selectedWeek.value, groups.value, { mode: 'push' });
 }
 
 // 8. Переход к расписанию преподавателя из карточки пары
@@ -238,11 +262,16 @@ function handleSelectTeacher(teacherId) {
   if (!teacherId) return;
   selectedKind.value = 'teacher';
   selectedId.value = teacherId;
+  syncBrowserUrl('teacher', teacherId, selectedWeek.value, groups.value, { mode: 'push' });
 }
 
 // 9. Открытие панели администратора
 function handleOpenAdmin() {
-  window.location.href = '/admin';
+  if (currentUser.value) {
+    isAdminMode.value = true;
+  } else {
+    isAuthModalOpen.value = true;
+  }
 }
 
 // 10. Обновление замен
@@ -260,18 +289,34 @@ function handlePrint() {
   printSchedule();
 }
 
-// 13. Обработка навигации в истории браузера
-function handlePopState() {
-  const route = parseCurrentRoute();
-  selectedKind.value = route.kind || 'group';
-  selectedId.value = route.id || '';
-  if (route.week) selectedWeek.value = route.week;
+// 13. Обработка навигации в истории браузера (popstate)
+async function handlePopState() {
+  isPopStateNavigating.value = true;
+  try {
+    const route = parseCurrentRoute();
+    const data = indexData.value?.data;
+    if (route.id && data && !entityExists(data, route.kind, route.id)) {
+      selectedKind.value = 'group';
+      selectedId.value = '';
+      syncBrowserUrl('group', '', selectedWeek.value, groups.value, { mode: 'replace' });
+      return;
+    }
+    selectedKind.value = route.kind || 'group';
+    selectedId.value = route.id || '';
+    if (route.week) selectedWeek.value = route.week;
+  } finally {
+    await nextTick();
+    isPopStateNavigating.value = false;
+  }
 }
 
 // Синхронизация URL и загрузка шарда при изменении сущности
 watch([selectedKind, selectedId, selectedWeek], () => {
   saveSelection(selectedKind.value, selectedId.value, selectedWeek.value);
-  syncBrowserUrl(selectedKind.value, selectedId.value, selectedWeek.value);
+  if (!isPopStateNavigating.value) {
+    syncBrowserUrl(selectedKind.value, selectedId.value, selectedWeek.value, groups.value, { mode: 'replace' });
+  }
+  updateDocumentTitle();
   if (selectedId.value) {
     loadScheduleShard(selectedKind.value, selectedId.value, selectedWeek.value);
   }
@@ -279,7 +324,9 @@ watch([selectedKind, selectedId, selectedWeek], () => {
 
 onMounted(async () => {
   window.addEventListener('popstate', handlePopState);
+  updateDocumentTitle();
   await loadPublicIndex();
+  updateDocumentTitle();
   await checkSession();
   if (window.location.pathname.startsWith('/admin') && currentUser.value) {
     isAdminMode.value = true;
@@ -294,6 +341,8 @@ onUnmounted(() => {
 <style scoped>
 .app-root {
   min-height: 100vh;
+  width: 100%;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   background-color: #f8fafc;

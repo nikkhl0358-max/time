@@ -911,10 +911,13 @@ def _canonical_public_inst_id(value):
     """Stable identity shared by working and week-publication occurrence ids."""
     import re
     sid = str(value or "")
-    # Week publication may wrap an already published occurrence more than once.
-    # Always compare the original working id, not the disposable __PUBW suffix.
-    while re.search(r"__PUBW\d+$", sid, flags=re.I):
-        sid = re.sub(r"__PUBW\d+$", "", sid, flags=re.I)
+    # Compare original working id, stripping disposable publication & recovery suffixes
+    rx = re.compile(
+        r"__(?:PUBW\d+|EXACT_W\d+|TRANSFER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|CANONICAL_RECOVER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|REMOTE_ONE_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)$",
+        re.IGNORECASE,
+    )
+    while rx.search(sid):
+        sid = rx.sub("", sid)
     return sid
 
 

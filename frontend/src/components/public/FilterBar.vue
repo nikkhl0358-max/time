@@ -15,6 +15,11 @@
         @click="handleChangeClick"
         :title="`Сменить ${entityRoleGenitive}`"
       >
+        <svg class="change-icon-svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <polyline points="1 20 1 14 7 14"></polyline>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+        </svg>
         <span>Сменить {{ entityRoleGenitive }}</span>
       </button>
     </div>
@@ -29,7 +34,9 @@
           title="Предыдущая неделя"
           aria-label="Предыдущая неделя"
         >
-          ◀
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
         </button>
 
         <div class="week-pill">
@@ -44,26 +51,39 @@
           title="Следующая неделя"
           aria-label="Следующая неделя"
         >
-          ▶
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
         </button>
       </div>
 
       <div class="action-buttons-row">
         <button 
           class="export-btn" 
-          :disabled="!hasItems"
+          :disabled="!canExport"
           @click="$emit('export-csv')" 
           title="Экспорт в CSV / Excel"
         >
-          Скачать CSV
+          <svg class="btn-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          <span>Скачать CSV</span>
         </button>
 
         <button 
           class="print-btn" 
+          :disabled="!canExport"
           @click="$emit('print')" 
           title="Распечатать расписание"
         >
-          Печать
+          <svg class="btn-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="6 9 6 2 18 2 18 9"></polyline>
+            <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
+            <rect x="6" y="14" width="12" height="8"></rect>
+          </svg>
+          <span>Печать</span>
         </button>
       </div>
     </div>
@@ -78,12 +98,14 @@ const props = defineProps({
   items: { type: Array, default: () => [] },
   selectedId: { type: [String, Number], default: '' },
   selectedName: { type: String, default: '' },
-  selectedWeek: { type: Number, default: 10 }
+  selectedWeek: { type: Number, default: 10 },
+  hasSchedule: { type: Boolean, default: true }
 });
 
 const emit = defineEmits(['change-selection', 'update:selectedWeek', 'export-csv', 'print']);
 
 const hasItems = computed(() => Boolean(props.selectedId));
+const canExport = computed(() => Boolean(props.selectedId) && props.hasSchedule);
 
 // 1. Отображение типа сущности
 const entityRoleLabel = computed(() => {
@@ -171,7 +193,7 @@ function handleChangeClick() {
 .change-entity-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   padding: 8px 14px;
   background: var(--blue-50);
   border: 1px solid var(--blue-200);
@@ -189,6 +211,24 @@ function handleChangeClick() {
   color: #ffffff;
   border-color: var(--blue-600);
   box-shadow: 0 2px 8px rgba(2, 132, 199, 0.25);
+}
+
+.change-entity-btn:active {
+  transform: scale(0.97);
+  background: var(--blue-700);
+  border-color: var(--blue-700);
+  color: #ffffff;
+}
+
+.change-icon-svg {
+  flex-shrink: 0;
+  display: inline-block;
+  vertical-align: middle;
+  transition: transform 0.25s ease;
+}
+
+.change-entity-btn:hover .change-icon-svg {
+  transform: rotate(180deg);
 }
 
 .btn-icon {
@@ -216,7 +256,7 @@ function handleChangeClick() {
   width: 32px;
   height: 32px;
   border-radius: 8px;
-  border: none;
+  border: 1px solid transparent;
   background: #ffffff;
   color: var(--blue-700);
   font-size: 12px;
@@ -225,17 +265,28 @@ function handleChangeClick() {
   align-items: center;
   justify-content: center;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
-  transition: all 0.2s ease;
+  transition: all 0.18s ease;
 }
 
 .week-nav-btn:hover:not(:disabled) {
   background: var(--blue-600);
   color: #ffffff;
+  box-shadow: 0 2px 6px rgba(2, 132, 199, 0.3);
+}
+
+.week-nav-btn:active:not(:disabled) {
+  transform: scale(0.92);
+  background: var(--blue-700);
+  color: #ffffff;
 }
 
 .week-nav-btn:disabled {
-  opacity: 0.4;
+  opacity: 0.35;
   cursor: not-allowed;
+  background: #f1f5f9;
+  color: var(--ink-muted);
+  border-color: var(--border-light);
+  box-shadow: none;
 }
 
 .week-pill {
@@ -275,21 +326,36 @@ function handleChangeClick() {
   font-weight: 700;
   color: var(--ink-secondary);
   cursor: pointer;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   transition: all 0.2s ease;
 }
 
-.export-btn:hover:not(:disabled), .print-btn:hover {
+.export-btn:hover:not(:disabled), .print-btn:hover:not(:disabled) {
   border-color: var(--blue-500);
   color: var(--blue-700);
   background: var(--blue-50);
 }
 
-.export-btn:disabled {
-  opacity: 0.5;
+.export-btn:active:not(:disabled), .print-btn:active:not(:disabled) {
+  transform: scale(0.97);
+  background: var(--blue-100);
+}
+
+.export-btn:disabled, .print-btn:disabled {
+  opacity: 0.45;
   cursor: not-allowed;
+  background: #f8fafc;
+  border-color: #e2e8f0;
+  color: var(--ink-muted);
+  box-shadow: none;
+}
+
+.btn-svg {
+  flex-shrink: 0;
+  display: inline-block;
+  vertical-align: middle;
 }
 
 @media (max-width: 900px) {
