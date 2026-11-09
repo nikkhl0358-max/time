@@ -1,8 +1,8 @@
-#design-switcher{position:fixed;right:14px;bottom:14px;z-index:2147483000;display:flex;gap:4px;align-items:center;padding:6px;background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:14px;box-shadow:0 5px 24px #0002;font:600 12px/1.25 system-ui,-apple-system,sans-serif;max-width:calc(100vw - 24px)}
+#design-switcher{position:fixed;right:14px;top:14px;z-index:2147483000;display:flex;gap:4px;align-items:center;padding:6px;background:#fff;color:#172033;border:1px solid #cbd5e1;border-radius:14px;box-shadow:0 5px 24px #0002;font:600 12px/1.25 system-ui,-apple-system,sans-serif;max-width:calc(100vw - 24px)}
 #design-switcher>span{padding:0 6px;white-space:nowrap}
 #design-switcher button{appearance:none;border:1px solid transparent;border-radius:9px;padding:8px 11px;color:#334155;background:transparent;cursor:pointer;font:inherit;white-space:nowrap}
 #design-switcher button:hover{background:#e2e8f0}
 #design-switcher button.active{background:#075fa5;color:#fff;border-color:#075fa5}
 #design-switcher button:focus-visible{outline:3px solid #fb923c;outline-offset:2px}
 @media print{#design-switcher{display:none!important}}
-@media(max-width:440px){#design-switcher{right:8px;bottom:8px;padding:4px}#design-switcher button{padding:7px 8px}}
+@media(max-width:440px){#design-switcher{right:8px;top:8px;padding:4px}#design-switcher button{padding:7px 8px}}

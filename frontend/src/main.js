@@ -1,4 +1,4 @@
-/** Public design selector and admin theme selector. The choice is local to the browser. */
+/** Public design selector. Administrative routes always use the original React interface. */
 const DESIGN_KEY = 'ktmu-design-version';
 const readDesign = () => {
   try { return localStorage.getItem(DESIGN_KEY) === 'old' ? 'old' : 'new'; }
@@ -12,13 +12,13 @@ async function bootstrapApplication() {
   const root = document.getElementById('app');
   if (!root) return;
   root.id = admin || design === 'old' ? 'root' : 'app';
-  document.documentElement.dataset.design = design;
+  document.documentElement.dataset.design = admin ? 'old' : design;
   document.documentElement.dataset.view = admin ? 'admin' : 'public';
 
   // Legacy React interface retains its original built-in styles; modern theme is opt-in.
   if (admin || design === 'old') {
     const { mountAdmin } = await import('./mountAdmin.jsx');
-    await mountAdmin(design);
+    await mountAdmin('old');
   } else {
     document.title = 'Расписание — КТМУ';
     const { mountVue } = await import('./mountVue.js');
@@ -31,10 +31,11 @@ function mountDesignSwitch(design) {
   const host = document.createElement('div');
   host.id = 'design-switcher';
   host.setAttribute('role', 'group');
-  host.setAttribute('aria-label', 'Выбор оформления');
+  host.setAttribute('aria-label', 'Выбор оформления публичного расписания');
   const label = document.createElement('span');
-  label.textContent = 'Дизайн:';
+  label.textContent = 'Дизайн сайта:';
   host.append(label);
+  if (isAdminRoute()) host.title = 'Настройка влияет только на публичное расписание. Админ-панель всегда в старом формате.';
   for (const [value, title] of [['old', 'Старый'], ['new', 'Новый']]) {
     const btn = document.createElement('button');
     btn.type = 'button';
