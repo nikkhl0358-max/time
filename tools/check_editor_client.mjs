@@ -19,7 +19,7 @@ function mockServer(staleSection = '') {
     const value = section === 'bootstrap' ? { value: bootstrap, token: 'revision-1', deferredSections: [...EDITOR_SECTIONS] }
       : { section, value: values[section], token: 'revision-1', ...(section === 'schedule' ? { cellRevisions: { i1: 7 } } : {}) };
     const status = section === staleSection && section ? 409 : 200;
-    return { ok: status === 200, status, json: async () => status === 409 ? { error: 'revision changed' } : value };
+    return { ok: status === 200, status, text: async () => JSON.stringify(status === 409 ? { error: 'revision changed' } : value), json: async () => status === 409 ? { error: 'revision changed' } : value };
   };
 }
 
