@@ -107,21 +107,21 @@ function switchToOldDesign() {
 .footer-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 8px;
 }
 
 .design-return-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 7px 11px;
-  min-height: 32px;
+  padding: 5px 9px;
+  min-height: 28px;
   border: 1px solid var(--border-light);
   border-radius: 9px;
   background: #fff;
   color: var(--ink-secondary);
   font-family: inherit;
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   line-height: 1.2;
   cursor: pointer;

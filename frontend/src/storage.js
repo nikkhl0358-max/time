@@ -667,6 +667,28 @@ export async function publicScheduleGet(kind, id, options = {}) {
   }
 }
 
+// Query published room occupancy for a date and lesson period.
+// The endpoint is public and only returns the published schedule.
+export async function publicRoomAvailabilityGet(date, period) {
+  const params = new URLSearchParams({
+    date: String(date || ''),
+    period: String(period ?? ''),
+    _t: String(Date.now()),
+  });
+  try {
+    const res = await storageFetch(`/api/public-room-availability?${params}`, {
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { error: data?.error || `Ошибка проверки кабинетов: HTTP ${res.status}` };
+    return data;
+  } catch (e) {
+    console.error('publicRoomAvailabilityGet failed', e);
+    return { error: 'Не удалось получить занятость кабинетов' };
+  }
+}
+
 export async function publicStatusGet() {
   try {
     const res = await storageFetch(`/api/public-status?_t=${Date.now()}`, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } });

@@ -35,12 +35,12 @@
 
         <div class="badges-row">
           <span v-if="isRemote" class="format-badge remote" title="Дистанционное занятие">
-            <svg class="badge-icon-remote" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg class="badge-icon-remote" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
               <line x1="8" y1="21" x2="16" y2="21"></line>
               <line x1="12" y1="17" x2="12" y2="21"></line>
             </svg>
-            Дистант
+            <span>Дистант</span>
           </span>
           <span v-if="subgroupBadge" class="subgroup-badge">
             {{ subgroupBadge }}
@@ -180,7 +180,7 @@
           <span v-if="roomCategoryBadge" class="room-tag-mini">{{ roomCategoryBadge }}</span>
         </div>
         <div v-else-if="isRemote" class="room-chip room-remote" title="Дистанционное занятие">
-          <span class="room-name">💻 дистанционно</span>
+          <span class="room-name">📍 дистанционно</span>
         </div>
 
         <!-- Нижний бейдж статуса замены/переноса (по скриншоту 1: ПЕРЕНОС) -->
@@ -621,14 +621,15 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
 }
 
 .room-tag-mini {
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--ink-secondary);
-  background: rgba(15, 23, 42, 0.06);
-  padding: 1px 5px;
-  border-radius: 4px;
-  margin-left: 5px;
-  display: inline-block;
+  font-size: 11px;
+  font-weight: 500;
+  color: #475569;
+  background: #e2e8f0;
+  padding: 1.5px 7px;
+  border-radius: 5px;
+  margin-left: 4px;
+  display: inline-flex;
+  align-items: center;
 }
 
 .sub-icon-svg {
@@ -662,11 +663,11 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 11px;
-  color: var(--blue-700);
-  background: var(--blue-100);
-  padding: 3px 8px;
-  border-radius: 6px;
+  font-size: 11.5px;
+  color: #0284c7;
+  background: #e0f2fe;
+  padding: 3px 9px;
+  border-radius: 8px;
   max-width: 100%;
 }
 
@@ -678,8 +679,8 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
 
 .slot-time {
   font-family: var(--font-mono);
-  font-weight: 800;
-  color: var(--blue-800);
+  font-weight: 700;
+  color: #0284c7;
 }
 
 .slot-separator {
@@ -688,8 +689,8 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
 }
 
 .slot-name {
-  font-weight: 400;
-  opacity: 0.85;
+  font-weight: 500;
+  color: #0284c7;
 }
 
 .special-flags-row {
@@ -757,26 +758,20 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  background: linear-gradient(135deg, #2563eb, #1d4ed8);
-  color: #ffffff;
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  padding: 2.5px 7px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 2.5px 8px;
   border-radius: 6px;
-  box-shadow: 0 1px 3px rgba(37, 99, 235, 0.3);
-  border: 1px solid rgba(255, 255, 255, 0.2);
-}
-
-.badge-icon-remote {
-  flex-shrink: 0;
-  stroke: #ffffff;
+  border: 1px solid #bfdbfe;
 }
 
 .room-chip.room-remote {
-  background: #eff6ff;
-  border-color: #bfdbfe;
-  color: #1d4ed8;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  color: #0284c7;
   font-weight: 600;
 }
 
@@ -918,9 +913,9 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--ink-secondary);
-  flex: 0 1 auto;
+  flex: 0 0 auto;
   min-width: 0;
 }
 
@@ -933,13 +928,13 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
   text-align: left;
   border-radius: 4px;
   transition: opacity 0.15s ease;
-  flex: 0 1 auto;
+  flex: 0 0 auto;
   min-width: 0;
 }
 
 .teacher-name {
   display: inline-block;
-  font-weight: 500;
+  font-weight: 600;
   color: var(--ink-secondary);
   white-space: nowrap;
   line-height: 1.25;
@@ -964,18 +959,17 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
 .room-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 8px;
-  background: #ffffff;
-  border: 1px solid var(--border-light);
-  border-radius: 6px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--blue-700);
+  gap: 6px;
+  padding: 3.5px 9px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #0284c7;
   white-space: nowrap;
   flex-shrink: 0;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
 }
 
 .room-chip.room-substituted {

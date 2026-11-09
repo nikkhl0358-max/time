@@ -1,18 +1,33 @@
+<!--
+  HeroScene3D.vue
+  Интерактивная 3D-сцена Chrono-Orb в шапке публичного портала.
+  Размещает текстовый блок слева, а 3D-сферу с гироскопическими кольцами — справа
+  в квадратном контейнере без перспективных искажений и сплющивания.
+-->
 <template>
-  <div class="scene-container" ref="containerRef" @mousemove="onMouseMove" @mouseenter="updateCachedRect">
-    <canvas ref="canvasRef" class="webgl-canvas"></canvas>
-    <div class="ambient-fallback-orb" aria-hidden="true"></div>
+  <section class="scene-container" ref="containerRef" @mousemove="onMouseMove" @mouseenter="updateCachedRect">
     <div class="glass-overlay">
-      <div class="scene-badge">
-        <span class="badge-dot"></span>
-        <span>ОФИЦИАЛЬНОЕ РАСПИСАНИЕ КТМУ</span>
+      <div class="hero-layout-row">
+        <!-- Текстовый блок слева: бейдж, крупный заголовок и описание -->
+        <div class="hero-text-col">
+          <div class="scene-badge">
+            <span class="badge-dot" aria-hidden="true"></span>
+            <span>ОФИЦИАЛЬНОЕ РАСПИСАНИЕ КТМУ</span>
+          </div>
+          <h1 class="scene-title">Расписание занятий</h1>
+          <p class="scene-subtitle">
+            Актуальные пары, расписание звонков и оперативные замены колледжа
+          </p>
+        </div>
+
+        <!-- 3D Сцена справа: квадратная область под сферу без эллиптических деформаций -->
+        <div class="hero-orb-col" ref="orbColRef">
+          <div class="ambient-fallback-orb" aria-hidden="true"></div>
+          <canvas ref="canvasRef" class="webgl-canvas"></canvas>
+        </div>
       </div>
-      <h1 class="scene-title">Расписание занятий</h1>
-      <p class="scene-subtitle">
-        Актуальные пары, расписание звонков и оперативные замены колледжа
-      </p>
     </div>
-  </div>
+  </section>
 </template>
 
 <script setup>
@@ -20,6 +35,7 @@ import { ref, onMounted, onUnmounted } from 'vue';
 import * as THREE from 'three';
 
 const containerRef = ref(null);
+const orbColRef = ref(null);
 const canvasRef = ref(null);
 
 let renderer = null;
@@ -44,6 +60,9 @@ let cachedTop = 0;
 const mouse = { x: 0, y: 0, targetX: 0, targetY: 0 };
 const FPS_INTERVAL = 1000 / 35;
 
+/**
+ * Создаёт радиальную градиентную текстуру тёплого янтарно-оранжевого ядра.
+ */
 function createOrangeGradientTexture() {
   const canvas = document.createElement('canvas');
   canvas.width = 256;
@@ -62,8 +81,11 @@ function createOrangeGradientTexture() {
   return tex;
 }
 
+/**
+ * Инициализирует меш центральной сферы Chrono-Orb с самосвечением.
+ */
 function createCoreMesh() {
-  const coreGeo = new THREE.SphereGeometry(1.22, 32, 32);
+  const coreGeo = new THREE.SphereGeometry(1.25, 36, 36);
   const tex = createOrangeGradientTexture();
   const coreMat = new THREE.MeshStandardMaterial({
     map: tex,
@@ -76,6 +98,9 @@ function createCoreMesh() {
   return coreMesh;
 }
 
+/**
+ * Создаёт мягкий световой ореол (корону) вокруг сферы.
+ */
 function createCoronaSprite() {
   const canvas = document.createElement('canvas');
   canvas.width = 128;
@@ -90,10 +115,13 @@ function createCoronaSprite() {
   const tex = new THREE.CanvasTexture(canvas);
   const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
   coronaSprite = new THREE.Sprite(mat);
-  coronaSprite.scale.set(3.6, 3.6, 1);
+  coronaSprite.scale.set(3.8, 3.8, 1);
   return coronaSprite;
 }
 
+/**
+ * Создаёт пару гироскопических орбит (колец), вращающихся вокруг сферы.
+ */
 function createGyroRings() {
   const rings = new THREE.Group();
   const ring1Geo = new THREE.TorusGeometry(1.95, 0.035, 12, 40);
@@ -103,7 +131,7 @@ function createGyroRings() {
   ring1.rotation.y = Math.PI / 6;
 
   const ring2Geo = new THREE.TorusGeometry(2.35, 0.03, 12, 40);
-  const ring2Mat = new THREE.MeshStandardMaterial({ color: 0xe0f2fe, roughness: 0.3, metalness: 0.4 });
+  const ring2Mat = new THREE.MeshStandardMaterial({ color: 0x38bdf8, roughness: 0.3, metalness: 0.4 });
   ring2 = new THREE.Mesh(ring2Geo, ring2Mat);
   ring2.rotation.x = -Math.PI / 3.2;
   ring2.rotation.y = Math.PI / 4;
@@ -113,6 +141,9 @@ function createGyroRings() {
   return rings;
 }
 
+/**
+ * Создаёт 4 микро-спутника, вращающихся по внешней траектории.
+ */
 function createSatellites() {
   satellitesGroup = new THREE.Group();
   const chipGeo = new THREE.BoxGeometry(0.24, 0.16, 0.04);
@@ -121,13 +152,16 @@ function createSatellites() {
     const mat = new THREE.MeshStandardMaterial({ color: colors[i], roughness: 0.2, metalness: 0.3 });
     const chip = new THREE.Mesh(chipGeo, mat);
     const angle = (i / 4) * Math.PI * 2;
-    chip.position.set(Math.cos(angle) * 2.8, Math.sin(angle * 2) * 0.4, Math.sin(angle) * 2.8);
+    chip.position.set(Math.cos(angle) * 2.7, Math.sin(angle * 2) * 0.4, Math.sin(angle) * 2.7);
     chip.rotation.y = -angle;
     satellitesGroup.add(chip);
   }
   return satellitesGroup;
 }
 
+/**
+ * Собирает все компоненты Chrono-Orb в единую 3D-группу.
+ */
 function setupChronoScene() {
   chronoGroup = new THREE.Group();
   chronoGroup.add(createCoronaSprite());
@@ -137,6 +171,9 @@ function setupChronoScene() {
   scene.add(chronoGroup);
 }
 
+/**
+ * Настраивает направленное и рассеянное освещение сцены.
+ */
 function setupLights() {
   const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
   dirLight.position.set(5, 8, 7);
@@ -146,12 +183,15 @@ function setupLights() {
   scene.add(ambLight);
 }
 
+/**
+ * Создаёт сцену, симметричную камеру и легковесный WebGL рендерер.
+ */
 function initScene(width, height) {
-  const safeW = Math.max(width || containerRef.value?.clientWidth || window.innerWidth || 320, 1);
-  const safeH = Math.max(height || containerRef.value?.clientHeight || 260, 1);
+  const safeW = Math.max(width || orbColRef.value?.clientWidth || 280, 1);
+  const safeH = Math.max(height || orbColRef.value?.clientHeight || 280, 1);
   scene = new THREE.Scene();
   camera = new THREE.PerspectiveCamera(45, safeW / safeH, 0.1, 100);
-  camera.position.set(0, 0, 7.2);
+  camera.position.set(0, 0, 7.8);
 
   try {
     renderer = new THREE.WebGLRenderer({
@@ -167,17 +207,23 @@ function initScene(width, height) {
   }
 }
 
+/**
+ * Обновляет вращение сферы, колец и спутников с лёгким покачиванием.
+ */
 function updateChronoPositions(time) {
   if (chronoGroup) {
     chronoGroup.rotation.y = time * 0.22 + mouse.x * 0.35;
     chronoGroup.rotation.x = Math.sin(time * 0.15) * 0.08 + mouse.y * 0.2;
-    chronoGroup.position.y = Math.sin(time * 0.8) * 0.06;
+    chronoGroup.position.set(0, Math.sin(time * 0.8) * 0.08, 0);
   }
   if (ring1) ring1.rotation.z = time * 0.32;
   if (ring2) ring2.rotation.z = -time * 0.25;
   if (satellitesGroup) satellitesGroup.rotation.y = -time * 0.28;
 }
 
+/**
+ * Запускает цикл анимации с ограничением до 35 кадров/с для экономии батареи.
+ */
 function animate(now = 0) {
   if (!isVisible || !renderer || !scene || !camera) return;
   animationFrameId = requestAnimationFrame(animate);
@@ -193,6 +239,9 @@ function animate(now = 0) {
   renderer.render(scene, camera);
 }
 
+/**
+ * Кэширует геометрию контейнера для плавного расчёта параллакса курсора.
+ */
 function updateCachedRect() {
   if (!containerRef.value) return;
   const rect = containerRef.value.getBoundingClientRect();
@@ -202,21 +251,30 @@ function updateCachedRect() {
   cachedTop = rect.top;
 }
 
+/**
+ * Обрабатывает движение курсора для наклона 3D-сферы.
+ */
 function onMouseMove(event) {
   mouse.targetX = ((event.clientX - cachedLeft) / cachedWidth) * 2 - 1;
   mouse.targetY = -(((event.clientY - cachedTop) / cachedHeight) * 2 - 1);
 }
 
+/**
+ * Обновляет проекцию камеры и размер рендерера при изменении размеров колонки.
+ */
 function handleResize() {
-  if (!containerRef.value || !renderer || !camera) return;
+  if (!orbColRef.value || !renderer || !camera) return;
   updateCachedRect();
-  const width = Math.max(containerRef.value.clientWidth || 0, 1);
-  const height = Math.max(containerRef.value.clientHeight || 0, 1);
+  const width = Math.max(orbColRef.value.clientWidth || 0, 1);
+  const height = Math.max(orbColRef.value.clientHeight || 0, 1);
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
   renderer.setSize(width, height);
 }
 
+/**
+ * Отключает рендеринг при уходе со страницы или сворачивании вкладки.
+ */
 function setupVisibilityObserver() {
   if (!window.IntersectionObserver || !containerRef.value) return;
   observer = new IntersectionObserver(([entry]) => {
@@ -232,12 +290,18 @@ function setupVisibilityObserver() {
   observer.observe(containerRef.value);
 }
 
+/**
+ * Отслеживает изменения размеров правой колонки со сферой.
+ */
 function setupResizeObserver() {
-  if (!window.ResizeObserver || !containerRef.value) return;
+  if (!window.ResizeObserver || !orbColRef.value) return;
   resizeObserver = new ResizeObserver(() => handleResize());
-  resizeObserver.observe(containerRef.value);
+  resizeObserver.observe(orbColRef.value);
 }
 
+/**
+ * Освобождает видеопамять Three.js объектов при демонтировании.
+ */
 function disposeThreeObject(obj) {
   if (!obj) return;
   if (obj.geometry) obj.geometry.dispose();
@@ -250,6 +314,9 @@ function disposeThreeObject(obj) {
   }
 }
 
+/**
+ * Очищает ресурсы WebGL, таймеры анимации и слушатели событий.
+ */
 function cleanupWebGL() {
   if (animationFrameId) cancelAnimationFrame(animationFrameId);
   if (observer) observer.disconnect();
@@ -270,7 +337,9 @@ function cleanupWebGL() {
 
 onMounted(() => {
   updateCachedRect();
-  initScene(cachedWidth, cachedHeight);
+  const colW = orbColRef.value?.clientWidth || 280;
+  const colH = orbColRef.value?.clientHeight || 280;
+  initScene(colW, colH);
   setupLights();
   setupChronoScene();
   setupVisibilityObserver();
@@ -291,51 +360,44 @@ onUnmounted(() => {
   width: 100%;
   max-width: 100vw;
   box-sizing: border-box;
-  min-height: 250px;
-  background: linear-gradient(135deg, #ffffff 0%, #f0f9ff 50%, #fff7ed 100%);
+  min-height: 240px;
+  background: linear-gradient(135deg, #ffffff 0%, #f0f9ff 48%, #fff7ed 100%);
   border-bottom: 1px solid var(--border-light);
   overflow: hidden;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  text-align: center;
-  padding: 32px 24px;
-}
-
-.webgl-canvas {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  z-index: 1;
-}
-
-.ambient-fallback-orb {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 280px;
-  height: 280px;
-  border-radius: 50%;
-  background: radial-gradient(circle, #f97316 0%, #ea580c 45%, rgba(249, 115, 22, 0.15) 70%, transparent 85%);
-  filter: blur(40px);
-  opacity: 0.35;
-  pointer-events: none;
-  z-index: 0;
+  padding: 36px 32px;
 }
 
 .glass-overlay {
   position: relative;
   z-index: 2;
-  max-width: 720px;
+  width: 100%;
+  max-width: 1440px;
+  margin: 0 auto;
+  box-sizing: border-box;
   display: flex;
-  flex-direction: column;
   align-items: center;
   pointer-events: auto;
+}
+
+.hero-layout-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 48px;
+  width: 100%;
+}
+
+.hero-text-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 820px;
 }
 
 .scene-badge {
@@ -364,45 +426,97 @@ onUnmounted(() => {
 }
 
 .scene-title {
-  font-size: 32px;
-  font-weight: 800;
-  line-height: 1.2;
+  font-size: 44px;
+  font-weight: 850;
+  line-height: 1.15;
   color: var(--ink-primary);
-  margin-bottom: 10px;
+  margin-bottom: 14px;
+  letter-spacing: -0.02em;
 }
 
 .scene-subtitle {
-  font-size: 14px;
+  font-size: 16px;
   color: var(--ink-muted);
   line-height: 1.5;
-  max-width: 580px;
+  max-width: 640px;
+  text-align: left;
+  margin: 0;
 }
 
-@media (max-width: 768px) {
+.hero-orb-col {
+  position: relative;
+  width: 280px;
+  height: 280px;
+  flex: 0 0 280px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ambient-fallback-orb {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 220px;
+  height: 220px;
+  border-radius: 50%;
+  background: radial-gradient(circle, #f97316 0%, #ea580c 45%, rgba(249, 115, 22, 0.12) 70%, transparent 85%);
+  filter: blur(34px);
+  opacity: 0.45;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.webgl-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 1;
+}
+
+@media (max-width: 860px) {
   .scene-container {
-    min-height: 210px;
-    padding: 24px 16px;
+    padding: 28px 20px;
+    min-height: 200px;
+  }
+  .hero-layout-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 20px;
+  }
+  .hero-orb-col {
+    width: 200px;
+    height: 200px;
+    flex: 0 0 200px;
+    align-self: center;
   }
   .scene-title {
-    font-size: 24px;
+    font-size: 30px;
   }
-  .ambient-fallback-orb {
-    width: 220px;
-    height: 220px;
+  .scene-subtitle {
+    font-size: 14px;
   }
 }
 
 @media (max-width: 480px) {
   .scene-container {
-    min-height: 180px;
-    padding: 20px 12px;
+    padding: 20px 14px;
+  }
+  .hero-orb-col {
+    width: 160px;
+    height: 160px;
+    flex: 0 0 160px;
   }
   .scene-title {
-    font-size: 21px;
-    margin-bottom: 6px;
+    font-size: 24px;
+    margin-bottom: 8px;
   }
   .scene-subtitle {
-    font-size: 12.5px;
+    font-size: 13px;
   }
 }
 </style>
