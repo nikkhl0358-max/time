@@ -5,7 +5,7 @@
       <p>Загрузка расписания...</p>
     </div>
 
-    <div v-else-if="!safeInstances.length" class="schedule-empty-state">
+    <div v-else-if="!hasAnyWeeklyContent" class="schedule-empty-state">
       <div class="empty-icon">
         <svg class="empty-icon-svg" viewBox="0 0 24 24" width="38" height="38" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
@@ -169,6 +169,8 @@ const props = defineProps({
   role: { type: String, default: 'group' },
   selectedId: { type: String, default: '' },
   instances: { type: Array, default: () => [] },
+  rawInstances: { type: Array, default: () => [] },
+  loads: { type: Array, default: () => [] },
   substitutions: { type: Array, default: () => [] },
   subjects: { type: Array, default: () => [] },
   loading: { type: Boolean, default: false },
@@ -298,9 +300,10 @@ function populateBaseInstances(safeInsts) {
 }
 
 function injectMovedLessons(map, p) {
+  const source = (Array.isArray(p.rawInstances) && p.rawInstances.length) ? p.rawInstances : p.instances;
   for (let dayIdx = 0; dayIdx < 6; dayIdx += 1) {
     const dateISO = formatISODate(p.semesterStart, p.selectedWeek, dayIdx);
-    const moved = collectMovedLessonsForDate(p.substitutions, p.instances, p.role, p.selectedId, dateISO, dayIdx, p.subjects);
+    const moved = collectMovedLessonsForDate(p.substitutions, source, p.role, p.selectedId, dateISO, dayIdx, p.subjects, p.loads);
     if (moved.length) map[dayIdx].push(...moved);
   }
 }
@@ -315,6 +318,17 @@ const lessonsByDay = computed(() => {
     map[key] = collapsePublicSiblingSubgroups(sorted);
   });
   return map;
+});
+
+const hasAnyWeeklyContent = computed(() => {
+  const regularCount = safeInstances.value.filter(i => !i._publicMoveSupportOnly).length;
+  if (regularCount > 0) return true;
+  for (let dayIdx = 0; dayIdx < 6; dayIdx += 1) {
+    if ((lessonsByDay.value[dayIdx] || []).length > 0) return true;
+    const dateISO = formatISODate(props.semesterStart, props.selectedWeek, dayIdx);
+    if (dateISO && getRetakesForDay(dateISO).length > 0) return true;
+  }
+  return false;
 });
 
 function getLessonsForDay(dayIdx) {

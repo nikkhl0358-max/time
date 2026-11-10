@@ -61,6 +61,7 @@
             :publishedWeeks="publishedWeeks"
             :publicWeekSelectionEnabled="publicWeekSelectionEnabled"
             :hasSchedule="Boolean(currentSchedule.instances && currentSchedule.instances.length > 0)"
+            :semesterStart="semesterConfig.semesterStart"
             @change-selection="handleChangeSelection"
             @export-csv="handleExportCSV"
             @print="handlePrint"
@@ -70,6 +71,8 @@
             :role="selectedKind"
             :selectedId="selectedId"
             :instances="currentSchedule.instances"
+            :rawInstances="currentSchedule.rawInstances || currentSchedule.instances"
+            :loads="loads"
             :substitutions="substitutions"
             :subjects="subjects"
             :loading="loading"
@@ -131,6 +134,7 @@
     <Modal :isOpen="isBellsOpen" title="Расписание звонков КТМУ" @close="isBellsOpen = false">
       <BellsSchedule 
         :bells="DEFAULT_BELLS" 
+        :semesterConfig="semesterConfig"
         :activePeriodNumber="activePair?.period"
       />
     </Modal>
@@ -201,6 +205,7 @@ const {
   subjects,
   specialties,
   lessonTypes,
+  loads,
   substitutions,
   announcements,
   publicIntroText,

@@ -4,12 +4,12 @@
 import { ref, onMounted, onUnmounted } from 'vue';
 
 export const STANDARD_BELLS = [
-  { period: 1, start: '08:00', end: '09:30' },
-  { period: 2, start: '09:40', end: '11:10' },
-  { period: 3, start: '11:30', end: '13:00' },
-  { period: 4, start: '13:30', end: '15:00' },
-  { period: 5, start: '15:10', end: '16:40' },
-  { period: 6, start: '16:50', end: '18:20' }
+  { period: 1, start: '08:30', end: '10:00' },
+  { period: 2, start: '10:10', end: '11:40' },
+  { period: 3, start: '11:50', end: '13:20' },
+  { period: 4, start: '14:00', end: '15:30' },
+  { period: 5, start: '15:40', end: '17:10' },
+  { period: 6, start: '17:20', end: '18:50' }
 ];
 
 export const VOZNESENSKY_BELLS = [
@@ -22,12 +22,12 @@ export const VOZNESENSKY_BELLS = [
 ];
 
 export const SHORTENED_BELLS = [
-  { period: 1, start: '08:00', end: '09:10' },
-  { period: 2, start: '09:20', end: '10:30' },
-  { period: 3, start: '10:40', end: '11:50' },
-  { period: 4, start: '12:00', end: '13:10' },
-  { period: 5, start: '13:20', end: '14:30' },
-  { period: 6, start: '14:40', end: '15:50' }
+  { period: 1, start: '09:00', end: '10:00' },
+  { period: 2, start: '10:10', end: '11:10' },
+  { period: 3, start: '11:30', end: '12:30' },
+  { period: 4, start: '12:50', end: '13:50' },
+  { period: 5, start: '14:05', end: '15:05' },
+  { period: 6, start: '15:15', end: '16:15' }
 ];
 
 const DEFAULT_BELLS = STANDARD_BELLS;

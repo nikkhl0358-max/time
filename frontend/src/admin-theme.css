@@ -25,6 +25,28 @@
   background: var(--paper) !important;
   font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, sans-serif !important;
   color: var(--ink) !important;
+  height: 100vh !important;
+  max-height: 100vh !important;
+  overflow: hidden !important;
+  display: flex !important;
+}
+
+.content-col {
+  flex: 1 !important;
+  display: flex !important;
+  flex-direction: column !important;
+  min-width: 0 !important;
+  height: 100vh !important;
+  max-height: 100vh !important;
+  overflow: hidden !important;
+}
+
+.content {
+  flex: 1 !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  padding: 18px 32px 36px !important;
+  box-sizing: border-box !important;
 }
 
 /* 3D Стилизованный сайдбар */
@@ -153,13 +175,16 @@
 
 /* Плавающая панель сохранения в шапке */
 .section-save-bar {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 40 !important;
   background: rgba(255, 255, 255, 0.95) !important;
   backdrop-filter: blur(12px) !important;
   border: 1px solid #E2E8F0 !important;
   border-radius: 12px !important;
   padding: 12px 18px !important;
   box-shadow: 0 4px 20px -2px rgba(15, 23, 42, 0.06) !important;
-  margin-bottom: 18px !important;
+  margin-bottom: 20px !important;
 }
 
 .section-save-btn {
@@ -179,7 +204,6 @@
 
 /* Карточки и тулбары */
 .card, 
-.section, 
 .load-toolbar-card, 
 .schedule-toolbar-block, 
 .smart-graph-result, 
@@ -190,6 +214,13 @@
   border: 1px solid #E2E8F0 !important;
   border-radius: 12px !important;
   box-shadow: 0 4px 16px -2px rgba(15, 23, 42, 0.05), 0 2px 6px -1px rgba(15, 23, 42, 0.02) !important;
+}
+
+.section {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  padding: 0 !important;
 }
 
 /* Кнопки действий */

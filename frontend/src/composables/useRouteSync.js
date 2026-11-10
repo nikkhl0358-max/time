@@ -114,37 +114,64 @@ export function entityExists(data, kind, id) {
   return Array.isArray(list) && list.some(item => String(item.id) === String(id));
 }
 
+export function calculateCurrentSemesterWeek(semesterStart, today = new Date()) {
+  if (!semesterStart) return null;
+  const p = String(semesterStart).split('-').map(Number);
+  if (p.length < 3 || p.some(isNaN)) return null;
+  const [y, m, d] = p;
+  const startDate = new Date(y, m - 1, d, 12, 0, 0);
+  const mondayOffset = (startDate.getDay() + 6) % 7;
+  startDate.setDate(startDate.getDate() - mondayOffset);
+  const diffDays = Math.round((today.getTime() - startDate.getTime()) / 86400000);
+  if (diffDays < 0 || isNaN(diffDays)) return null;
+  return Math.floor(diffDays / 7) + 1;
+}
+
 function resolveFallbackWeek(data, requestedWeek) {
-  if (requestedWeek && Array.isArray(data.publishedWeeks) && data.publishedWeeks.includes(requestedWeek)) {
+  if (requestedWeek && Number.isFinite(requestedWeek) && requestedWeek >= 1 && requestedWeek <= 24) {
     return requestedWeek;
   }
-  if (Array.isArray(data.publishedWeeks) && data.publishedWeeks.length) {
-    return data.publishedWeeks[data.publishedWeeks.length - 1];
+  const published = Array.isArray(data?.publishedWeeks) ? data.publishedWeeks : [];
+  const calWeek = calculateCurrentSemesterWeek(data?.config?.semesterStart);
+  if (calWeek && (published.includes(calWeek) || !data?.publicWeekSelectionEnabled)) {
+    return calWeek;
   }
-  return 10;
+  if (published.length) {
+    return published[published.length - 1];
+  }
+  return calWeek || 10;
+}
+
+function resolveTargetEntity(data, route, saved) {
+  const validKinds = ['group', 'teacher', 'room'];
+  let kind = validKinds.includes(route.kind) ? route.kind : (saved?.kind && validKinds.includes(saved.kind) ? saved.kind : 'group');
+  let id = (typeof route.id === 'string' && route.id) || (typeof saved?.id === 'string' && saved.id) || '';
+  if (route.id && !entityExists(data, route.kind, route.id)) {
+    id = saved?.id && typeof saved.id === 'string' && entityExists(data, kind, saved.id) ? saved.id : '';
+    kind = id ? kind : 'group';
+  } else if (id && !entityExists(data, kind, id)) {
+    id = '';
+  }
+  return { kind, id };
+}
+
+function resolveTargetWeek(data, route, saved) {
+  const calWeek = calculateCurrentSemesterWeek(data?.config?.semesterStart);
+  const published = Array.isArray(data?.publishedWeeks) ? data.publishedWeeks : [];
+  if (route.week) return resolveFallbackWeek(data, route.week);
+  if (calWeek && published.includes(calWeek)) return calWeek;
+  if (published.length) return published[published.length - 1];
+  if (typeof saved?.week === 'number' && published.includes(saved.week)) return saved.week;
+  return resolveFallbackWeek(data, calWeek || 10);
 }
 
 export function resolveInitialSelection(data) {
   const route = parseCurrentRoute();
   const rawSaved = readSavedSelection();
   const saved = (rawSaved && typeof rawSaved === 'object' && !Array.isArray(rawSaved)) ? rawSaved : null;
-  const validKinds = ['group', 'teacher', 'room'];
-  let targetKind = validKinds.includes(route.kind) ? route.kind : 'group';
-  if (!route.id && saved?.kind && validKinds.includes(saved.kind)) {
-    targetKind = saved.kind;
-  }
-  let targetId = (typeof route.id === 'string' && route.id) || (typeof saved?.id === 'string' && saved.id) || '';
-  let targetWeek = route.week || (typeof saved?.week === 'number' && saved.week > 0 ? saved.week : null);
-
-  if (route.id && !entityExists(data, route.kind, route.id)) {
-    targetId = saved?.id && typeof saved.id === 'string' && entityExists(data, targetKind, saved.id) ? saved.id : '';
-    targetKind = targetId ? targetKind : 'group';
-  } else if (targetId && !entityExists(data, targetKind, targetId)) {
-    targetId = '';
-  }
-
-  const finalWeek = resolveFallbackWeek(data, targetWeek);
-  return { kind: targetKind, id: targetId, week: finalWeek };
+  const { kind, id } = resolveTargetEntity(data, route, saved);
+  const week = resolveTargetWeek(data, route, saved);
+  return { kind, id, week };
 }
 
 function buildGroupUrl(group) {

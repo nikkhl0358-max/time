@@ -56,6 +56,16 @@
             <polyline points="9 18 15 12 9 6"></polyline>
           </svg>
         </button>
+
+        <button 
+          v-if="currentCalWeek && selectedWeek !== currentCalWeek"
+          type="button" 
+          class="current-week-quick-btn" 
+          @click="emit('update:selectedWeek', currentCalWeek)" 
+          title="Перейти к текущей календарной неделе"
+        >
+          Сегодня ({{ currentCalWeek }})
+        </button>
       </div>
 
       <div class="action-buttons-row">
@@ -93,6 +103,7 @@
 
 <script setup>
 import { computed } from 'vue';
+import { calculateCurrentSemesterWeek } from '../../composables/useRouteSync.js';
 
 const props = defineProps({
   role: { type: String, default: 'group' },
@@ -103,17 +114,22 @@ const props = defineProps({
   selectedWeek: { type: Number, default: 10 },
   hasSchedule: { type: Boolean, default: true },
   publishedWeeks: { type: Array, default: () => [] },
-  publicWeekSelectionEnabled: { type: Boolean, default: true }
+  publicWeekSelectionEnabled: { type: Boolean, default: true },
+  semesterStart: { type: String, default: '' }
 });
 
 const emit = defineEmits(['change-selection', 'update:selectedWeek', 'export-csv', 'print']);
 
 const hasItems = computed(() => Boolean(props.selectedId));
 const canExport = computed(() => Boolean(props.selectedId) && props.hasSchedule);
+const currentCalWeek = computed(() => calculateCurrentSemesterWeek(props.semesterStart));
 
 const availableWeeks = computed(() => {
   if (props.publicWeekSelectionEnabled && Array.isArray(props.publishedWeeks) && props.publishedWeeks.length) {
-    return [...new Set(props.publishedWeeks.map(Number).filter(n => Number.isFinite(n) && n >= 1 && n <= 24))].sort((a, b) => a - b);
+    const set = new Set(props.publishedWeeks.map(Number));
+    if (props.selectedWeek) set.add(Number(props.selectedWeek));
+    if (currentCalWeek.value) set.add(Number(currentCalWeek.value));
+    return [...set].filter(n => Number.isFinite(n) && n >= 1 && n <= 24).sort((a, b) => a - b);
   }
   return Array.from({ length: 24 }, (_, i) => i + 1);
 });
@@ -330,6 +346,31 @@ function handleChangeClick() {
   flex-direction: column;
   align-items: center;
   padding: 0 10px;
+}
+
+.current-week-quick-btn {
+  padding: 5px 9px;
+  background: var(--orange-500, #f97316);
+  color: #ffffff;
+  border: none;
+  border-radius: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 6px rgba(249, 115, 22, 0.25);
+  margin-left: 2px;
+}
+
+.current-week-quick-btn:hover {
+  background: var(--orange-600, #ea580c);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 10px rgba(249, 115, 22, 0.35);
+}
+
+.current-week-quick-btn:active {
+  transform: scale(0.96);
 }
 
 .week-label {

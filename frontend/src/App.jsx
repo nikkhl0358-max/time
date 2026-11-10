@@ -577,11 +577,11 @@ function normalizedPublicConfig(raw) {
     activeDays: Array.isArray(c.activeDays) ? c.activeDays : [true, true, true, true, true, false, false],
     periodsPerDay: Number(c.periodsPerDay) || 6,
     periodTimes: Array.isArray(c.periodTimes) ? c.periodTimes : [
-      "08:00–09:30", "09:40–11:10", "11:30–13:00", "13:30–15:00", "15:10–16:40", "16:50–18:20",
+      "08:30–10:00", "10:10–11:40", "11:50–13:20", "14:00–15:30", "15:40–17:10", "17:20–18:50",
     ],
     voznesenskyPeriodTimes: Array.isArray(c.voznesenskyPeriodTimes) ? c.voznesenskyPeriodTimes : [...DEFAULT_VOZNESENSKY_PERIOD_TIMES],
     shortenedPeriodTimes: Array.isArray(c.shortenedPeriodTimes) ? c.shortenedPeriodTimes : [
-      "08:00–09:10", "09:20–10:30", "10:40–11:50", "12:00–13:10", "13:20–14:30", "14:40–15:50",
+      "09:00–10:00", "10:10–11:10", "11:30–12:30", "12:50–13:50", "14:05–15:05", "15:15–16:15",
     ],
     shortenedDates: Array.isArray(c.shortenedDates) ? c.shortenedDates : [],
     semesterStart: c.semesterStart || "",
@@ -1278,13 +1278,13 @@ function buildSeed() {
       activeDays: [true, true, true, true, true, false, false],
       periodsPerDay: 6,
       periodTimes: [
-        "08:00–09:30", "09:40–11:10", "11:30–13:00",
-        "13:30–15:00", "15:10–16:40", "16:50–18:20",
+        "08:30–10:00", "10:10–11:40", "11:50–13:20",
+        "14:00–15:30", "15:40–17:10", "17:20–18:50",
       ],
       voznesenskyPeriodTimes: [...DEFAULT_VOZNESENSKY_PERIOD_TIMES],
       shortenedPeriodTimes: [
-        "08:00–09:10", "09:20–10:30", "10:40–11:50",
-        "12:00–13:10", "13:20–14:30", "14:40–15:50",
+        "09:00–10:00", "10:10–11:10", "11:30–12:30",
+        "12:50–13:50", "14:05–15:05", "15:15–16:15",
       ],
       shortenedDates: [], // ISO даты сокращённых учебных дней
       semesterStart: "",

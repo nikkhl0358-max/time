@@ -16,12 +16,12 @@ function mapInstancePlacement(inst, assignment) {
 }
 
 function normalizeScheduleData(schedule) {
-  if (!schedule) return { instances: [], assignment: {} };
+  if (!schedule) return { instances: [], assignment: {}, rawInstances: [] };
   const assignment = schedule.assignment || {};
   const rawInstances = Array.isArray(schedule.instances) ? schedule.instances : [];
   const instances = rawInstances
     .map(inst => mapInstancePlacement(inst, assignment))
-    .filter(inst => inst.day !== undefined);
+    .filter(inst => inst.day !== undefined || inst._publicMoveSupportOnly);
   return { ...schedule, instances, rawInstances };
 }
 
@@ -38,7 +38,8 @@ function canonicalPublicInstId(value) {
 
 function matchSubWithLesson(sub, inst, dateISO) {
   if (!sub || !inst || !dateISO) return false;
-  if (!sub.date || String(sub.date) !== String(dateISO)) return false;
+  const matchesDate = String(sub.date) === String(dateISO) || String(sub.targetDate) === String(dateISO);
+  if (!matchesDate) return false;
   const subIds = [sub.instId, sub.sourceInstId, sub.originalInstId]
     .map(canonicalPublicInstId)
     .filter(Boolean);
@@ -72,7 +73,13 @@ export function useScheduleData() {
   const selectedId = ref('');
   const selectedWeek = ref(10);
   const shardSubstitutions = ref([]);
+  const shardLoads = ref([]);
   const manualSubstitutions = ref(null);
+
+  const loads = computed(() => {
+    const baseLoads = indexData.value?.data?.loads || [];
+    return [...baseLoads, ...shardLoads.value];
+  });
 
   const groups = computed(() => indexData.value?.data?.groups || []);
   const teachers = computed(() => indexData.value?.data?.teachers || []);
@@ -145,6 +152,7 @@ export function useScheduleData() {
       const shard = await fetchEntityShard(kind, id, week);
       currentSchedule.value = normalizeScheduleData(shard?.schedule);
       shardSubstitutions.value = Array.isArray(shard?.dataPatch?.substitutions) ? shard.dataPatch.substitutions : [];
+      shardLoads.value = Array.isArray(shard?.dataPatch?.loads) ? shard.dataPatch.loads : [];
     } catch (err) {
       console.error('Ошибка загрузки шарда расписания:', err);
     } finally {
@@ -193,10 +201,16 @@ export function useScheduleData() {
 
   const substitutionsByDate = computed(() => {
     const map = new Map();
-    substitutions.value.forEach(sub => {
-      const d = String(sub.date || '');
+    const add = (d, sub) => {
+      if (!d) return;
       if (!map.has(d)) map.set(d, []);
       map.get(d).push(sub);
+    };
+    substitutions.value.forEach(sub => {
+      add(String(sub.date || ''), sub);
+      if (sub.targetDate && String(sub.targetDate) !== String(sub.date)) {
+        add(String(sub.targetDate), sub);
+      }
     });
     return map;
   });
@@ -292,6 +306,7 @@ export function useScheduleData() {
     subjects,
     specialties,
     lessonTypes,
+    loads,
     substitutions,
     announcements,
     publicIntroText,

@@ -1,6 +1,13 @@
 # UML проекта timetable22
 
-Обновлено: 2026-11-09 — устранение потери переносов занятий в шардах сущностей, предотвращение усечения ФИО преподавателей, очистка тегов аудиторий и паритет с оригинальным расписанием.
+Обновлено: 2026-11-10 — комплексно устранены 3 дефекта интерфейса и логики:
+1. Админ-панель: исправлено смещение вёрстки и скролла — изолирован селектор `.section`, контейнер ограничен `height: 100vh; overflow: hidden`, контентная область скроллится независимо (`overflow-y: auto`), панель сохранения зафиксирована вверху (`position: sticky; top: 0; z-index: 40`).
+2. Расписание звонков: приведены в соответствие официальные интервалы (стандартные пары 1: 08:30–10:00, 2: 10:10–11:40, 3: 11:50–13:20, 4: 14:00–15:30, 5: 15:40–17:10, 6: 17:20–18:50; сокращённые пары 1: 09:00–10:00, 2: 10:10–11:10, 3: 11:30–12:30, 4: 12:50–13:50, 5: 14:05–15:05, 6: 15:15–16:15).
+3. Мобильное и десктопное отображение переносов и замен:
+   - В `normalizeScheduleData` сохранены support-инстансы (`_publicMoveSupportOnly`).
+   - В `scheduleSubstitutions.js` реализовано разыменование исходной нагрузки (`loads`) при отсутствии `rawInst` в недельном шарде, что гарантирует сопоставление по преподавателю и группе.
+   - В `useScheduleData.js` добавлена индексация как исходной (`sub.date`), так и целевой даты (`sub.targetDate`) в `substitutionsByDate`.
+   - В `useRouteSync.js` декомпозирована функция выбора недели с приоритетом актуальной опубликованной недели (`published[published.length - 1]`) вместо устаревшего значения в `localStorage`.
 
 ## Компоненты
 
@@ -58,6 +65,7 @@ flowchart LR
         TestUIVisual -.-> AuthModal
 
         App --> SchedComposable[composables/useScheduleData.js]
+        App --> RouteSyncComposable[composables/useRouteSync.js]
         App --> AuthComposable[composables/useAuth.js]
         App --> TimeComposable[composables/useCurrentTime.js]
         App --> ExportComposable[composables/useScheduleExport.js]

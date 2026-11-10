@@ -6,7 +6,7 @@
         :class="['bell-tab-btn', { active: currentTab === 'standard' }]"
         @click="currentTab = 'standard'"
       >
-        🏛 Главный корпус
+        🏛 Понедельник–суббота
       </button>
       <button 
         type="button" 
@@ -20,7 +20,7 @@
         :class="['bell-tab-btn', { active: currentTab === 'short' }]"
         @click="currentTab = 'short'"
       >
-        ⏱ Сокращённый
+        ⏱ Сокращённые дни
       </button>
     </div>
 
@@ -50,16 +50,37 @@ import { STANDARD_BELLS, VOZNESENSKY_BELLS, SHORTENED_BELLS } from '../../compos
 
 const props = defineProps({
   bells: { type: Array, default: () => [] },
+  semesterConfig: { type: Object, default: () => ({}) },
   activePeriodNumber: { type: Number, default: null }
 });
 
 const currentTab = ref('standard');
 
+function parsePeriodString(str, periodNum) {
+  if (!str) return null;
+  const clean = String(str).replace('–', '-');
+  const parts = clean.split('-').map(s => s.trim());
+  if (parts.length < 2 || !parts[0] || !parts[1]) return null;
+  return { period: periodNum, start: parts[0], end: parts[1] };
+}
+
+function parsePeriodList(list, fallback) {
+  if (!Array.isArray(list) || !list.length) return fallback;
+  const parsed = list
+    .map((str, idx) => parsePeriodString(str, idx + 1))
+    .filter(Boolean);
+  return parsed.length ? parsed : fallback;
+}
+
 const displayedBells = computed(() => {
-  if (currentTab.value === 'voz') return VOZNESENSKY_BELLS;
-  if (currentTab.value === 'short') return SHORTENED_BELLS;
-  if (props.bells && props.bells.length) return props.bells;
-  return STANDARD_BELLS;
+  const cfg = props.semesterConfig || {};
+  if (currentTab.value === 'voz') {
+    return parsePeriodList(cfg.voznesenskyPeriodTimes, VOZNESENSKY_BELLS);
+  }
+  if (currentTab.value === 'short') {
+    return parsePeriodList(cfg.shortenedPeriodTimes, SHORTENED_BELLS);
+  }
+  return parsePeriodList(cfg.periodTimes, props.bells?.length ? props.bells : STANDARD_BELLS);
 });
 </script>
 

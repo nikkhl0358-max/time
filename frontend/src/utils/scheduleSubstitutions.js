@@ -23,15 +23,23 @@ export function subMatchesInstance(sub, inst) {
   return instIds.some(id => subIds.includes(id));
 }
 
-export function subMatchesView(sub, inst, kind, viewId) {
+function findAssociatedLoad(sub, rawInst, loads) {
+  if (!Array.isArray(loads) || !loads.length) return null;
+  const loadId = (sub?.instId || rawInst?.instId || '').split('__')[0];
+  if (!loadId) return null;
+  return loads.find(l => String(l.id || l.loadId) === String(loadId)) || null;
+}
+
+export function subMatchesView(sub, inst, kind, viewId, loads = []) {
   const vid = String(viewId || '');
   if (!vid) return false;
+  const load = findAssociatedLoad(sub, inst, loads);
   if (kind === 'group') {
-    const gids = [inst?.groupId, ...(inst?.groupIds || []), ...(inst?.streamGroupIds || []), sub?.groupId, sub?.importGroupId].filter(Boolean).map(String);
+    const gids = [inst?.groupId, load?.groupId, ...(inst?.groupIds || []), ...(inst?.streamGroupIds || []), sub?.groupId, sub?.importGroupId].filter(Boolean).map(String);
     return gids.includes(vid);
   }
   if (kind === 'teacher') {
-    const tids = [sub?.newTeacherId, sub?.teacherId, inst?.teacherId, sub?.importOldTeacherId, sub?.importNewTeacherId].filter(Boolean).map(String);
+    const tids = [sub?.newTeacherId, sub?.teacherId, inst?.teacherId, load?.teacherId, sub?.importOldTeacherId, sub?.importNewTeacherId].filter(Boolean).map(String);
     return tids.includes(vid);
   }
   if (kind === 'room') {
@@ -77,27 +85,18 @@ function createMovedSubOverride(sub, slot) {
   };
 }
 
-export function buildMovedInstance(sub, rawInst, dayIdx, dateISO, subjects = []) {
-  const subj = resolveSubject(sub, rawInst, subjects);
-  const slot = resolveMovedSlot(sub, rawInst);
-  const teacherId = sub.newTeacherId || rawInst?.teacherId || sub.importOldTeacherId || sub.teacherId || '';
-  const groupId = rawInst?.groupId || sub.importGroupId || sub.groupId || '';
-  const subg = Number(rawInst?.subgroup || sub.subgroup || (sub.importSubgroup ? Number(sub.importSubgroup) : 0));
+function resolveMovedMeta(sub, rawInst, loads) {
+  const load = findAssociatedLoad(sub, rawInst, loads);
+  const teacherId = sub.newTeacherId || rawInst?.teacherId || load?.teacherId || sub.importOldTeacherId || sub.teacherId || '';
+  const groupId = rawInst?.groupId || load?.groupId || sub.importGroupId || sub.groupId || '';
+  const subg = Number(rawInst?.subgroup ?? load?.subgroup ?? sub.subgroup ?? (sub.importSubgroup ? Number(sub.importSubgroup) : 0));
+  const lTypeId = rawInst?.lessonTypeId || rawInst?.typeId || load?.typeId || load?.lessonTypeId || '';
+  const format = sub.newFormat || rawInst?.format || load?.format || 'inperson';
+  return { load, teacherId, groupId, subg, lTypeId, format };
+}
+
+function buildMovedTracking(sub, slot) {
   return {
-    ...(rawInst || {}),
-    instId: `moved-${sub.id || sub.instId || Math.random()}`,
-    _isMovedSynthetic: true,
-    day: dayIdx,
-    period: slot.period,
-    subjectId: subj.subjectId,
-    subjectName: subj.subjectName,
-    teacherId,
-    groupId,
-    groupIds: rawInst?.groupIds || (groupId ? [groupId] : []),
-    streamGroupIds: rawInst?.streamGroupIds || [],
-    subgroup: subg,
-    format: sub.newFormat || rawInst?.format || 'inperson',
-    roomId: slot.roomId,
     sourceDate: sub.date,
     sourcePeriod: slot.sourcePeriod,
     targetDate: sub.targetDate,
@@ -107,14 +106,38 @@ export function buildMovedInstance(sub, rawInst, dayIdx, dateISO, subjects = [])
   };
 }
 
-export function collectMovedLessonsForDate(substitutions, instances, kind, viewId, targetDate, dayIdx, subjects = []) {
+export function buildMovedInstance(sub, rawInst, dayIdx, dateISO, subjects = [], loads = []) {
+  const meta = resolveMovedMeta(sub, rawInst, loads);
+  const subj = resolveSubject(sub, rawInst || meta.load, subjects);
+  const slot = resolveMovedSlot(sub, rawInst);
+  return {
+    ...(rawInst || {}),
+    instId: `moved-${sub.id || sub.instId || Math.random()}`,
+    _isMovedSynthetic: true,
+    day: dayIdx,
+    period: slot.period,
+    subjectId: subj.subjectId,
+    subjectName: subj.subjectName,
+    teacherId: meta.teacherId,
+    groupId: meta.groupId,
+    groupIds: rawInst?.groupIds || (meta.groupId ? [meta.groupId] : []),
+    streamGroupIds: rawInst?.streamGroupIds || [],
+    subgroup: meta.subg,
+    lessonTypeId: meta.lTypeId,
+    format: meta.format,
+    roomId: slot.roomId,
+    ...buildMovedTracking(sub, slot)
+  };
+}
+
+export function collectMovedLessonsForDate(substitutions, instances, kind, viewId, targetDate, dayIdx, subjects = [], loads = []) {
   if (!targetDate || !Array.isArray(substitutions)) return [];
   const list = [];
   for (const sub of substitutions) {
     if (!['moved', 'excursion'].includes(sub?.type) || String(sub.targetDate) !== String(targetDate)) continue;
     const rawInst = (instances || []).find(i => subMatchesInstance(sub, i));
-    if (!subMatchesView(sub, rawInst, kind, viewId)) continue;
-    list.push(buildMovedInstance(sub, rawInst, dayIdx, targetDate, subjects));
+    if (!subMatchesView(sub, rawInst, kind, viewId, loads)) continue;
+    list.push(buildMovedInstance(sub, rawInst, dayIdx, targetDate, subjects, loads));
   }
   return list;
 }
