@@ -2,19 +2,27 @@
   <Modal :isOpen="isOpen" title="Авторизация составителя" @close="handleClose">
     <form @submit.prevent="handleSubmit" class="auth-form">
       <div v-if="error" class="auth-error-banner" role="alert">
-        <span>⚠️ {{ error }}</span>
-        <button type="button" class="dismiss-error-btn" @click="clearError">✕</button>
+        <div class="auth-error-message">
+          <svg class="auth-error-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="8" x2="12" y2="12"></line>
+            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+          </svg>
+          <span>{{ error }}</span>
+        </div>
+        <button type="button" class="dismiss-error-btn" @click="clearError" aria-label="Закрыть ошибку">✕</button>
       </div>
 
       <div class="form-field">
         <label for="admin-auth-username">Имя пользователя / логин</label>
         <input 
           id="admin-auth-username" 
+          ref="usernameInputRef"
           v-model.trim="username" 
           type="text" 
           required 
           autocomplete="username"
-          class="auth-input"
+          :class="['auth-input', { 'has-error': error }]"
           placeholder="admin"
           :disabled="loading"
           @input="clearError"
@@ -25,11 +33,12 @@
         <label for="admin-auth-password">Пароль</label>
         <input 
           id="admin-auth-password" 
+          ref="passwordInputRef"
           v-model="password" 
           type="password" 
           required 
           autocomplete="current-password"
-          class="auth-input"
+          :class="['auth-input', { 'has-error': error }]"
           placeholder="••••••••"
           :disabled="loading"
           @input="clearError"
@@ -52,7 +61,7 @@
 </template>
 
 <script setup>
-import { ref, watch } from 'vue';
+import { ref, watch, nextTick } from 'vue';
 import Modal from '../common/Modal.vue';
 import { useAuth } from '../../composables/useAuth.js';
 
@@ -64,6 +73,9 @@ const emit = defineEmits(['close', 'login-success']);
 
 const username = ref('');
 const password = ref('');
+const usernameInputRef = ref(null);
+const passwordInputRef = ref(null);
+
 const { login, authLoading: loading, authError: error } = useAuth();
 
 function resetForm() {
@@ -81,6 +93,18 @@ function handleClose() {
   emit('close');
 }
 
+/**
+ * Автофокусировка: если логин заполнен — фокус на пароль, иначе на логин.
+ */
+async function focusInitialInput() {
+  await nextTick();
+  if (username.value && passwordInputRef.value) {
+    passwordInputRef.value.focus();
+  } else if (usernameInputRef.value) {
+    usernameInputRef.value.focus();
+  }
+}
+
 async function handleSubmit() {
   if (!username.value || !password.value) return;
   const success = await login(username.value, password.value);
@@ -88,14 +112,19 @@ async function handleSubmit() {
     resetForm();
     emit('login-success');
     emit('close');
+  } else {
+    await nextTick();
+    passwordInputRef.value?.focus();
+    passwordInputRef.value?.select();
   }
 }
 
-watch(() => props.isOpen, (open) => {
+watch(() => props.isOpen, async (open) => {
   if (!open) {
     resetForm();
   } else {
     clearError();
+    await focusInitialInput();
   }
 });
 </script>
@@ -108,9 +137,9 @@ watch(() => props.isOpen, (open) => {
 }
 
 .auth-error-banner {
-  background: var(--orange-50);
-  border: 1px solid var(--orange-200);
-  color: var(--orange-700);
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
   padding: 10px 14px;
   border-radius: 8px;
   font-size: 13px;
@@ -120,10 +149,21 @@ watch(() => props.isOpen, (open) => {
   justify-content: space-between;
 }
 
+.auth-error-message {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auth-error-icon {
+  flex-shrink: 0;
+  color: #ef4444;
+}
+
 .dismiss-error-btn {
   background: none;
   border: none;
-  color: var(--orange-700);
+  color: #991b1b;
   cursor: pointer;
   font-size: 12px;
   padding: 2px 6px;
@@ -155,6 +195,16 @@ watch(() => props.isOpen, (open) => {
 .auth-input:focus {
   border-color: var(--blue-600);
   box-shadow: 0 0 0 3px rgba(2, 132, 199, 0.15);
+}
+
+.auth-input.has-error {
+  border-color: #ef4444;
+  background-color: #fff8f8;
+}
+
+.auth-input.has-error:focus {
+  border-color: #dc2626;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
 }
 
 .auth-submit-btn {

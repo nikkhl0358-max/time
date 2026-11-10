@@ -6,6 +6,7 @@
         <span class="entity-type-label">{{ entityRoleLabel }}</span>
         <div class="entity-name-row">
           <h2 class="entity-name">{{ selectedName || 'Не выбрано' }}</h2>
+          <span v-if="entitySubtitle" class="entity-subtitle-badge" :title="entitySubtitle">{{ entitySubtitle }}</span>
         </div>
       </div>
 
@@ -15,6 +16,11 @@
         @click="handleChangeClick"
         :title="`Сменить ${entityRoleGenitive}`"
       >
+        <svg class="change-icon-svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <polyline points="23 4 23 10 17 10"></polyline>
+          <polyline points="1 20 1 14 7 14"></polyline>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+        </svg>
         <span>Сменить {{ entityRoleGenitive }}</span>
       </button>
     </div>
@@ -24,12 +30,14 @@
       <div class="week-navigation">
         <button 
           class="week-nav-btn" 
-          :disabled="selectedWeek <= 1"
-          @click="changeWeek(selectedWeek - 1)"
+          :disabled="!canPrevWeek"
+          @click="stepWeek(-1)"
           title="Предыдущая неделя"
           aria-label="Предыдущая неделя"
         >
-          ◀
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
         </button>
 
         <div class="week-pill">
@@ -39,31 +47,44 @@
 
         <button 
           class="week-nav-btn" 
-          :disabled="selectedWeek >= 24"
-          @click="changeWeek(selectedWeek + 1)"
+          :disabled="!canNextWeek"
+          @click="stepWeek(1)"
           title="Следующая неделя"
           aria-label="Следующая неделя"
         >
-          ▶
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
         </button>
       </div>
 
       <div class="action-buttons-row">
         <button 
           class="export-btn" 
-          :disabled="!hasItems"
+          :disabled="!canExport"
           @click="$emit('export-csv')" 
           title="Экспорт в CSV / Excel"
         >
-          Скачать CSV
+          <svg class="btn-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+            <polyline points="7 10 12 15 17 10"></polyline>
+            <line x1="12" y1="15" x2="12" y2="3"></line>
+          </svg>
+          <span>Скачать CSV</span>
         </button>
 
         <button 
           class="print-btn" 
+          :disabled="!canExport"
           @click="$emit('print')" 
           title="Распечатать расписание"
         >
-          Печать
+          <svg class="btn-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="6 9 6 2 18 2 18 9"></polyline>
+            <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path>
+            <rect x="6" y="14" width="12" height="8"></rect>
+          </svg>
+          <span>Печать</span>
         </button>
       </div>
     </div>
@@ -78,12 +99,27 @@ const props = defineProps({
   items: { type: Array, default: () => [] },
   selectedId: { type: [String, Number], default: '' },
   selectedName: { type: String, default: '' },
-  selectedWeek: { type: Number, default: 10 }
+  entitySubtitle: { type: String, default: '' },
+  selectedWeek: { type: Number, default: 10 },
+  hasSchedule: { type: Boolean, default: true },
+  publishedWeeks: { type: Array, default: () => [] },
+  publicWeekSelectionEnabled: { type: Boolean, default: true }
 });
 
 const emit = defineEmits(['change-selection', 'update:selectedWeek', 'export-csv', 'print']);
 
 const hasItems = computed(() => Boolean(props.selectedId));
+const canExport = computed(() => Boolean(props.selectedId) && props.hasSchedule);
+
+const availableWeeks = computed(() => {
+  if (props.publicWeekSelectionEnabled && Array.isArray(props.publishedWeeks) && props.publishedWeeks.length) {
+    return [...new Set(props.publishedWeeks.map(Number).filter(n => Number.isFinite(n) && n >= 1 && n <= 24))].sort((a, b) => a - b);
+  }
+  return Array.from({ length: 24 }, (_, i) => i + 1);
+});
+
+const canPrevWeek = computed(() => availableWeeks.value.some(w => w < props.selectedWeek));
+const canNextWeek = computed(() => availableWeeks.value.some(w => w > props.selectedWeek));
 
 // 1. Отображение типа сущности
 const entityRoleLabel = computed(() => {
@@ -100,9 +136,16 @@ const entityRoleGenitive = computed(() => {
 });
 
 // 3. Смена учебной недели
-function changeWeek(newWeek) {
-  const clamped = Math.max(1, Math.min(24, newWeek));
-  emit('update:selectedWeek', clamped);
+function stepWeek(direction) {
+  const list = availableWeeks.value;
+  if (!list.length) return;
+  let target = null;
+  if (direction < 0) {
+    target = [...list].reverse().find(w => w < props.selectedWeek) ?? null;
+  } else {
+    target = list.find(w => w > props.selectedWeek) ?? null;
+  }
+  if (target !== null) emit('update:selectedWeek', target);
 }
 
 // 5. Клик по кнопке смены сущности
@@ -154,6 +197,21 @@ function handleChangeClick() {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+
+.entity-subtitle-badge {
+  font-size: 12px;
+  font-weight: 600;
+  color: #0369a1;
+  background: #e0f2fe;
+  border: 1px solid #bae6fd;
+  padding: 3px 8px;
+  border-radius: 6px;
+  white-space: nowrap;
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .entity-icon {
@@ -171,7 +229,7 @@ function handleChangeClick() {
 .change-entity-btn {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   padding: 8px 14px;
   background: var(--blue-50);
   border: 1px solid var(--blue-200);
@@ -189,6 +247,24 @@ function handleChangeClick() {
   color: #ffffff;
   border-color: var(--blue-600);
   box-shadow: 0 2px 8px rgba(2, 132, 199, 0.25);
+}
+
+.change-entity-btn:active {
+  transform: scale(0.97);
+  background: var(--blue-700);
+  border-color: var(--blue-700);
+  color: #ffffff;
+}
+
+.change-icon-svg {
+  flex-shrink: 0;
+  display: inline-block;
+  vertical-align: middle;
+  transition: transform 0.25s ease;
+}
+
+.change-entity-btn:hover .change-icon-svg {
+  transform: rotate(180deg);
 }
 
 .btn-icon {
@@ -216,7 +292,7 @@ function handleChangeClick() {
   width: 32px;
   height: 32px;
   border-radius: 8px;
-  border: none;
+  border: 1px solid transparent;
   background: #ffffff;
   color: var(--blue-700);
   font-size: 12px;
@@ -225,17 +301,28 @@ function handleChangeClick() {
   align-items: center;
   justify-content: center;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
-  transition: all 0.2s ease;
+  transition: all 0.18s ease;
 }
 
 .week-nav-btn:hover:not(:disabled) {
   background: var(--blue-600);
   color: #ffffff;
+  box-shadow: 0 2px 6px rgba(2, 132, 199, 0.3);
+}
+
+.week-nav-btn:active:not(:disabled) {
+  transform: scale(0.92);
+  background: var(--blue-700);
+  color: #ffffff;
 }
 
 .week-nav-btn:disabled {
-  opacity: 0.4;
+  opacity: 0.35;
   cursor: not-allowed;
+  background: #f1f5f9;
+  color: var(--ink-muted);
+  border-color: var(--border-light);
+  box-shadow: none;
 }
 
 .week-pill {
@@ -275,21 +362,36 @@ function handleChangeClick() {
   font-weight: 700;
   color: var(--ink-secondary);
   cursor: pointer;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 6px;
   transition: all 0.2s ease;
 }
 
-.export-btn:hover:not(:disabled), .print-btn:hover {
+.export-btn:hover:not(:disabled), .print-btn:hover:not(:disabled) {
   border-color: var(--blue-500);
   color: var(--blue-700);
   background: var(--blue-50);
 }
 
-.export-btn:disabled {
-  opacity: 0.5;
+.export-btn:active:not(:disabled), .print-btn:active:not(:disabled) {
+  transform: scale(0.97);
+  background: var(--blue-100);
+}
+
+.export-btn:disabled, .print-btn:disabled {
+  opacity: 0.45;
   cursor: not-allowed;
+  background: #f8fafc;
+  border-color: #e2e8f0;
+  color: var(--ink-muted);
+  box-shadow: none;
+}
+
+.btn-svg {
+  flex-shrink: 0;
+  display: inline-block;
+  vertical-align: middle;
 }
 
 @media (max-width: 900px) {

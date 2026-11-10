@@ -22,20 +22,20 @@
 
       <nav class="role-selector" aria-label="Выбор вида расписания">
         <button 
-          :class="['role-btn', { active: currentRole === 'group' }]"
-          @click="$emit('select-role', 'group')"
+          :class="['role-btn', { active: activeRole === 'group' }]"
+          @click="handleRoleClick('group')"
         >
           Группы
         </button>
         <button 
-          :class="['role-btn', { active: currentRole === 'teacher' }]"
-          @click="$emit('select-role', 'teacher')"
+          :class="['role-btn', { active: activeRole === 'teacher' }]"
+          @click="handleRoleClick('teacher')"
         >
           Преподаватели
         </button>
         <button 
-          :class="['role-btn', { active: currentRole === 'room' }]"
-          @click="$emit('select-role', 'room')"
+          :class="['role-btn', { active: activeRole === 'room' }]"
+          @click="handleRoleClick('room')"
         >
           Аудитории
         </button>
@@ -49,8 +49,9 @@
         role="button"
         tabindex="0"
         title="Текущая пара. Нажмите, чтобы открыть звонки"
-        @click="$emit('toggle-bells')"
-        @keydown.enter="$emit('toggle-bells')"
+        @click="handleBellsClick"
+        @keydown.enter="handleBellsClick"
+        @keydown.space.prevent="handleBellsClick"
       >
         <span class="pulse-indicator"></span>
         <span class="pair-text">Пара {{ activePair.period }}</span>
@@ -61,7 +62,7 @@
 
       <button 
         class="nav-action-btn" 
-        @click="$emit('toggle-bells')"
+        @click="handleBellsClick"
         title="Посмотреть расписание звонков"
       >
         Звонки
@@ -69,7 +70,7 @@
 
       <button 
         class="nav-action-btn orange" 
-        @click="$emit('toggle-substitutions')"
+        @click="handleSubsClick"
         title="Посмотреть оперативные замены"
       >
         Замены
@@ -80,18 +81,43 @@
 </template>
 
 <script setup>
-defineProps({
-  currentRole: { type: String, default: 'group' },
+import { computed } from 'vue';
+
+const props = defineProps({
+  role: { type: String, default: 'group' },
+  currentRole: { type: String, default: '' },
   activePair: { type: Object, default: null },
   substitutionsCount: { type: Number, default: 0 }
 });
 
-defineEmits([
+const emit = defineEmits([
   'reset-view',
   'select-role',
+  'update:role',
   'toggle-bells',
-  'toggle-substitutions'
+  'open-bells',
+  'toggle-substitutions',
+  'open-subs'
 ]);
+
+const activeRole = computed(() => {
+  return props.currentRole || props.role || 'group';
+});
+
+function handleRoleClick(newRole) {
+  emit('select-role', newRole);
+  emit('update:role', newRole);
+}
+
+function handleBellsClick() {
+  emit('toggle-bells');
+  emit('open-bells');
+}
+
+function handleSubsClick() {
+  emit('toggle-substitutions');
+  emit('open-subs');
+}
 </script>
 
 <style scoped>
@@ -311,6 +337,14 @@ defineEmits([
 @media (max-width: 520px) {
   .app-navbar {
     padding: 8px 12px;
+  }
+  .nav-left {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .role-selector {
+    width: 100%;
   }
   .brand-sub {
     display: none;

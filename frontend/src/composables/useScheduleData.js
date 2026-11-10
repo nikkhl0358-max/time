@@ -5,6 +5,7 @@
 import { ref, computed } from 'vue';
 import { publicIndexGet, publicScheduleGet } from '../storage.js';
 import { resolveInitialSelection, saveSelection, syncBrowserUrl } from './useRouteSync.js';
+import { getRoomCategoryDetails } from '../utils/scheduleSubstitutions.js';
 
 function mapInstancePlacement(inst, assignment) {
   const a = assignment[inst.instId] || assignment[inst.id] || {};
@@ -24,15 +25,42 @@ function normalizeScheduleData(schedule) {
   return { ...schedule, instances, rawInstances };
 }
 
-function matchSubWithLesson(sub, inst, dayIndex, period) {
-  if (sub.instId && inst.instId) {
-    if (inst.instId.startsWith(sub.instId) || sub.instId.startsWith(inst.instId)) return true;
-    if (inst._publishedSourceInstId && inst._publishedSourceInstId === sub.instId) return true;
+const DEFAULT_TIMES = ['08:30–10:00', '10:10–11:40', '11:50–13:20', '14:00–15:30', '15:40–17:10', '17:20–18:50', '19:00–20:30'];
+
+function canonicalPublicInstId(value) {
+  let id = String(value || '');
+  const rx = /__(?:PUBW\d+(?:_\d+)*|EXACT_W\d+(?:_\d+)*|TRANSFER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|CANONICAL_RECOVER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|REMOTE_ONE_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)$/i;
+  while (rx.test(id)) {
+    id = id.replace(rx, '');
   }
-  const matchGroup = !sub.groupId || String(sub.groupId) === String(inst.groupId);
-  const matchDay = Number(sub.day) === Number(dayIndex);
-  const matchPeriod = Number(sub.period) === Number(period);
-  return matchGroup && matchDay && matchPeriod;
+  return id;
+}
+
+function matchSubWithLesson(sub, inst, dateISO) {
+  if (!sub || !inst || !dateISO) return false;
+  if (!sub.date || String(sub.date) !== String(dateISO)) return false;
+  const subIds = [sub.instId, sub.sourceInstId, sub.originalInstId]
+    .map(canonicalPublicInstId)
+    .filter(Boolean);
+  if (!subIds.length) return false;
+  const instIds = [inst.instId, inst._publishedSourceInstId, inst.id]
+    .map(canonicalPublicInstId)
+    .filter(Boolean);
+  return instIds.some(id => subIds.includes(id));
+}
+
+function resolveParity(cfg, weekNum) {
+  const num = Number(weekNum);
+  if (!num) return null;
+  return cfg?.weekParityOverrides?.[String(num)] || (num % 2 === 1 ? 'odd' : 'even');
+}
+
+function resolveGroupCustomTime(g, dayIndex, idx, parity) {
+  if (!g || dayIndex === null || dayIndex === undefined) return '';
+  const pCustom = parity ? g.dayPeriodTimesByParity?.[parity]?.[String(dayIndex)] : null;
+  if (Array.isArray(pCustom) && pCustom[idx]?.trim()) return pCustom[idx];
+  const dCustom = g.dayPeriodTimes?.[String(dayIndex)] || g.dayPeriodTimes?.[dayIndex];
+  return (Array.isArray(dCustom) && dCustom[idx]?.trim()) ? dCustom[idx] : '';
 }
 
 export function useScheduleData() {
@@ -48,11 +76,20 @@ export function useScheduleData() {
 
   const groups = computed(() => indexData.value?.data?.groups || []);
   const teachers = computed(() => indexData.value?.data?.teachers || []);
+  const departments = computed(() => indexData.value?.data?.departments || []);
   const rooms = computed(() => indexData.value?.data?.rooms || []);
   const subjects = computed(() => indexData.value?.data?.subjects || []);
   const specialties = computed(() => indexData.value?.data?.specialties || []);
   const lessonTypes = computed(() => indexData.value?.data?.lessonTypes || []);
+  const roomTypes = computed(() => indexData.value?.data?.roomTypes || []);
+  const roomSizes = computed(() => indexData.value?.data?.roomSizes || []);
   const semesterConfig = computed(() => indexData.value?.data?.config || {});
+  const announcements = computed(() => indexData.value?.data?.announcements || []);
+  const publicIntroText = computed(() => indexData.value?.data?.publicIntroText || '');
+  const retakes = computed(() => indexData.value?.data?.retakes || []);
+  const practices = computed(() => indexData.value?.data?.practices || []);
+  const publishedWeeks = computed(() => indexData.value?.data?.publishedWeeks || []);
+  const publicWeekSelectionEnabled = computed(() => indexData.value?.data?.publicWeekSelectionEnabled !== false);
 
   const substitutions = computed({
     get: () => {
@@ -91,14 +128,21 @@ export function useScheduleData() {
     selectedId.value = init.id;
     selectedWeek.value = init.week;
     saveSelection(init.kind, init.id, init.week);
-    syncBrowserUrl(init.kind, init.id, init.week);
+    syncBrowserUrl(init.kind, init.id, init.week, data?.groups || []);
+  }
+
+  async function fetchEntityShard(kind, id, week) {
+    const shard = await publicScheduleGet(kind, id, { week, scope: 'week' });
+    if (shard?.schedule && (shard.schedule.instances || []).length) return shard;
+    const semShard = await publicScheduleGet(kind, id, { scope: 'semester' });
+    return semShard?.schedule ? semShard : shard;
   }
 
   async function loadScheduleShard(kind, id, week = selectedWeek.value) {
     if (!id) return;
     loading.value = true;
     try {
-      const shard = await publicScheduleGet(kind, id, { week, scope: 'week' });
+      const shard = await fetchEntityShard(kind, id, week);
       currentSchedule.value = normalizeScheduleData(shard?.schedule);
       shardSubstitutions.value = Array.isArray(shard?.dataPatch?.substitutions) ? shard.dataPatch.substitutions : [];
     } catch (err) {
@@ -108,38 +152,89 @@ export function useScheduleData() {
     }
   }
 
+  // Быстрые O(1) хэш-индексы для устранения линейного сканирования при рендеринге списков
+  const teacherMap = computed(() => {
+    const m = new Map();
+    teachers.value.forEach(t => { if (t?.id) m.set(String(t.id), t.name); });
+    return m;
+  });
+
+  const subjectMap = computed(() => {
+    const m = new Map();
+    subjects.value.forEach(s => { if (s?.id) m.set(String(s.id), s.name); });
+    return m;
+  });
+
+  const roomMap = computed(() => {
+    const m = new Map();
+    rooms.value.forEach(r => { if (r?.id) m.set(String(r.id), r); });
+    return m;
+  });
+
+  const groupMap = computed(() => {
+    const m = new Map();
+    groups.value.forEach(g => { if (g?.id) m.set(String(g.id), g); });
+    return m;
+  });
+
+  const lessonTypeMap = computed(() => {
+    const m = new Map();
+    lessonTypes.value.forEach(lt => { if (lt?.id) m.set(String(lt.id), lt.name); });
+    return m;
+  });
+
+  const roomDetailsMap = computed(() => {
+    const m = new Map();
+    rooms.value.forEach(r => {
+      if (r?.id) m.set(String(r.id), getRoomCategoryDetails(r, roomTypes.value, roomSizes.value));
+    });
+    return m;
+  });
+
+  const substitutionsByDate = computed(() => {
+    const map = new Map();
+    substitutions.value.forEach(sub => {
+      const d = String(sub.date || '');
+      if (!map.has(d)) map.set(d, []);
+      map.get(d).push(sub);
+    });
+    return map;
+  });
+
   function getTeacherName(id) {
     if (!id) return 'Преподаватель не назначен';
-    const t = teachers.value.find(item => String(item.id) === String(id));
-    return t ? t.name : 'Преподаватель не назначен';
+    return teacherMap.value.get(String(id)) || 'Преподаватель не назначен';
   }
 
   function getSubjectName(id) {
     if (!id) return '—';
-    const s = subjects.value.find(item => String(item.id) === String(id));
-    return s ? s.name : String(id);
+    return subjectMap.value.get(String(id)) || String(id);
   }
 
   function getRoomName(id) {
     if (!id) return '';
-    const r = rooms.value.find(item => String(item.id) === String(id));
+    const r = roomMap.value.get(String(id));
     return r ? (r.name || r.number || String(id)) : '';
+  }
+
+  function getRoomDetails(id) {
+    if (!id) return { tagLabel: '', description: '' };
+    return roomDetailsMap.value.get(String(id)) || { tagLabel: '', description: '' };
   }
 
   function getGroupName(id) {
     if (!id) return '';
-    const g = groups.value.find(item => String(item.id) === String(id));
+    const g = groupMap.value.get(String(id));
     return g ? g.name : String(id);
   }
 
   function getLessonTypeName(id) {
     if (!id) return '';
-    const lt = lessonTypes.value.find(item => String(item.id) === String(id));
-    return lt ? lt.name : String(id);
+    return lessonTypeMap.value.get(String(id)) || String(id);
   }
 
   function getRoomLocation(id, fallbackName = '') {
-    const r = id ? rooms.value.find(item => String(item.id) === String(id)) : null;
+    const r = id ? roomMap.value.get(String(id)) : null;
     const name = String(r?.name || fallbackName || '').trim();
     const lower = name.toLowerCase();
     if (lower.includes('садов') || lower.startsWith('с-')) {
@@ -153,20 +248,27 @@ export function useScheduleData() {
 
   function getPeriodTime(periodNumber, opts = {}) {
     const idx = Number(periodNumber) - 1;
-    const { groupId, dayIndex } = opts;
-    if (groupId && dayIndex !== null && dayIndex !== undefined) {
-      const g = groups.value.find(item => String(item.id) === String(groupId));
-      const custom = g?.dayPeriodTimes?.[String(dayIndex)] || g?.dayPeriodTimes?.[dayIndex];
-      if (Array.isArray(custom) && custom[idx]) return custom[idx];
+    const { groupId, dayIndex, dateStr, roomId, weekNum } = opts;
+    const cfg = semesterConfig.value || {};
+    if (dateStr && (cfg.shortenedDates || []).includes(dateStr) && cfg.shortenedPeriodTimes?.[idx]) {
+      return cfg.shortenedPeriodTimes[idx];
     }
-    const times = semesterConfig.value?.periodTimes || [];
-    if (times[idx]) return times[idx];
-    const defaults = ['08:30–10:00', '10:10–11:40', '11:50–13:20', '14:00–15:30', '15:40–17:10', '17:20–18:50', '19:00–20:30'];
-    return defaults[idx] || '';
+    const g = groupId ? groupMap.value.get(String(groupId)) : null;
+    const parity = resolveParity(cfg, weekNum || selectedWeek.value);
+    const custom = resolveGroupCustomTime(g, dayIndex, idx, parity);
+    if (custom) return custom;
+    if (roomId && getRoomLocation(roomId).includes('Вознесенский') && cfg.voznesenskyPeriodTimes?.[idx]) {
+      return cfg.voznesenskyPeriodTimes[idx];
+    }
+    return cfg.periodTimes?.[idx] || DEFAULT_TIMES[idx] || '';
   }
 
-  function findSubstitutionForLesson(instance, dayIndex, period) {
-    return substitutions.value.find(sub => matchSubWithLesson(sub, instance, dayIndex, period));
+  function findSubstitutionForLesson(instance, dateISO) {
+    if (instance?._isMovedSynthetic && instance?.substitution) {
+      return instance.substitution;
+    }
+    const dateSubs = substitutionsByDate.value.get(String(dateISO)) || [];
+    return dateSubs.find(sub => matchSubWithLesson(sub, instance, dateISO));
   }
 
   function updateSubstitutions(val) {
@@ -183,17 +285,27 @@ export function useScheduleData() {
     selectedWeek,
     groups,
     teachers,
+    departments,
     rooms,
+    roomTypes,
+    roomSizes,
     subjects,
     specialties,
     lessonTypes,
     substitutions,
+    announcements,
+    publicIntroText,
+    retakes,
+    practices,
+    publishedWeeks,
+    publicWeekSelectionEnabled,
     semesterConfig,
     loadPublicIndex,
     loadScheduleShard,
     getTeacherName,
     getSubjectName,
     getRoomName,
+    getRoomDetails,
     getRoomLocation,
     getGroupName,
     getLessonTypeName,

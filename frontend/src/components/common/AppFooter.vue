@@ -7,7 +7,7 @@
           <span class="footer-title">КТМУ · Расписание</span>
         </div>
         <p class="footer-desc">
-          Колледж туризма и медиатехнологий. Интерактивная система расписания.
+          Колледж технологии, моделирования и управления (СПбГУПТД). Интерактивная система расписания.
         </p>
         <span class="footer-copy">© 2026 Все права защищены</span>
       </div>
@@ -16,11 +16,13 @@
         <button
           type="button"
           class="admin-entry-btn"
-          :title="isAdmin ? 'Перейти в кабинет составителя' : 'Вход в панель управления для составителей'"
-          @click="$emit('open-admin')"
+          title="Открыть окно авторизации составителя расписания"
+          @click="goToAdmin"
         >
-          <span class="admin-key-icon">🔐</span>
-          <span>{{ isAdmin ? 'Кабинет составителя (Админ)' : 'Войти (Админ)' }}</span>
+          <svg class="admin-key-svg" viewBox="0 0 16 16" width="13" height="13" fill="currentColor" aria-hidden="true">
+            <path d="M8 1a2 2 0 0 1 2 2v4H6V3a2 2 0 0 1 2-2zm3 6V3a3 3 0 0 0-6 0v4a2 2 0 0 0-2 2v5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2z"/>
+          </svg>
+          <span>Кабинет составителя (Админ)</span>
         </button>
       </div>
     </div>
@@ -28,11 +30,22 @@
 </template>
 
 <script setup>
-defineProps({
+const props = defineProps({
   isAdmin: { type: Boolean, default: false }
 });
 
-defineEmits(['open-admin']);
+const emit = defineEmits(['open-admin']);
+
+/**
+ * Открывает окно авторизации или переходит в админку при активной сессии.
+ */
+function goToAdmin() {
+  if (props.isAdmin) {
+    window.location.href = '/admin';
+  } else {
+    emit('open-admin');
+  }
+}
 </script>
 
 <style scoped>
@@ -127,8 +140,9 @@ defineEmits(['open-admin']);
   transform: translateY(0);
 }
 
-.admin-key-icon {
-  font-size: 14px;
+.admin-key-svg {
+  color: var(--blue-700);
+  flex-shrink: 0;
 }
 
 @media (max-width: 768px) {

@@ -21,7 +21,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 # Публичные GET не содержат рабочего проекта, учётных записей и резервных копий.
 PUBLIC_GET = frozenset({"public_control_status", "public_index", "public_status",
     "public_room_availability", "public_schedule_shard", "public_bootstrap", "app_build"})
-AUTH_ENDPOINTS = frozenset({"auth_session", "auth_login", "auth_logout", "auth_setup"})
+AUTH_ENDPOINTS = frozenset({"auth_session", "auth_me", "auth_login", "auth_logout", "auth_setup"})
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 LOGIN_WINDOW = 900  # Окно в секундах; ограничитель рассчитан на один production worker.
 LOGIN_ATTEMPTS = 10
@@ -231,15 +231,43 @@ def guard_api(read_users):
     return None
 
 
+from flask.sessions import SecureCookieSessionInterface
+
+
+class DynamicSessionInterface(SecureCookieSessionInterface):
+    """Динамически снимает Secure с cookie при обращении по HTTP к локальным IP (LAN/Wi-Fi)."""
+
+    def get_cookie_secure(self, app):
+        env = os.environ.get("AUTH_COOKIE_SECURE")
+        if env is not None:
+            return env != "0"
+        try:
+            if request and (request.is_secure or request.scheme == "https"):
+                return True
+            host = (request.host if request else "").split(":")[0].lower()
+            if host in {"localhost", "127.0.0.1", "testclient"}:
+                return True
+            return False
+        except Exception:
+            return True
+
+
 def install_auth(app, data_dir, read_users, update_users, lock):
     """Настраивает cookie и маршруты с callbacks для атомарного хранилища."""
     app.secret_key = session_key(data_dir)
+    app.session_interface = DynamicSessionInterface()
     app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_REQUEST_BYTES", 128 * 1024 * 1024))
-    app.config.update(SESSION_COOKIE_NAME="timetable_session", SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Strict", SESSION_COOKIE_SECURE=os.environ.get("AUTH_COOKIE_SECURE", "1") != "0",
-        PERMANENT_SESSION_LIFETIME=timedelta(hours=12), SESSION_REFRESH_EACH_REQUEST=False)
+    app.config.update(
+        SESSION_COOKIE_NAME="timetable_session",
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Strict",
+        SESSION_COOKIE_SECURE=os.environ.get("AUTH_COOKIE_SECURE", "1") != "0",
+        PERMANENT_SESSION_LIFETIME=timedelta(hours=12),
+        SESSION_REFRESH_EACH_REQUEST=False
+    )
     app.before_request(lambda: guard_api(read_users))
     app.add_url_rule("/api/auth/session", "auth_session", lambda: session_response(read_users))
+    app.add_url_rule("/api/auth/me", "auth_me", lambda: session_response(read_users))
     app.add_url_rule("/api/auth/login", "auth_login", lambda: login_response(read_users, update_users, lock), methods=["POST"])
     app.add_url_rule("/api/auth/logout", "auth_logout", logout_response, methods=["POST"])
     app.add_url_rule("/api/auth/setup", "auth_setup", lambda: setup_response(read_users, update_users, lock), methods=["POST"])
@@ -260,7 +288,8 @@ def login_response(read_users, update_users, lock):
     if not login_allowed():
         return jsonify(error="Слишком много попыток входа; повторите через 15 минут"), 429
     body = json_body()
-    login, password = body.get("login", "").strip().casefold(), body.get("password", "")
+    login = (body.get("login") or body.get("username") or "").strip().casefold()
+    password = body.get("password", "")
     with lock:
         users = read_users()
         user = next((u for u in users if str(u.get("login", "")).casefold() == login), None)

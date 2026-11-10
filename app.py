@@ -14,7 +14,6 @@ import tempfile
 import select
 import sqlite3
 from pg_compat import pg_connect, pg_storage_exists
-import auth_store
 import re
 from collections import OrderedDict
 from datetime import datetime
@@ -348,7 +347,7 @@ PUBLIC_SHARD_CACHE_MAX = int(os.environ.get("PUBLIC_SHARD_CACHE_MAX", "16"))
 # v1870: shard schema is independent from the publication marker. A deploy that
 # fixes shard selection must be able to rebuild lazy public files from the SAME
 # publishedSnapshot without forcing staff to republish the timetable.
-PUBLIC_SHARD_SCHEMA_VERSION = 1894
+PUBLIC_SHARD_SCHEMA_VERSION = 1895
 PUBLIC_INDEX_SCHEMA_VERSION = 1871
 
 
@@ -912,10 +911,12 @@ def _canonical_public_inst_id(value):
     """Stable identity shared by working and week-publication occurrence ids."""
     import re
     sid = str(value or "")
-    # Week publication may wrap an already published occurrence more than once.
-    # Always compare the original working id, not the disposable __PUBW suffix.
-    while re.search(r"__PUBW\d+$", sid, flags=re.I):
-        sid = re.sub(r"__PUBW\d+$", "", sid, flags=re.I)
+    rx = re.compile(
+        r"__(?:PUBW\d+(?:_\d+)*|EXACT_W\d+(?:_\d+)*|TRANSFER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|CANONICAL_RECOVER_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*|REMOTE_ONE_[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*)$",
+        re.IGNORECASE,
+    )
+    while rx.search(sid):
+        sid = rx.sub("", sid)
     return sid
 
 
@@ -1180,89 +1181,111 @@ def _trim_instance_to_public_weeks(project, inst):
     return out
 
 
+def _public_sub_direct_matches(sub, kind, entity_id):
+    """Direct identity matching from substitution fields."""
+    eid = str(entity_id or "")
+    if not eid or not isinstance(sub, dict):
+        return False
+    if kind == "group":
+        return eid in {str(sub.get("groupId") or ""), str(sub.get("importGroupId") or "")}
+    if kind == "teacher":
+        return eid in {
+            str(sub.get("newTeacherId") or ""), str(sub.get("teacherId") or ""),
+            str(sub.get("importOldTeacherId") or ""), str(sub.get("importNewTeacherId") or "")
+        }
+    if kind == "room":
+        return eid in {
+            str(sub.get("newRoomId") or ""), str(sub.get("roomId") or ""),
+            str(sub.get("importNewRoom") or ""), str(sub.get("importOldRoom") or "")
+        }
+    return False
+
+
+def _public_sub_instance_matches(project, sub, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment):
+    """Instance identity matching by dereferencing substitution instId."""
+    eid = str(entity_id or "")
+    if not eid or not isinstance(sub, dict):
+        return False
+    sid = str(sub.get("instId") or sub.get("sourceInstId") or sub.get("originalInstId") or "")
+    inst = inst_by_id.get(sid) or inst_by_can.get(_canonical_public_inst_id(sid))
+    if not isinstance(inst, dict):
+        return False
+    if kind == "group":
+        return eid in _instance_group_ids(inst)
+    if kind == "teacher":
+        return eid in _public_instance_teacher_ids(project, inst, loads_by_id)
+    if kind == "room":
+        iid = str(inst.get("instId") or "")
+        a = (assignment.get(iid) if isinstance(assignment, dict) else {}) or {}
+        rids = {str(inst.get("roomId") or ""), str(inst.get("dedicatedRoomId") or ""), str(a.get("roomId") or "")} - {""}
+        return eid in rids
+    return False
+
+
+def _public_substitution_matches_entity(project, sub, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment):
+    """Checks whether a substitution belongs to a group, teacher, or room."""
+    if _public_sub_direct_matches(sub, kind, entity_id):
+        return True
+    return _public_sub_instance_matches(project, sub, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment)
+
+
+def _collect_entity_sub_support_ids(project, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment):
+    """Collects source instance IDs for all substitutions touching this entity."""
+    support_ids = set()
+    for sub in (project.get("substitutions") or []):
+        if not isinstance(sub, dict):
+            continue
+        if _public_substitution_matches_entity(project, sub, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment):
+            support_ids.update(_public_substitution_source_ids(sub))
+    return support_ids
+
+
+def _filter_raw_instances(project, instances, kind, entity_id, loads_by_id, assignment, extra_support_ids):
+    """Selects raw instances belonging directly to entity or required as substitution support."""
+    chosen = []
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        is_support = bool(_public_instance_identity_ids(inst).intersection(extra_support_ids))
+        if is_support:
+            chosen.append(inst)
+            continue
+        if kind == "group" and entity_id in _instance_group_ids(inst):
+            chosen.append(inst)
+        elif kind == "teacher" and entity_id in _public_instance_teacher_ids(project, inst, loads_by_id):
+            chosen.append(inst)
+        elif kind == "room":
+            iid = str(inst.get("instId") or "")
+            a = (assignment.get(iid) if iid else {}) or {}
+            rids = {str(inst.get("roomId") or ""), str(inst.get("dedicatedRoomId") or ""), str(a.get("roomId") or "")} - {""}
+            if entity_id in rids:
+                chosen.append(inst)
+    return chosen
+
+
 def _build_public_schedule_shard(project, kind, entity_id):
     schedule = project.get("schedule") if isinstance(project.get("schedule"), dict) else {}
     instances = schedule.get("instances") if isinstance(schedule.get("instances"), list) else []
     entity_id = str(entity_id or "")
-    loads_by_id = {
-        str(row.get("id") or row.get("loadId") or ""): row
-        for row in (project.get("loads") or [])
-        if isinstance(row, dict) and str(row.get("id") or row.get("loadId") or "")
-    }
-    if kind == "group":
-        raw_chosen = [inst for inst in instances if entity_id in _instance_group_ids(inst)]
-    elif kind == "teacher":
-        # Original teacher's instances plus source instances needed to render
-        # moved/substitute lessons assigned to this teacher. v1870 resolves the
-        # teacher from authoritative loadIds too; raw instance.teacherId can be
-        # stale after graph/stream operations even while the group card is valid.
-        incoming_subs = [
-            sub for sub in (project.get("substitutions") or [])
-            if isinstance(sub, dict) and _substitution_targets_teacher(sub, entity_id)
-        ]
-        extra_inst_ids = set()
-        for sub in incoming_subs:
-            extra_inst_ids.update(_public_substitution_source_ids(sub))
-        raw_chosen = [
-            inst for inst in instances
-            if entity_id in _public_instance_teacher_ids(project, inst, loads_by_id)
-            # v1890: replacement receiver must see the source occurrence even when
-            # the public week id has been rewritten one or more times.
-            or bool(_public_instance_identity_ids(inst).intersection(extra_inst_ids))
-        ]
-    elif kind == "room":
-        # v1864: public room timetable. Include lessons whose base assignment
-        # uses the room, plus source lessons moved/reassigned INTO this room by
-        # a date substitution. The client applies the overlay for the concrete
-        # date, so a lesson reassigned away from this room is not shown as busy.
-        assignment = schedule.get("assignment") if isinstance(schedule.get("assignment"), dict) else {}
-        extra_inst_ids = set()
-        for sub in (project.get("substitutions") or []):
-            if not isinstance(sub, dict) or str(sub.get("newRoomId") or "") != entity_id:
-                continue
-            extra_inst_ids.update(_public_substitution_source_ids(sub))
-        raw_chosen = []
-        for inst in instances:
-            if not isinstance(inst, dict):
-                continue
-            iid = str(inst.get("instId") or "")
-            a = assignment.get(iid) if iid else None
-            room_ids = set()
-            if isinstance(a, dict):
-                for key in ("roomId", "extraRoomId"):
-                    if a.get(key):
-                        room_ids.add(str(a.get(key)))
-                for key in ("roomIds", "additionalRoomIds", "extraRoomIds"):
-                    for item in (a.get(key) or []):
-                        if isinstance(item, dict):
-                            rid = item.get("roomId") or item.get("id")
-                        else:
-                            rid = item
-                        if rid:
-                            room_ids.add(str(rid))
-            if (entity_id in room_ids
-                or bool(_public_instance_identity_ids(inst).intersection(extra_inst_ids))):
-                raw_chosen.append(inst)
-    else:
-        raw_chosen = []
+    loads_by_id = {str(r.get("id") or r.get("loadId") or ""): r for r in (project.get("loads") or []) if isinstance(r, dict)}
+    inst_by_id = {str(i.get("instId")): i for i in instances if isinstance(i, dict) and i.get("instId")}
+    inst_by_can = {_canonical_public_inst_id(i.get("instId")): i for i in instances if isinstance(i, dict) and i.get("instId")}
+    assignment = schedule.get("assignment") if isinstance(schedule.get("assignment"), dict) else {}
+    extra_support_ids = _collect_entity_sub_support_ids(project, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment)
+    raw_chosen = _filter_raw_instances(project, instances, kind, entity_id, loads_by_id, assignment, extra_support_ids)
     chosen = []
     for inst in raw_chosen:
-        trimmed = _trim_instance_to_public_weeks(project, inst)
+        is_support = bool(_public_instance_identity_ids(inst).intersection(extra_support_ids))
+        trimmed = inst if is_support else _trim_instance_to_public_weeks(project, inst)
         if trimmed is not None:
             if kind == "teacher":
-                # Shard-only compatibility metadata. Do not mutate the published
-                # snapshot; merely make every resolved teacher identity visible to
-                # the client before enrichInstanceStreamGroups() runs.
                 trimmed = dict(trimmed)
                 resolved = _public_instance_teacher_ids(project, inst, loads_by_id)
                 existing = [str(x) for x in (trimmed.get("teacherIds") or []) if str(x)]
                 trimmed["teacherIds"] = list(dict.fromkeys(existing + sorted(resolved)))
             chosen.append(trimmed)
     ids = {str(inst.get("instId")) for inst in chosen if isinstance(inst, dict) and inst.get("instId")}
-    assignment = schedule.get("assignment") if isinstance(schedule.get("assignment"), dict) else {}
     locked = schedule.get("locked") or []
-    # Public rendering only consumes these schedule fields. Keep any harmless
-    # scalar metadata, but never ship other groups' instances/assignments.
     out = {k: v for k, v in schedule.items() if k not in {"instances", "assignment", "locked", "unplaced"}}
     out["instances"] = chosen
     out["assignment"] = {iid: assignment[iid] for iid in ids if iid in assignment}
@@ -1271,54 +1294,66 @@ def _build_public_schedule_shard(project, kind, entity_id):
     return out
 
 
-
-def _public_entity_data_patch(project, chosen_instances):
-    """Only heavy dictionaries referenced by one public entity."""
-    chosen_instances = [x for x in (chosen_instances or []) if isinstance(x, dict)]
-    inst_ids = set()
-    for inst in chosen_instances:
-        inst_ids.update(_public_instance_identity_ids(inst))
-    load_ids = set()
-    group_ids = set()
-    teacher_ids = set()
+def _collect_patch_group_teacher_room_ids(chosen_instances, kind, entity_id):
+    """Collects all group, teacher, and room identities touched by chosen instances."""
+    gids = set([str(entity_id)]) if kind == "group" and entity_id else set()
+    tids = set([str(entity_id)]) if kind == "teacher" and entity_id else set()
+    rids = set([str(entity_id)]) if kind == "room" and entity_id else set()
+    lids = set()
     for inst in chosen_instances:
         if inst.get("loadId"):
-            load_ids.add(str(inst.get("loadId")))
-        # v1891: retain load rows for EVERY participant of a public stream.
-        # Older stream cards can carry secondary groups only in groupIds, and
-        # dropping those rows makes student/teacher shards collapse to primary.
-        group_ids.update(_instance_group_ids(inst))
+            lids.add(str(inst.get("loadId")))
+        gids.update(_instance_group_ids(inst))
         if inst.get("teacherId"):
-            teacher_ids.add(str(inst.get("teacherId")))
+            tids.add(str(inst.get("teacherId")))
+        if inst.get("roomId"):
+            rids.add(str(inst.get("roomId")))
+        if inst.get("dedicatedRoomId"):
+            rids.add(str(inst.get("dedicatedRoomId")))
         for tid in (inst.get("teacherIds") or []):
             if tid:
-                teacher_ids.add(str(tid))
-        for part in (inst.get("streamParticipants") or []):
-            if isinstance(part, dict):
-                if part.get("loadId"):
-                    load_ids.add(str(part.get("loadId")))
-                if part.get("groupId"):
-                    group_ids.add(str(part.get("groupId")))
-                if part.get("teacherId"):
-                    teacher_ids.add(str(part.get("teacherId")))
-    loads = []
-    for row in (project.get("loads") or []):
+                tids.add(str(tid))
+    return gids, tids, rids, lids
+
+
+def _sub_matches_patch_ids(row, gids, tids, rids):
+    """Checks if substitution directly references any group, teacher, or room id."""
+    if str(row.get("groupId") or "") in gids or str(row.get("importGroupId") or "") in gids:
+        return True
+    for k in ("teacherId", "newTeacherId", "importOldTeacherId", "importNewTeacherId"):
+        if str(row.get(k) or "") in tids:
+            return True
+    for k in ("roomId", "newRoomId", "importOldRoom", "importNewRoom"):
+        if str(row.get(k) or "") in rids:
+            return True
+    return False
+
+
+def _public_entity_data_patch(project, chosen_instances, kind=None, entity_id=None):
+    """Only heavy dictionaries referenced by one public entity."""
+    chosen = [x for x in (chosen_instances or []) if isinstance(x, dict)]
+    inst_ids = set()
+    for inst in chosen:
+        inst_ids.update(_public_instance_identity_ids(inst))
+    gids, tids, rids, lids = _collect_patch_group_teacher_room_ids(chosen, kind, entity_id)
+    loads = [row for row in (project.get("loads") or []) if isinstance(row, dict) and (
+        str(row.get("id") or row.get("loadId") or "") in lids or str(row.get("groupId") or "") in gids or str(row.get("teacherId") or "") in tids
+    )]
+    schedule = project.get("schedule") if isinstance(project.get("schedule"), dict) else {}
+    instances = schedule.get("instances") if isinstance(schedule.get("instances"), list) else []
+    inst_by_id = {str(i.get("instId")): i for i in instances if isinstance(i, dict) and i.get("instId")}
+    inst_by_can = {_canonical_public_inst_id(i.get("instId")): i for i in instances if isinstance(i, dict) and i.get("instId")}
+    loads_by_id = {str(r.get("id") or r.get("loadId") or ""): r for r in loads}
+    assignment = schedule.get("assignment") if isinstance(schedule.get("assignment"), dict) else {}
+    substitutions = []
+    for row in (project.get("substitutions") or []):
         if not isinstance(row, dict):
             continue
-        rid = str(row.get("id") or row.get("loadId") or "")
-        # Old/generated instances can miss loadId. In that case retain the small
-        # set of rows belonging to one of the shard's actual groups/teachers.
-        if rid in load_ids or str(row.get("groupId") or "") in group_ids or str(row.get("teacherId") or "") in teacher_ids:
-            loads.append(row)
-    substitutions = [
-        row for row in (project.get("substitutions") or [])
-        if isinstance(row, dict) and (
-            bool(_public_substitution_source_ids(row).intersection(inst_ids))
-            or str(row.get("groupId") or "") in group_ids
-            or str(row.get("teacherId") or "") in teacher_ids
-            or str(row.get("newTeacherId") or "") in teacher_ids
-        )
-    ]
+        m_entity = _public_substitution_matches_entity(project, row, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment)
+        m_inst = bool(_public_substitution_source_ids(row).intersection(inst_ids))
+        m_patch = _sub_matches_patch_ids(row, gids, tids, rids)
+        if m_entity or m_inst or m_patch:
+            substitutions.append(row)
     return {"loads": loads, "substitutions": substitutions}
 
 
@@ -1351,7 +1386,7 @@ def _public_schedule_shard_for_week(project, schedule, week_number):
         semester_monday = None
     if semester_monday is not None:
         for sub in (project.get("substitutions") or []):
-            if not isinstance(sub, dict) or str(sub.get("type") or "") != "moved":
+            if not isinstance(sub, dict) or str(sub.get("type") or "") not in {"moved", "excursion"}:
                 continue
             target_date = str(sub.get("targetDate") or "")
             try:
@@ -1592,7 +1627,7 @@ def _prebuild_public_snapshot_shards(project, marker, change=None):
         if rebuild_semester:
             full_payload = {
                 "schedule": full_schedule,
-                "dataPatch": _public_entity_data_patch(source, full_instances),
+                "dataPatch": _public_entity_data_patch(source, full_instances, kind, entity_id),
                 "marker": marker, "kind": kind, "id": entity_id, "scope": "semester",
             }
             _write_public_shard_file(os.path.join(entity_dir, "semester.json"), full_payload)
@@ -1604,7 +1639,7 @@ def _prebuild_public_snapshot_shards(project, marker, change=None):
             week_instances = week_schedule.get("instances") or []
             week_payload = {
                 "schedule": week_schedule,
-                "dataPatch": _public_entity_data_patch(source, week_instances),
+                "dataPatch": _public_entity_data_patch(source, week_instances, kind, entity_id),
                 "marker": marker, "kind": kind, "id": entity_id, "scope": "week", "week": week,
             }
             _write_public_shard_file(os.path.join(entity_dir, f"week-{week}.json"), week_payload)
@@ -1808,7 +1843,7 @@ def _ensure_public_shard_on_demand(kind, entity_id, scope="semester", week=0, _r
                 instances = schedule.get("instances") or []
                 payload = {
                     "schedule": schedule,
-                    "dataPatch": _public_entity_data_patch(project, instances),
+                    "dataPatch": _public_entity_data_patch(project, instances, kind, str(entity_id)),
                     "marker": marker,
                     "kind": kind,
                     "id": str(entity_id),
@@ -2253,7 +2288,7 @@ def load_store():
     # All application writes go through save_store(), which refreshes this cache.
     # On process start the cache is empty and SQLite is read once.
     if _store_cache.get("store") is not None:
-        return _auth_overlay_store_for_request(dict(_store_cache["store"]))
+        return dict(_store_cache["store"])
     conn = _sqlite_connect()
     try:
         rows = conn.execute("SELECT key, value_json FROM kv_store").fetchall()
@@ -2273,7 +2308,7 @@ def load_store():
         parsed = _replace_sqlite_store(parsed, durable=True)
     _store_cache["mtime"] = None
     _store_cache["store"] = parsed
-    return _auth_overlay_store_for_request(dict(parsed))
+    return dict(parsed)
 
 def _is_valid_working_value(value):
     """Рабочее расписание не может быть null/пустой строкой/пустым объектом."""
@@ -2407,10 +2442,6 @@ def _replace_sqlite_store(store, durable=True):
                 "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
                 (str(key), payload, now),
             )
-        # User-management changes are committed with the matching project JSON.
-        # Ordinary schedule saves do not touch the small credentials table.
-        if USE_POSTGRES and has_request_context() and getattr(g, "auth_users_write", None) is not None:
-            auth_store.write_users_in_transaction(conn, g.auth_users_write)
         conn.commit()
         return compacted_store
     except Exception:
@@ -2485,8 +2516,6 @@ def _save_store_key_fast(key, value, durable=False, revision_map=None, revision_
             "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
             (str(key), payload, now),
         )
-        if USE_POSTGRES and has_request_context() and getattr(g, "auth_users_write", None) is not None:
-            auth_store.write_users_in_transaction(conn, g.auth_users_write)
         if revision_map:
             try:
                 for sid, revision in revision_map.items():
@@ -2627,31 +2656,6 @@ APP_BUILD_ID = _compute_app_build_id()
 app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
 
 
-# A failed database connection is a temporary outage, NOT an empty user list.
-# Keep authentication/API responses machine-readable and never expose DB secrets.
-@app.errorhandler(sqlite3.OperationalError)
-def _sqlite_unavailable(exc):
-    app.logger.error("storage operation failed for %s: %s", request.path, type(exc).__name__)
-    response = jsonify(error="Не удалось подключиться к хранилищу PostgreSQL/SQLite. Проверьте доступность базы в Timeweb; существующие данные не изменены.", code="STORAGE_UNAVAILABLE", retryable=True)
-    response.headers["Retry-After"] = "5"
-    return response, 503
-
-try:
-    from psycopg import OperationalError as _PgOperationalError
-except ImportError:
-    _PgOperationalError = None
-if _PgOperationalError is not None:
-    app.register_error_handler(_PgOperationalError, _sqlite_unavailable)
-
-@app.errorhandler(auth_store.AuthDataError)
-def _auth_data_unavailable(exc):
-    app.logger.error("account migration unavailable: %s", type(exc).__name__)
-    response = jsonify(error="Учётные записи пока не перенесены. Не создавайте новую базу; проверьте PostgreSQL и журналы сервера.", code="AUTH_MIGRATION_UNAVAILABLE", retryable=False)
-    response.headers["Cache-Control"] = "no-store"
-    return response, 503
-
-
-
 def _auth_project(store):
     """Читает рабочий проект без изменения ссылок кеша хранилища."""
     raw = store.get("schedule-data-v2")
@@ -2659,25 +2663,12 @@ def _auth_project(store):
 
 
 def _auth_read_users():
-    """Читайте только credentials: не загружайте большой проект при каждом API.
-
-    Ошибка PostgreSQL НЕ трактуется как пустая база: иначе экран может
-    ошибочно предложить создать нового администратора.
-    """
-    return copy.deepcopy(_auth_current_users())
+    """Выдаёт отдельную копию учётных записей для проверки и изменения пароля."""
+    return copy.deepcopy(_auth_project(load_store()).get("users") or [])
 
 
 def _auth_update_users(users):
-    """Password upgrades/changes on PostgreSQL never rewrite timetable JSON.
-
-    Existing project JSON remains backward-compatible. The editor gets current
-    identities from auth_user_store, so stale passwords in old snapshots can
-    never authorize a login or overwrite a fresh server-side password.
-    """
-    if USE_POSTGRES:
-        import psycopg
-        auth_store.write_users(os.environ["DATABASE_URL"], psycopg.connect, users)
-        return
+    """Пишет проверенное сервером изменение пользователей под общей блокировкой."""
     store = load_store()
     project = dict(_auth_project(store))
     project["users"] = users
@@ -2690,74 +2681,23 @@ def _auth_update_users(users):
 
 
 def _auth_current_users():
-    """One small Postgres row per request; no JSONB conversion of timetable."""
-    if USE_POSTGRES:
-        import psycopg
-        return auth_store.read_users(os.environ["DATABASE_URL"], psycopg.connect)
-
-    if not os.path.exists(SQLITE_PATH):
-        if os.path.exists(LEGACY_DATA_FILE):
-            return (_auth_project(load_store()).get("users") or [])
+    """Читает свежие credentials проекцией JSON, не передавая большой проект."""
+    if not _storage_exists():
         return []
-    # SQLite has native json_extract: only the tiny users JSON is returned.
-    with sqlite3.connect(SQLITE_PATH, timeout=5) as conn:
-        row = conn.execute(
-            "SELECT json_extract(value_json, '$.users') FROM kv_store WHERE key=?",
-            ("schedule-data-v2",),
-        ).fetchone()
+    conn = _sqlite_connect()
+    try:
+        projection = "(value_json::jsonb -> 'users')::text" if USE_POSTGRES else "json_extract(value_json, '$.users')"
+        row = conn.execute(f"SELECT {projection} FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
         if row and row[0] is not None:
-            users = json.loads(row[0])
-            return users if isinstance(users, list) else []
-        legacy = conn.execute(
-            "SELECT value_json FROM kv_store WHERE key=?", ("schedule-data-v2",),
-        ).fetchone()
-        if not legacy:
-            return []
-        project = json.loads(legacy[0])
+            return json.loads(row[0]) or []
+        # Старый формат содержит JSON-строку внутри value_json, а не объект.
+        row = conn.execute("SELECT value_json FROM kv_store WHERE key=?", ("schedule-data-v2",)).fetchone()
+        project = json.loads(row[0]) if row else {}
         project = json.loads(project) if isinstance(project, str) else project
-        return (project.get("users") or []) if isinstance(project, dict) else []
+        return project.get("users") or []
+    finally:
+        conn.close()
 
-
-def _auth_merge_existing_hashes(incoming, existing):
-    """Credentials table wins over stale hashes in the legacy JSON snapshot."""
-    if not isinstance(incoming, list):
-        return incoming
-    identities = {str(u.get("id")): u for u in existing if isinstance(u, dict)}
-    by_login = {str(u.get("login", "")).casefold(): u for u in existing if isinstance(u, dict)}
-    out = []
-    for candidate in incoming:
-        if not isinstance(candidate, dict):
-            out.append(candidate)
-            continue
-        candidate = dict(candidate)
-        previous = identities.get(str(candidate.get("id"))) or by_login.get(str(candidate.get("login", "")).casefold())
-        if previous and previous.get("passwordHash"):
-            candidate["passwordHash"] = previous["passwordHash"]
-        out.append(candidate)
-    return out
-
-
-def _auth_visible_project(project):
-    """Overlay current accounts in responses without modifying the global cache."""
-    if not USE_POSTGRES or not isinstance(project, dict) or not has_request_context():
-        return project
-    users = getattr(g, "auth_users", None)
-    if users is None:
-        return project
-    return {**project, "users": copy.deepcopy(users)}
-
-
-def _auth_overlay_store_for_request(store):
-    """Keep stale project snapshots from replacing roles or password hashes.
-
-    Project and cached objects are copied shallowly: the large schedule remains
-    shared and is not serialized or duplicated to serve one small user list.
-    """
-    if USE_POSTGRES and "schedule-data-v2" in store:
-        original = store["schedule-data-v2"]
-        if isinstance(original, dict):
-            store["schedule-data-v2"] = _auth_visible_project(original)
-    return store
 
 def _validate_user_edit(incoming, existing, baseline):
     """Разрешает явное управление пользователями только актуальному superadmin."""
@@ -2768,49 +2708,28 @@ def _validate_user_edit(incoming, existing, baseline):
         raise Conflict("Учётные записи изменились; обновите страницу")
     if not isinstance(incoming, list) or not all(isinstance(u, dict) for u in incoming):
         raise Forbidden("Неверный список пользователей")
-    ids, logins = set(), set()
-    for user in incoming:
-        uid = str(user.get("id") or "").strip()
-        login = str(user.get("login") or "").strip().casefold()
-        if not uid or not login or user.get("role") not in {"admin", "superadmin"}:
-            raise Forbidden("У пользователя должны быть ID, логин и допустимая роль")
-        if uid in ids or login in logins:
-            raise Forbidden("Повторяются ID или логин учётной записи")
-        if not str(user.get("passwordHash") or ""):
-            raise Forbidden("У учётной записи отсутствует пароль")
-        ids.add(uid)
-        logins.add(login)
     if not any(u.get("role") == "superadmin" for u in incoming):
         raise Forbidden("Нельзя удалить последнего главного администратора")
 
 
 def _authorize_user_changes(store):
-    """Authorize explicit user edits and preserve server credentials on autosave.
-
-    The separate PostgreSQL row is authoritative. Stale editor snapshots may
-    include old password hashes; those are always replaced with fresh values.
-    Account-list edits are staged for the *same transaction* as the project.
-    """
+    """Сохраняет свежие пароли при запоздавшем autosave и проверяет смену ролей."""
     if not has_request_context() or getattr(g, "auth_internal_write", False):
         return store
     existing = _auth_current_users()
     baseline = getattr(g, "auth_users", existing)
     project = _auth_project(store)
-    incoming = _auth_merge_existing_hashes(project.get("users") or [], existing)
+    incoming = project.get("users") or []
     if incoming != baseline:
         try:
             _validate_user_edit(incoming, existing, baseline)
         except Exception:
             _invalidate_store_cache()
             raise
-        if USE_POSTGRES:
-            g.auth_users_write = copy.deepcopy(incoming)
     else:
-        if USE_POSTGRES:
-            g.auth_users_write = None
-    project = dict(project)
-    project["users"] = incoming if incoming != baseline else existing
-    store["schedule-data-v2"] = project
+        project = dict(project)
+        project["users"] = existing
+        store["schedule-data-v2"] = project
     return store
 
 
@@ -2824,7 +2743,6 @@ def _editor_read_project(key):
         return None
     raw = store[key]
     project = json.loads(raw) if isinstance(raw, str) else raw
-    project = _auth_visible_project(project) if key == "schedule-data-v2" else project
     conn = _sqlite_connect()
     try:
         row = conn.execute("SELECT updated_at FROM kv_store WHERE key=?", (key,)).fetchone()
@@ -2885,7 +2803,6 @@ def editor_export(key):
         portable = _store_with_snapshots_for_backup(store)
         raw = portable[key]
         project = json.loads(raw) if isinstance(raw, str) else raw
-        project = _auth_visible_project(project) if key == "schedule-data-v2" else project
         if isinstance(project, dict) and "users" in project:
             from editor_transport import sanitize_users
             project = dict(project)
@@ -2959,7 +2876,6 @@ def get_key(key):
     if key == "schedule-data-v2" and request.args.get("editor") == "1":
         try:
             parsed = json.loads(value) if isinstance(value, str) else value
-            parsed = _auth_visible_project(parsed)
             # v1758: revisions are transport metadata, not part of the project JSON.
             # Existing exports/backups/publication formats therefore remain unchanged.
             return jsonify({
@@ -2969,9 +2885,18 @@ def get_key(key):
             })
         except Exception:
             pass
+
     if key == "schedule-data-v2":
-        parsed = json.loads(value) if isinstance(value, str) else value
-        value = _auth_visible_project(parsed)
+        try:
+            parsed = json.loads(value) if isinstance(value, str) else value
+            if isinstance(parsed, dict) and "users" in parsed:
+                from editor_transport import sanitize_users
+                parsed = dict(parsed)
+                parsed["users"] = sanitize_users(parsed.get("users") or [])
+                value = parsed
+        except Exception:
+            pass
+
     return jsonify({"key": key, "value": value})
 
 
@@ -3138,8 +3063,7 @@ def set_key(key):
                 if "schedule" in remote_existing and not allow_create:
                     incoming_value["schedule"] = remote_existing.get("schedule")
                 if "users" in incoming_value and "users" in remote_existing:
-                    canonical_users = _auth_current_users() if USE_POSTGRES else remote_existing["users"]
-                    incoming_value["users"] = merge_users_preserve_hashes(incoming_value["users"], canonical_users)
+                    incoming_value["users"] = merge_users_preserve_hashes(incoming_value["users"], remote_existing["users"])
         store[key] = incoming_value
         save_store(store)
     if raw_mode:
@@ -8326,6 +8250,7 @@ def _serve_spa_index():
 @app.get("/")
 @app.get("/group/<path:route_id>")
 @app.get("/teacher/<path:route_id>")
+@app.get("/room/<path:route_id>")
 @app.get("/admin")
 @app.get("/admin/<path:spa_path>")
 @app.get("/specialty/<path:route_id>")

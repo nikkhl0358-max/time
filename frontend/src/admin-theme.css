@@ -30,10 +30,38 @@
 /* 3D Стилизованный сайдбар */
 .sidebar {
   width: 236px !important;
+  max-height: 100vh !important;
+  height: 100vh !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior: contain !important;
+  scrollbar-width: thin !important;
+  scrollbar-color: rgba(255, 255, 255, 0.28) rgba(0, 0, 0, 0.25) !important;
   background: linear-gradient(180deg, #0B132B 0%, #111E38 100%) !important;
   border-right: 1px solid rgba(255, 255, 255, 0.08) !important;
   box-shadow: 4px 0 24px rgba(0, 0, 0, 0.08) !important;
   padding: 22px 14px !important;
+}
+
+.sidebar::-webkit-scrollbar {
+  width: 6px !important;
+}
+
+.sidebar::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.2) !important;
+}
+
+.sidebar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.28) !important;
+  border-radius: 4px !important;
+}
+
+.sidebar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.5) !important;
+}
+
+.sidebar-exit {
+  margin-top: 10px !important;
 }
 
 .brand {
