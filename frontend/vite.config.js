@@ -15,5 +15,13 @@ export default defineConfig({
   },
   build: {
     outDir: "dist",
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("xlsx-js-style")) return "vendor-xlsx";
+          if (id.includes("lucide-react")) return "vendor-lucide";
+        },
+      },
+    },
   },
 });

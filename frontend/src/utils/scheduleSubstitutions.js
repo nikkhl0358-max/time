@@ -43,8 +43,12 @@ export function subMatchesView(sub, inst, kind, viewId, loads = []) {
     return tids.includes(vid);
   }
   if (kind === 'room') {
-    if (sub?.newFormat === 'remote') return false;
-    const rids = [sub?.newRoomId, sub?.importNewRoom, inst?.roomId, inst?.dedicatedRoomId, sub?.importOldRoom, inst?.assignment?.roomId].filter(Boolean).map(String);
+    if (['remote', 'distance', 'dist'].includes(sub?.newFormat)) return false;
+    const isRemote = ['remote', 'distance', 'dist'].includes(inst?.format) || ['remote', 'distance', 'dist'].includes(load?.format);
+    if (isRemote && sub?.newFormat !== 'inperson' && !sub?.newRoomId && !sub?.importNewRoom) return false;
+    const assignedRoom = inst?.roomId || inst?.assignment?.roomId;
+    const dedicated = (!isRemote && !assignedRoom) ? inst?.dedicatedRoomId : null;
+    const rids = [sub?.newRoomId, sub?.importNewRoom, assignedRoom, dedicated, sub?.importOldRoom].filter(Boolean).map(String);
     return rids.includes(vid);
   }
   return true;

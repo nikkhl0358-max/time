@@ -6,7 +6,7 @@
         :class="['bell-tab-btn', { active: currentTab === 'standard' }]"
         @click="currentTab = 'standard'"
       >
-        🏛 Понедельник–суббота
+        🏛 Главный корпус
       </button>
       <button 
         type="button" 
@@ -20,7 +20,7 @@
         :class="['bell-tab-btn', { active: currentTab === 'short' }]"
         @click="currentTab = 'short'"
       >
-        ⏱ Сокращённые дни
+        ⏱ Сокращённый
       </button>
     </div>
 
@@ -56,12 +56,18 @@ const props = defineProps({
 
 const currentTab = ref('standard');
 
+function padTime(t) {
+  if (!t) return '';
+  const [h, m] = t.trim().split(':');
+  return `${h.padStart(2, '0')}:${m || '00'}`;
+}
+
 function parsePeriodString(str, periodNum) {
   if (!str) return null;
   const clean = String(str).replace('–', '-');
   const parts = clean.split('-').map(s => s.trim());
   if (parts.length < 2 || !parts[0] || !parts[1]) return null;
-  return { period: periodNum, start: parts[0], end: parts[1] };
+  return { period: periodNum, start: padTime(parts[0]), end: padTime(parts[1]) };
 }
 
 function parsePeriodList(list, fallback) {

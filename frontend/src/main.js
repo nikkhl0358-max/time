@@ -14,11 +14,12 @@ function isAdminRoute() {
 
 async function bootstrapApplication() {
   if (isAdminRoute()) {
+    const adminModulePromise = import("./mountAdmin.jsx");
     try {
       const res = await fetch("/api/auth/session");
       const data = res.ok ? await res.json() : null;
       if (data?.user) {
-        const m = await import("./mountAdmin.jsx");
+        const m = await adminModulePromise;
         m.mountAdmin();
         return;
       }

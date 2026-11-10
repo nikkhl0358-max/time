@@ -13,11 +13,12 @@ import hashlib
 import tempfile
 import select
 import sqlite3
+import mimetypes
 from pg_compat import pg_connect, pg_storage_exists
 import re
 from collections import OrderedDict
 from datetime import datetime
-from flask import Flask, request, jsonify, send_from_directory, Response, g, has_request_context, redirect
+from flask import Flask, request, jsonify, send_from_directory, send_file, Response, g, has_request_context, redirect
 from werkzeug.exceptions import Forbidden
 from auth import install_auth
 from editor_state import (
@@ -347,7 +348,7 @@ PUBLIC_SHARD_CACHE_MAX = int(os.environ.get("PUBLIC_SHARD_CACHE_MAX", "16"))
 # v1870: shard schema is independent from the publication marker. A deploy that
 # fixes shard selection must be able to rebuild lazy public files from the SAME
 # publishedSnapshot without forcing staff to republish the timetable.
-PUBLIC_SHARD_SCHEMA_VERSION = 1895
+PUBLIC_SHARD_SCHEMA_VERSION = 1896
 PUBLIC_INDEX_SCHEMA_VERSION = 1871
 
 
@@ -1201,6 +1202,18 @@ def _public_sub_direct_matches(sub, kind, entity_id):
     return False
 
 
+def _instance_room_ids(inst, assignment):
+    """Возвращает актуальные физические аудитории инстанса (дистант не занимает аудиторию)."""
+    if str(inst.get("format") or "inperson") in ("remote", "distance", "dist"):
+        return set()
+    iid = str(inst.get("instId") or "")
+    a = (assignment.get(iid) if isinstance(assignment, dict) else {}) or {}
+    assigned = {str(a.get("roomId") or inst.get("roomId") or ""), str(a.get("extraRoomId") or inst.get("extraRoomId") or "")} - {""}
+    if not assigned and inst.get("dedicatedRoomId"):
+        assigned.add(str(inst.get("dedicatedRoomId")))
+    return assigned
+
+
 def _public_sub_instance_matches(project, sub, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment):
     """Instance identity matching by dereferencing substitution instId."""
     eid = str(entity_id or "")
@@ -1215,10 +1228,10 @@ def _public_sub_instance_matches(project, sub, kind, entity_id, loads_by_id, ins
     if kind == "teacher":
         return eid in _public_instance_teacher_ids(project, inst, loads_by_id)
     if kind == "room":
-        iid = str(inst.get("instId") or "")
-        a = (assignment.get(iid) if isinstance(assignment, dict) else {}) or {}
-        rids = {str(inst.get("roomId") or ""), str(inst.get("dedicatedRoomId") or ""), str(a.get("roomId") or "")} - {""}
-        return eid in rids
+        if str(sub.get("newFormat") or "") in ("remote", "distance", "dist"):
+            return False
+        new_room = str(sub.get("newRoomId") or sub.get("importNewRoom") or "")
+        return eid == new_room if new_room else eid in _instance_room_ids(inst, assignment)
     return False
 
 
@@ -1254,12 +1267,8 @@ def _filter_raw_instances(project, instances, kind, entity_id, loads_by_id, assi
             chosen.append(inst)
         elif kind == "teacher" and entity_id in _public_instance_teacher_ids(project, inst, loads_by_id):
             chosen.append(inst)
-        elif kind == "room":
-            iid = str(inst.get("instId") or "")
-            a = (assignment.get(iid) if iid else {}) or {}
-            rids = {str(inst.get("roomId") or ""), str(inst.get("dedicatedRoomId") or ""), str(a.get("roomId") or "")} - {""}
-            if entity_id in rids:
-                chosen.append(inst)
+        elif kind == "room" and entity_id in _instance_room_ids(inst, assignment):
+            chosen.append(inst)
     return chosen
 
 
@@ -2653,7 +2662,7 @@ def _compute_app_build_id():
 
 APP_BUILD_ID = _compute_app_build_id()
 
-app = Flask(__name__, static_folder=STATIC_DIR, static_url_path="")
+app = Flask(__name__, static_folder=None)
 
 
 def _auth_project(store):
@@ -3236,7 +3245,9 @@ def public_room_availability():
         if actual_period != period:
             continue
         rids = room_ids(a)
-        if matching and matching.get("newFormat") == "remote":
+        if str(inst.get("format") or "inperson") in ("remote", "distance", "dist"):
+            rids = set()
+        if matching and matching.get("newFormat") in ("remote", "distance", "dist"):
             rids = set()
         elif matching and matching.get("newRoomId") and matching.get("type") != "join_subgroup":
             rids = {str(matching["newRoomId"])}
@@ -8244,8 +8255,48 @@ def storage_diagnostics():
 # Explicit client routes are registered in addition to the generic fallback.
 # This is deliberately separate from /api/* so a missing API endpoint still
 # returns a real 404 instead of HTML.
+def _guess_static_mimetype(filename):
+    """Определяет MIME-тип файла по его расширению для отдачи статики."""
+    ctype, _ = mimetypes.guess_type(filename)
+    if not ctype:
+        ext = os.path.splitext(filename)[1].lower()
+        mapping = {".js": "application/javascript", ".css": "text/css", ".svg": "image/svg+xml"}
+        return mapping.get(ext, "application/octet-stream")
+    return "application/javascript" if ctype in ("application/x-javascript", "text/javascript") else ctype
+
+
+def _serve_gzipped_or_plain(full_path, mimetype, is_immutable):
+    """Отдаёт предсжатый .gz файл при поддержке gzip клиентом, либо оригинал."""
+    gz_path = full_path + ".gz"
+    accepts_gzip = "gzip" in request.headers.get("Accept-Encoding", "").lower()
+    use_gz = accepts_gzip and os.path.exists(gz_path) and os.path.getsize(gz_path) > 0
+    target = gz_path if use_gz else full_path
+    resp = send_file(target, mimetype=mimetype, as_attachment=False)
+    if use_gz:
+        resp.headers["Content-Encoding"] = "gzip"
+        resp.headers["Vary"] = "Accept-Encoding"
+    cache = "public, max-age=31536000, immutable" if is_immutable else "no-cache"
+    resp.headers["Cache-Control"] = cache
+    return resp
+
+
+def _serve_static_path(path):
+    """Отдаёт статический файл с поддержкой gzip и долгосрочного кэширования для /assets."""
+    full = os.path.join(STATIC_DIR, path)
+    if not (path and os.path.exists(full) and os.path.isfile(full)):
+        return None
+    mimetype = _guess_static_mimetype(full)
+    is_asset = path.startswith("assets/")
+    return _serve_gzipped_or_plain(full, mimetype, is_asset)
+
+
 def _serve_spa_index():
-    return send_from_directory(STATIC_DIR, "index.html")
+    """Отдаёт корневой HTML приложения SPA без кэширования с поддержкой gzip."""
+    idx_path = os.path.join(STATIC_DIR, "index.html")
+    if not os.path.exists(idx_path):
+        return send_from_directory(STATIC_DIR, "index.html")
+    return _serve_gzipped_or_plain(idx_path, "text/html; charset=utf-8", False)
+
 
 @app.get("/")
 @app.get("/group/<path:route_id>")
@@ -8261,9 +8312,9 @@ def serve_spa_routes(route_id=None, spa_path=None):
 # для прочих GET/HEAD URL.
 @app.route("/<path:path>", methods=["GET", "HEAD"])
 def serve(path):
-    full = os.path.join(STATIC_DIR, path)
-    if path and os.path.exists(full) and os.path.isfile(full):
-        return send_from_directory(STATIC_DIR, path)
+    res = _serve_static_path(path)
+    if res is not None:
+        return res
     if path.startswith("api/"):
         return jsonify({"error": "not found"}), 404
     return _serve_spa_index()

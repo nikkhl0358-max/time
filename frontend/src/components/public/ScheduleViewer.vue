@@ -289,10 +289,18 @@ function sortDayLessons(lessons, getPeriodTimeFn, dayIdx, dateStr = '') {
   return decorated.map(d => d.inst);
 }
 
-function populateBaseInstances(safeInsts) {
+function shouldIncludeInstanceInView(inst, role) {
+  if (inst._publicMoveSupportOnly) return false;
+  if (role === 'room' && ['remote', 'distance', 'dist'].includes(inst.format)) {
+    return false;
+  }
+  return true;
+}
+
+function populateBaseInstances(safeInsts, role) {
   const map = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
   safeInsts.forEach(inst => {
-    if (inst._publicMoveSupportOnly) return;
+    if (!shouldIncludeInstanceInView(inst, role)) return;
     const d = Number(inst.day !== undefined ? inst.day : inst.blockIndex);
     if (map[d]) map[d].push(inst);
   });
@@ -309,7 +317,7 @@ function injectMovedLessons(map, p) {
 }
 
 const lessonsByDay = computed(() => {
-  const map = populateBaseInstances(safeInstances.value);
+  const map = populateBaseInstances(safeInstances.value, props.role);
   injectMovedLessons(map, props);
   Object.keys(map).forEach(key => {
     const dayIdx = Number(key);
@@ -335,6 +343,13 @@ function getLessonsForDay(dayIdx) {
   return lessonsByDay.value[dayIdx] || [];
 }
 
+function isLessonOccupyingRoom(inst, sub, role) {
+  if (role !== 'room') return true;
+  if (['remote', 'distance', 'dist'].includes(inst.format)) return false;
+  if (['remote', 'distance', 'dist'].includes(sub?.newFormat)) return false;
+  return true;
+}
+
 function getActiveOccupiedPeriods(dayIdx) {
   const dayLessons = getLessonsForDay(dayIdx);
   const dateISO = formatISODate(props.semesterStart, props.selectedWeek, dayIdx);
@@ -342,7 +357,8 @@ function getActiveOccupiedPeriods(dayIdx) {
     .filter(inst => {
       const sub = props.findSub ? props.findSub(inst, dateISO, dayIdx, inst.period || 1) : null;
       const isCancelled = sub && ['cancel', 'cancel_assignment', 'pending_move', 'moved', 'excursion'].includes(sub.type) && !sub.isMovedTarget;
-      return !isCancelled;
+      if (isCancelled) return false;
+      return isLessonOccupyingRoom(inst, sub, props.role);
     })
     .map(inst => Number(inst.period) || 1);
 }

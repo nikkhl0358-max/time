@@ -11,8 +11,9 @@ function mapInstancePlacement(inst, assignment) {
   const a = assignment[inst.instId] || assignment[inst.id] || {};
   const day = a.day !== undefined ? Number(a.day) : (inst.day !== undefined ? Number(inst.day) : undefined);
   const period = a.period !== undefined ? Number(a.period) + 1 : (inst.period !== undefined ? Number(inst.period) : 1);
-  const roomId = a.roomId || inst.dedicatedRoomId || inst.preferredRoomIds?.[0] || '';
-  return { ...inst, day, period, roomId, extraRoomId: a.extraRoomId || null, assignment: a };
+  const isRemote = ['remote', 'distance', 'dist'].includes(inst.format);
+  const roomId = isRemote ? '' : (a.roomId || inst.dedicatedRoomId || inst.preferredRoomIds?.[0] || '');
+  return { ...inst, day, period, roomId, extraRoomId: isRemote ? null : (a.extraRoomId || null), assignment: a };
 }
 
 function normalizeScheduleData(schedule) {
