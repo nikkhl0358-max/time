@@ -160,7 +160,7 @@ import { ref, computed } from 'vue';
 import LessonCard from './LessonCard.vue';
 import PublicNotices from './PublicNotices.vue';
 import { isShortenedDate, isNoClassDateFast } from '../../fastScheduleLookups.js';
-import { collectMovedLessonsForDate, calculateFreePeriods, calculateDayGaps, collapsePublicSiblingSubgroups } from '../../utils/scheduleSubstitutions.js';
+import { collectMovedLessonsForDate, calculateFreePeriods, calculateDayGaps, collapsePublicSiblingSubgroups, dedupePublicDuplicateLessons } from '../../utils/scheduleSubstitutions.js';
 
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 const SHORT_DAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
@@ -323,7 +323,8 @@ const lessonsByDay = computed(() => {
     const dayIdx = Number(key);
     const dateISO = formatISODate(props.semesterStart, props.selectedWeek, dayIdx);
     const sorted = sortDayLessons(map[key], props.getPeriodTime, dayIdx, dateISO);
-    map[key] = collapsePublicSiblingSubgroups(sorted);
+    const deduped = dedupePublicDuplicateLessons(sorted, props.role);
+    map[key] = collapsePublicSiblingSubgroups(deduped);
   });
   return map;
 });

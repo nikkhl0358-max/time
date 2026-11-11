@@ -30308,6 +30308,18 @@ export default function App() {
         )}
 
         {role !== "admin" && !isAdminEntryUrl() && (
+          <div className="classic-mode-banner" style={{background:"#eff6ff",borderBottom:"1px solid #bfdbfe",padding:"8px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",fontSize:13,color:"#1e40af",gap:12}}>
+            <span>Классический вид расписания КТМУ (для удобной сверки замен)</span>
+            <button className="btn primary sm classic-banner-switch" style={{whiteSpace:"nowrap"}} onClick={() => {
+              try { localStorage.removeItem("ktmu_schedule_ui_version"); } catch(_) {}
+              const u = new URL(window.location.href);
+              u.searchParams.set("view", "modern");
+              window.location.href = u.toString();
+            }}>✨ Перейти к новому дизайну</button>
+          </div>
+        )}
+
+        {role !== "admin" && !isAdminEntryUrl() && (
           <div className="role-bar">
             {ROLES.map((r) => {
               const Icon = r.icon;

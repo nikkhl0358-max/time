@@ -22,6 +22,12 @@
    - В `useScheduleData.js`: `mapInstancePlacement` сбрасывает `roomId` в пустую строку для дистанта, предотвращая наследование `dedicatedRoomId`.
    - В `scheduleSubstitutions.js`: `subMatchesView` игнорирует закреплённые кабинеты для дистанционных занятий.
    - В `ScheduleViewer.vue`: функции `shouldIncludeInstanceInView` и `isLessonOccupyingRoom` исключают отображение дистанта в аудитории и исключают его из занятости кабинета.
+6. Устранение задвоения пар (Выгодская Е.М., 2-КДД-33) и поддержка классического вида:
+   - Дедупликация в публичном интерфейсе (`frontend/src/utils/scheduleSubstitutions.js`, `ScheduleViewer.vue`): функция `dedupePublicDuplicateLessons` отсекает повторные карточки одной пары в публичном расписании (`lessonDuplicateKey`).
+   - Дедупликация в шардах бэкенда (`app.py`): функции `_dedupe_shard_instances` и `_instance_shard_dedupe_key` фильтруют дублирующиеся инстансы для групп и преподавателей с обязательным учётом номера учебной недели (`_publishedOccurrenceWeek`), исключая потерю пар на других неделях. Инкрементирован `PUBLIC_SHARD_SCHEMA_VERSION = 1898`.
+   - Кнопка «Классический вид» в подвале (`frontend/src/components/common/AppFooter.vue`): кнопка рядом со входом в админку переключает расписание в проверенный классический табличный вид React (`?view=classic`, `localStorage.ktmu_schedule_ui_version = 'classic'`) для комфортной сверки замен.
+   - Баннер возврата к новому дизайну (`frontend/src/App.jsx`): верхняя панель `classic-mode-banner` в классическом виде позволяет вернуться в современный дизайн в один клик (`?view=modern`).
+   - Паритет расписания звонков (`server_scheduler.mjs`, `frontend/src/App.jsx`): синхронизированы дефолтные звонки с официальным графиком, проверка `tools/check_scheduler_parity.py` проходит успешно.
 
 ## Компоненты
 

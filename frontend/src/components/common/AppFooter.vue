@@ -15,6 +15,21 @@
       <div class="footer-actions">
         <button
           type="button"
+          class="classic-entry-btn"
+          title="Открыть классический табличный вид расписания"
+          @click="switchToClassicView"
+        >
+          <svg class="classic-table-svg" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="18" height="18" rx="2"/>
+            <path d="M3 9h18"/>
+            <path d="M3 15h18"/>
+            <path d="M9 3v18"/>
+          </svg>
+          <span>Классический вид</span>
+        </button>
+
+        <button
+          type="button"
           class="admin-entry-btn"
           title="Открыть окно авторизации составителя расписания"
           @click="goToAdmin"
@@ -45,6 +60,18 @@ function goToAdmin() {
   } else {
     emit('open-admin');
   }
+}
+
+/**
+ * Переключает интерфейс расписания на классический табличный вид React.
+ */
+function switchToClassicView() {
+  try {
+    localStorage.setItem('ktmu_schedule_ui_version', 'classic');
+  } catch (_) {}
+  const url = new URL(window.location.href);
+  url.searchParams.set('view', 'classic');
+  window.location.href = url.toString();
 }
 </script>
 
@@ -111,6 +138,7 @@ function goToAdmin() {
   gap: 12px;
 }
 
+.classic-entry-btn,
 .admin-entry-btn {
   display: inline-flex;
   align-items: center;
@@ -128,6 +156,7 @@ function goToAdmin() {
   box-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
 }
 
+.classic-entry-btn:hover,
 .admin-entry-btn:hover {
   border-color: var(--blue-500);
   color: var(--blue-700);
@@ -136,8 +165,14 @@ function goToAdmin() {
   box-shadow: 0 4px 12px rgba(2, 132, 199, 0.15);
 }
 
+.classic-entry-btn:active,
 .admin-entry-btn:active {
   transform: translateY(0);
+}
+
+.classic-table-svg {
+  color: var(--blue-600);
+  flex-shrink: 0;
 }
 
 .admin-key-svg {
@@ -158,6 +193,7 @@ function goToAdmin() {
   .footer-brand {
     justify-content: center;
   }
+  .classic-entry-btn,
   .admin-entry-btn {
     width: 100%;
     justify-content: center;

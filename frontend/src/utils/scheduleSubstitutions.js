@@ -222,6 +222,37 @@ function keyForCell(inst, sub) {
   return [period, inst?.groupId || '', teacherId, inst?.subjectId || '', inst?.lessonTypeId || inst?.typeId || '', inst?.format || ''].join('|');
 }
 
+function lessonDuplicateKey(inst, sub, role) {
+  const teacherId = sub?.newTeacherId || inst?.teacherId || '';
+  const period = Number(inst?.period ?? -1);
+  const roomId = sub?.newRoomId || inst?.roomId || '';
+  const roomPart = (role === 'room' || inst?.format !== 'remote') ? roomId : '';
+  const sg = Number(inst?.subgroup || 0);
+  const groupPart = role === 'teacher' ? (inst?.groupId || '') : '';
+  return [
+    period, groupPart, sg, teacherId,
+    inst?.subjectId || '', inst?.lessonTypeId || inst?.typeId || '',
+    inst?.format || 'inperson', roomPart
+  ].join('|');
+}
+
+export function dedupePublicDuplicateLessons(cells = [], role = '') {
+  const out = [], seen = new Set();
+  for (const c of cells || []) {
+    const inst = c?.inst || c;
+    const sub = c?.substitution || inst?.substitution;
+    if (sub?.cancelled || sub?.isCancelled) {
+      out.push(c);
+      continue;
+    }
+    const key = lessonDuplicateKey(inst, sub, role);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(c);
+  }
+  return out;
+}
+
 export function collapsePublicSiblingSubgroups(cells = []) {
   const out = [], consumed = new Set();
   for (let i = 0; i < cells.length; i += 1) {

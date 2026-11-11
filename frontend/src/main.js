@@ -12,6 +12,21 @@ function isAdminRoute() {
   return path.startsWith("/admin") || hash.startsWith("#admin");
 }
 
+function isClassicPreferred() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const view = params.get("view");
+    if (view === "classic") return true;
+    if (view === "modern") {
+      localStorage.removeItem("ktmu_schedule_ui_version");
+      return false;
+    }
+    return localStorage.getItem("ktmu_schedule_ui_version") === "classic";
+  } catch (_) {
+    return false;
+  }
+}
+
 async function bootstrapApplication() {
   if (isAdminRoute()) {
     const adminModulePromise = import("./mountAdmin.jsx");
@@ -25,6 +40,11 @@ async function bootstrapApplication() {
       }
     } catch (_) {}
     window.location.replace("/?auth=admin");
+    return;
+  }
+  if (isClassicPreferred()) {
+    const m = await import("./mountAdmin.jsx");
+    m.mountAdmin();
     return;
   }
   document.title = "Расписание — КТМУ";

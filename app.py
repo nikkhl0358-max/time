@@ -348,7 +348,7 @@ PUBLIC_SHARD_CACHE_MAX = int(os.environ.get("PUBLIC_SHARD_CACHE_MAX", "16"))
 # v1870: shard schema is independent from the publication marker. A deploy that
 # fixes shard selection must be able to rebuild lazy public files from the SAME
 # publishedSnapshot without forcing staff to republish the timetable.
-PUBLIC_SHARD_SCHEMA_VERSION = 1896
+PUBLIC_SHARD_SCHEMA_VERSION = 1898
 PUBLIC_INDEX_SCHEMA_VERSION = 1871
 
 
@@ -1272,6 +1272,50 @@ def _filter_raw_instances(project, instances, kind, entity_id, loads_by_id, assi
     return chosen
 
 
+def _instance_shard_dedupe_key(inst, assignment, kind, cfg=None):
+    """Семантический ключ занятия для исключения технических дублей в публичном шарде."""
+    iid = str(inst.get("instId") or "")
+    a = (assignment.get(iid) if isinstance(assignment, dict) else {}) or {}
+    day = a.get("day", inst.get("day"))
+    period = a.get("period", inst.get("period"))
+    group_part = str(inst.get("groupId") or "") if kind == "teacher" else ""
+    occ_week = inst.get("_publishedOccurrenceWeek")
+    weeks = (occ_week,) if occ_week else tuple(_instance_weeks_py(cfg or {}, inst))
+    return (weeks, day, period, group_part, int(inst.get("subgroup") or 0),
+            str(inst.get("teacherId") or ""), str(inst.get("subjectId") or ""),
+            str(inst.get("typeId") or inst.get("lessonTypeId") or ""),
+            str(inst.get("format") or "inperson"))
+
+
+def _process_shard_instance(inst, kind, loads_by_id):
+    """Подготавливает инстанс для шарда с резолвом преподавателей."""
+    if kind != "teacher":
+        return inst
+    trimmed = dict(inst)
+    resolved = _public_instance_teacher_ids({}, inst, loads_by_id)
+    existing = [str(x) for x in (trimmed.get("teacherIds") or []) if str(x)]
+    trimmed["teacherIds"] = list(dict.fromkeys(existing + sorted(resolved)))
+    return trimmed
+
+
+def _dedupe_shard_instances(raw_chosen, extra_support, project, kind, loads_by_id, assignment):
+    """Фильтрует и дедуплицирует инстансы для публичного шарда."""
+    cfg = project.get("config") if isinstance(project, dict) else {}
+    chosen, seen = [], set()
+    for inst in raw_chosen:
+        is_sup = bool(_public_instance_identity_ids(inst).intersection(extra_support))
+        trimmed = inst if is_sup else _trim_instance_to_public_weeks(project, inst)
+        if trimmed is None:
+            continue
+        if kind in ("teacher", "group") and not is_sup:
+            k = _instance_shard_dedupe_key(trimmed, assignment, kind, cfg)
+            if k in seen:
+                continue
+            seen.add(k)
+        chosen.append(_process_shard_instance(trimmed, kind, loads_by_id))
+    return chosen
+
+
 def _build_public_schedule_shard(project, kind, entity_id):
     schedule = project.get("schedule") if isinstance(project.get("schedule"), dict) else {}
     instances = schedule.get("instances") if isinstance(schedule.get("instances"), list) else []
@@ -1280,19 +1324,9 @@ def _build_public_schedule_shard(project, kind, entity_id):
     inst_by_id = {str(i.get("instId")): i for i in instances if isinstance(i, dict) and i.get("instId")}
     inst_by_can = {_canonical_public_inst_id(i.get("instId")): i for i in instances if isinstance(i, dict) and i.get("instId")}
     assignment = schedule.get("assignment") if isinstance(schedule.get("assignment"), dict) else {}
-    extra_support_ids = _collect_entity_sub_support_ids(project, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment)
-    raw_chosen = _filter_raw_instances(project, instances, kind, entity_id, loads_by_id, assignment, extra_support_ids)
-    chosen = []
-    for inst in raw_chosen:
-        is_support = bool(_public_instance_identity_ids(inst).intersection(extra_support_ids))
-        trimmed = inst if is_support else _trim_instance_to_public_weeks(project, inst)
-        if trimmed is not None:
-            if kind == "teacher":
-                trimmed = dict(trimmed)
-                resolved = _public_instance_teacher_ids(project, inst, loads_by_id)
-                existing = [str(x) for x in (trimmed.get("teacherIds") or []) if str(x)]
-                trimmed["teacherIds"] = list(dict.fromkeys(existing + sorted(resolved)))
-            chosen.append(trimmed)
+    extra_support = _collect_entity_sub_support_ids(project, kind, entity_id, loads_by_id, inst_by_id, inst_by_can, assignment)
+    raw_chosen = _filter_raw_instances(project, instances, kind, entity_id, loads_by_id, assignment, extra_support)
+    chosen = _dedupe_shard_instances(raw_chosen, extra_support, project, kind, loads_by_id, assignment)
     ids = {str(inst.get("instId")) for inst in chosen if isinstance(inst, dict) and inst.get("instId")}
     locked = schedule.get("locked") or []
     out = {k: v for k, v in schedule.items() if k not in {"instances", "assignment", "locked", "unplaced"}}
