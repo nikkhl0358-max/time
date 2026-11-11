@@ -1,6 +1,6 @@
 <template>
   <SpatialCard :maxTilt="5" class="lesson-card-wrapper">
-    <div :class="['lesson-item', { 'has-substitution': hasSub, 'is-cancelled': isCancelled, 'is-event': isEvent }]">
+    <div :class="['lesson-item', { 'has-substitution': hasSub, 'is-cancelled': isCancelled, 'is-event': isEvent, 'is-remote': isRemote }]">
       <!-- Плашка замены / отмены / переноса -->
       <div v-if="hasSub" :class="['sub-alert-bar', subAlertClass]">
         <svg v-if="isMoved" class="sub-icon-svg" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -561,6 +561,10 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
   overflow: hidden;
 }
 
+.lesson-item.is-remote {
+  border-left-color: #059669;
+}
+
 .lesson-item.is-event {
   border-left-color: #8b5cf6;
 }
@@ -758,20 +762,20 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  background: #eff6ff;
-  color: #1d4ed8;
+  background: #ecfdf5;
+  color: #047857;
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.01em;
   padding: 2.5px 8px;
   border-radius: 6px;
-  border: 1px solid #bfdbfe;
+  border: 1px solid #a7f3d0;
 }
 
 .room-chip.room-remote {
-  background: #f0f9ff;
-  border: 1px solid #bae6fd;
-  color: #0284c7;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  color: #047857;
   font-weight: 600;
 }
 
@@ -1025,12 +1029,12 @@ const statusBadgeClass = computed(() => statusBadgeInfo.value?.class || '');
 }
 
 .room-chip.room-remote {
-  background: #f0f9ff;
-  border: 1px solid #bae6fd;
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
 }
 
 .room-chip.room-remote .room-name {
-  color: #0284c7;
+  color: #047857;
   font-weight: 600;
 }
 

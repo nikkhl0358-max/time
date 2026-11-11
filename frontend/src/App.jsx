@@ -23683,6 +23683,28 @@ function ActualHoursPanel({data,set}) {
 
 /* ============================== Замены ============================== */
 
+function dedupeSubstitutionBaseRows(rawRows, subs) {
+  if (!rawRows || !rawRows.length) return [];
+  const subsSet = new Set((subs || []).map((s) => String(s.instId)));
+  const sorted = rawRows.slice().sort((a, b) => {
+    const aHas = subsSet.has(String(a.inst?.instId)) ? 1 : 0;
+    const bHas = subsSet.has(String(b.inst?.instId)) ? 1 : 0;
+    return bHas - aHas;
+  });
+  const seen = new Set(), out = [];
+  for (const r of sorted) {
+    const k = [
+      r.a?.period, r.inst?.groupId || "", r.inst?.teacherId || "",
+      r.inst?.subjectId || "", r.inst?.typeId || r.inst?.lessonTypeId || "",
+      r.inst?.subgroup || 0, r.inst?.format || "inperson"
+    ].join("|");
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(r);
+  }
+  return out;
+}
+
 function SubstitutionsPanel({ data, set, onPublish }) {
   const [date, setDate] = useState(todayISO());
   const [editingKey, setEditingKey] = useState(null);
@@ -23832,9 +23854,10 @@ function SubstitutionsPanel({ data, set, onPublish }) {
   // на закрытую дату визуально попадало всё обычное расписание этого вторника.
   // Это были не реальные переносы, а ошибка выборки интерфейса.
   const noOrdinaryClassesToday = isNoClassDate(data, date);
-  const baseRows = noOrdinaryClassesToday ? [] : sched.instances
+  const rawBaseRows = noOrdinaryClassesToday ? [] : sched.instances
     .map((inst) => ({ inst, a: sched.assignment[inst.instId] }))
     .filter((r) => r.a && r.a.day === day && instanceAppliesToDate(data.config, r.inst, date));
+  const baseRows = dedupeSubstitutionBaseRows(rawBaseRows, subs);
   const rows = baseRows
     // Excursion replaces the regular class; cancelled original is managed below.
     .filter((r) => subFor(r.inst.instId)?.type !== "excursion")
