@@ -160,7 +160,7 @@ import { ref, computed } from 'vue';
 import LessonCard from './LessonCard.vue';
 import PublicNotices from './PublicNotices.vue';
 import { isShortenedDate, isNoClassDateFast } from '../../fastScheduleLookups.js';
-import { collectMovedLessonsForDate, calculateFreePeriods, calculateDayGaps, collapsePublicSiblingSubgroups, dedupePublicDuplicateLessons } from '../../utils/scheduleSubstitutions.js';
+import { collectMovedLessonsForDate, calculateFreePeriods, calculateDayGaps, collapsePublicSiblingSubgroups, dedupePublicDuplicateLessons, isInstanceActiveInWeek } from '../../utils/scheduleSubstitutions.js';
 
 const DAY_NAMES = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 const SHORT_DAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб'];
@@ -289,18 +289,21 @@ function sortDayLessons(lessons, getPeriodTimeFn, dayIdx, dateStr = '') {
   return decorated.map(d => d.inst);
 }
 
-function shouldIncludeInstanceInView(inst, role) {
+function shouldIncludeInstanceInView(inst, role, selectedWeek, semesterConfig) {
   if (inst._publicMoveSupportOnly) return false;
   if (role === 'room' && ['remote', 'distance', 'dist'].includes(inst.format)) {
+    return false;
+  }
+  if (selectedWeek && !isInstanceActiveInWeek(inst, selectedWeek, semesterConfig)) {
     return false;
   }
   return true;
 }
 
-function populateBaseInstances(safeInsts, role) {
+function populateBaseInstances(safeInsts, role, selectedWeek, semesterConfig) {
   const map = { 0: [], 1: [], 2: [], 3: [], 4: [], 5: [] };
   safeInsts.forEach(inst => {
-    if (!shouldIncludeInstanceInView(inst, role)) return;
+    if (!shouldIncludeInstanceInView(inst, role, selectedWeek, semesterConfig)) return;
     const d = Number(inst.day !== undefined ? inst.day : inst.blockIndex);
     if (map[d]) map[d].push(inst);
   });
@@ -317,7 +320,7 @@ function injectMovedLessons(map, p) {
 }
 
 const lessonsByDay = computed(() => {
-  const map = populateBaseInstances(safeInstances.value, props.role);
+  const map = populateBaseInstances(safeInstances.value, props.role, props.selectedWeek, props.semesterConfig);
   injectMovedLessons(map, props);
   Object.keys(map).forEach(key => {
     const dayIdx = Number(key);
@@ -330,8 +333,6 @@ const lessonsByDay = computed(() => {
 });
 
 const hasAnyWeeklyContent = computed(() => {
-  const regularCount = safeInstances.value.filter(i => !i._publicMoveSupportOnly).length;
-  if (regularCount > 0) return true;
   for (let dayIdx = 0; dayIdx < 6; dayIdx += 1) {
     if ((lessonsByDay.value[dayIdx] || []).length > 0) return true;
     const dateISO = formatISODate(props.semesterStart, props.selectedWeek, dayIdx);

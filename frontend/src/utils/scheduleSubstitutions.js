@@ -216,6 +216,31 @@ export function getRoomCategoryDetails(room, roomTypes = [], roomSizes = []) {
   return { tagLabel, description: descParts.join(' · '), ...cats, sizeLabel, capacity: room.capacity || 0 };
 }
 
+export function isInstanceActiveInWeek(inst, weekNum, config = {}) {
+  if (!inst) return false;
+  if (inst._publicMoveSupportOnly) return false;
+  const targetWeek = Number(weekNum);
+  if (!targetWeek || targetWeek <= 0) return true;
+  if (inst._publishedOccurrenceWeek !== undefined && inst._publishedOccurrenceWeek !== null) {
+    return Number(inst._publishedOccurrenceWeek) === targetWeek;
+  }
+  const pattern = inst.weekPattern || 'all';
+  if (pattern === 'all') return true;
+  if (pattern === 'custom') {
+    const list = Array.isArray(inst.customWeeks) ? inst.customWeeks : [];
+    return list.some((w) => Number(w) === targetWeek);
+  }
+  if (pattern === 'perWeek') {
+    const wp = inst.weeklyPairs || {};
+    return Number(wp[targetWeek] || wp[String(targetWeek)] || 0) > 0;
+  }
+  if (pattern === 'odd' || pattern === 'even') {
+    const parity = config?.weekParityOverrides?.[String(targetWeek)] || (targetWeek % 2 === 1 ? 'odd' : 'even');
+    return pattern === parity;
+  }
+  return true;
+}
+
 function keyForCell(inst, sub) {
   const teacherId = sub?.newTeacherId || inst?.teacherId || '';
   const period = Number(inst?.period ?? -1);
