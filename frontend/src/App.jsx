@@ -25131,6 +25131,24 @@ function currentAcademicYearLabel() {
   return `${y}-${y + 1}`;
 }
 
+// Экзамены имеют свободное время начала, независимо от сетки пар.
+function assessmentMinutes(value) {
+  const m = String(value || "").match(/^(\d{1,2}):(\d{2})$/);
+  return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+}
+function assessmentInterval(entry, config) {
+  if (entry.startTime && entry.endTime) return [assessmentMinutes(entry.startTime), assessmentMinutes(entry.endTime)];
+  const slot = String(config?.periodTimes?.[Number(entry.period)] || "").match(/(\d{1,2}:\d{2})\s*[–—-]\s*(\d{1,2}:\d{2})/);
+  return slot ? [assessmentMinutes(slot[1]), assessmentMinutes(slot[2])] : [null, null];
+}
+function assessmentTimeLabel(entry, config) {
+  if (entry.startTime) return entry.startTime;
+  return entry.period != null ? (config?.periodTimes?.[Number(entry.period)] || `${Number(entry.period) + 1} пара`) : "—";
+}
+function assessmentIntervalsOverlap(first, second) {
+  return first[0] != null && first[1] != null && second[0] != null && second[1] != null && first[0] < second[1] && second[0] < first[1];
+}
+
 function AttestationPanel({ data, set, onPublish }) {
   const { groups, subjects, teachers, rooms } = data;
   const years = [...new Set([
@@ -25144,7 +25162,7 @@ function AttestationPanel({ data, set, onPublish }) {
   const attestationTypes = (data.attestationTypes && data.attestationTypes.length ? data.attestationTypes : ["зачёт", "экзамен", "курсовая работа", "дифф. зачёт"]);
   const [newAttestationType, setNewAttestationType] = useState("");
   const initialKind = attestationTypes.includes("экзамен") ? "экзамен" : (attestationTypes[0] || "экзамен");
-  const [form, setForm] = useState({ groupId: "", subjectId: "", teacherId: "", commissionTeacherIds: [], roomId: "", date: todayISO(), period: 0, kind: initialKind, note: "" });
+  const [form, setForm] = useState({ groupId: "", subjectId: "", teacherId: "", commissionTeacherIds: [], roomId: "", date: todayISO(), startTime: "09:00", kind: initialKind, note: "" });
 
   const [debtSession, setDebtSession] = useState("winter");
   const [debtFormOpen, setDebtFormOpen] = useState(false);
@@ -25167,23 +25185,45 @@ function AttestationPanel({ data, set, onPublish }) {
 
   const rows = (data.interimAssessments || [])
     .filter((a) => a.academicYear === year)
-    .sort((a, b) => (a.date + String(a.period ?? 0)).localeCompare(b.date + String(b.period ?? 0)));
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")) || assessmentTimeLabel(a, data.config).localeCompare(assessmentTimeLabel(b, data.config)));
 
+  const validTime = assessmentMinutes(form.startTime) != null && assessmentMinutes(form.startTime) < 1440;
   const formConflicts = (() => {
-    if (!form.groupId || !form.date) return [];
-    const base = findDateConflicts(data, { date: form.date, period: form.period, groupId: form.groupId, teacherId: form.teacherId, roomId: form.roomId });
-    const commission = (form.commissionTeacherIds || []).flatMap((teacherId) =>
-      findDateConflicts(data, { date: form.date, period: form.period, teacherId })
-        .map((x) => `${byId(teachers, teacherId)?.name || "Член комиссии"}: ${x}`)
-    );
-    return [...new Set([...base, ...commission])];
+    if (!form.groupId || !form.date || !validTime) return [];
+    const start = assessmentMinutes(form.startTime);
+    // Время окончания неизвестно: проверяем только момент начала, не выдумывая длительность.
+    const occupiedPeriods = (data.config.periodTimes || []).flatMap((label, period) => {
+      const match = String(label).match(/(\d{1,2}:\d{2})\s*[–—-]\s*(\d{1,2}:\d{2})/);
+      return match && start >= assessmentMinutes(match[1]) && start < assessmentMinutes(match[2]) ? [period] : [];
+    });
+    const participantIds = [form.teacherId, ...(form.commissionTeacherIds || [])].filter(Boolean);
+    const warnings = occupiedPeriods.flatMap((period) => {
+      const base = findDateConflicts(data, { date: form.date, period, groupId: form.groupId, teacherId: form.teacherId, roomId: form.roomId });
+      const members = (form.commissionTeacherIds || []).flatMap((teacherId) =>
+        findDateConflicts(data, { date: form.date, period, teacherId })
+          .map((x) => `${byId(teachers, teacherId)?.name || "Член комиссии"}: ${x}`));
+      return [...base, ...members];
+    });
+    for (const previous of (data.interimAssessments || [])) {
+      if (previous.date !== form.date) continue;
+      // Для новых записей сравниваем равенство начала; для старых интервалов — попадание в интервал.
+      const oldInterval = assessmentInterval(previous, data.config);
+      const sameStart = oldInterval[0] === start;
+      const withinOldInterval = !!previous.endTime && oldInterval[0] != null && oldInterval[1] != null && start >= oldInterval[0] && start < oldInterval[1];
+      if (!sameStart && !withinOldInterval) continue;
+      if (previous.groupId === form.groupId || (form.roomId && previous.roomId === form.roomId) ||
+          participantIds.some((id) => [previous.teacherId, ...(previous.commissionTeacherIds || [])].includes(id))) {
+        warnings.push(`совпадает время начала аттестации — ${byId(subjects, previous.subjectId)?.name || "другая дисциплина"}`);
+      }
+    }
+    return [...new Set(warnings)];
   })();
 
   const addEntry = () => {
-    if (!form.groupId || !form.subjectId || !form.teacherId || !form.date || formConflicts.length) return;
+    if (!form.groupId || !form.subjectId || !form.teacherId || !form.date || !validTime || formConflicts.length) return;
     const entry = { id: uid(), academicYear: year, ...form, commissionTeacherIds: (form.commissionTeacherIds || []).filter((id) => id !== form.teacherId) };
     set("interimAssessments")([...(data.interimAssessments || []), entry]);
-    setForm((f) => ({ groupId: "", subjectId: "", teacherId: "", commissionTeacherIds: [], roomId: "", date: f.date, period: 0, kind: f.kind, note: "" }));
+    setForm((f) => ({ groupId: "", subjectId: "", teacherId: "", commissionTeacherIds: [], roomId: "", date: f.date, startTime: f.startTime, kind: f.kind, note: "" }));
     setCommissionOpen(false);
     setFormOpen(false);
   };
@@ -25263,36 +25303,39 @@ function AttestationPanel({ data, set, onPublish }) {
       </div>
 
       {subtab === "main" && <>
-        <div className="schedule-toolbar">
-          <button className="btn primary sm" onClick={() => setFormOpen((v) => !v)}><Plus size={14} /> Добавить аттестацию</button>
+        <div className="schedule-toolbar" style={{justifyContent:"space-between"}}>
+          <span className="muted">Экзамены в таблице · время начала свободное, без привязки к парам</span>
+          <button className="btn primary sm" onClick={() => setFormOpen((v) => !v)}><Plus size={14} /> {formOpen ? "Скрыть строку" : "Добавить аттестацию"}</button>
         </div>
-        {formOpen && <div className="bulk-panel">
-          <div className="quick-add-row" style={{ marginBottom: 10 }}>
-            <input value={newAttestationType} onChange={(e)=>setNewAttestationType(e.target.value)} placeholder="Добавить свой вид аттестации…" />
-            <button className="btn ghost sm" onClick={addAttestationType} disabled={!newAttestationType.trim()}><Plus size={13}/> Добавить вид</button>
-          </div>
-          <div className="retake-form-grid">
-            <SearchableSelect value={form.groupId} onChange={(v) => setForm((f) => ({ ...f, groupId: v }))} options={groups.map((g) => ({ value: g.id, label: g.name }))} placeholder="Группа…" />
-            <SearchableSelect value={form.subjectId} onChange={(v) => setForm((f) => ({ ...f, subjectId: v }))} options={subjects.map((x) => ({ value: x.id, label: x.name }))} placeholder="Дисциплина…" />
-            <SearchableSelect value={form.teacherId} onChange={(v) => setForm((f) => ({ ...f, teacherId: v, commissionTeacherIds: (f.commissionTeacherIds || []).filter((id) => id !== v) }))} options={teachers.map((t) => ({ value: t.id, label: t.name }))} placeholder="Основной преподаватель…" />
-            <select value={form.kind} onChange={(e) => setForm((f) => ({ ...f, kind: e.target.value }))}>{attestationTypes.map((kind)=><option key={kind} value={kind}>{kind}</option>)}</select>
-            <input type="date" value={form.date} onChange={(e) => setForm((f) => ({ ...f, date: e.target.value }))} />
-            <select value={form.period} onChange={(e) => setForm((f) => ({ ...f, period: Number(e.target.value) }))}>{Array.from({ length: data.config.periodsPerDay }).map((_, p) => <option key={p} value={p}>{p + 1} пара · {data.config.periodTimes[p]}</option>)}</select>
-            <SearchableSelect value={form.roomId} onChange={(v) => setForm((f) => ({ ...f, roomId: v }))} options={rooms.map((r) => ({ value: r.id, label: r.name }))} placeholder="Аудитория…" />
-            <input value={form.note} onChange={(e) => setForm((f) => ({ ...f, note: e.target.value }))} placeholder="Примечание (необязательно)" />
-          </div>
-          <div className="schedule-toolbar" style={{ marginTop: 10 }}>
-            <button className="btn ghost sm" type="button" onClick={() => setCommissionOpen((v) => !v)}><Users size={14}/> Комиссия{commissionNames.length ? ` (${commissionNames.length})` : ""}</button>
-            {commissionNames.length > 0 && <span className="lists-count">{commissionNames.join(", ")}</span>}
-          </div>
-          {commissionOpen && <div className="bulk-panel" style={{ marginTop: 8 }}><div className="config-label">Выберите членов комиссии</div><div className="week-parity-grid">{teachers.filter((t) => t.id !== form.teacherId).map((t) => { const selected=(form.commissionTeacherIds||[]).includes(t.id); return <button key={t.id} type="button" className={`week-chip ${selected ? "selected odd" : ""}`} style={{ width: "auto", padding: "0 10px" }} onClick={() => toggleCommission(t.id)}>{t.name}</button>; })}</div></div>}
-          {formConflicts.length > 0 && <p className="stream-confirm-text" style={{ marginTop: 10 }}>{formConflicts.map((c, i) => <span key={i}>⚠️ {c}{i < formConflicts.length - 1 ? <br /> : null}</span>)}</p>}
-          <button className="btn primary sm" style={{ marginTop: 10 }} onClick={addEntry} disabled={!form.groupId || !form.subjectId || !form.teacherId || !form.date || formConflicts.length > 0}>Добавить</button>
+        {formOpen && <div className="quick-add-row" style={{marginBottom:10}}>
+          <input value={newAttestationType} onChange={(e)=>setNewAttestationType(e.target.value)} placeholder="Новый вид аттестации…" />
+          <button className="btn ghost sm" onClick={addAttestationType} disabled={!newAttestationType.trim()}><Plus size={13}/> Добавить вид</button>
         </div>}
-        <div className="table-wrap"><table><thead><tr><th>Дата</th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Форма</th><th>Преподаватель</th><th>Комиссия</th><th>Ауд.</th><th>Примечание</th><th className="col-actions" /></tr></thead><tbody>
-          {rows.map((r) => <tr key={r.id}><td>{formatRuDateFull(r.date)}</td><td>{r.period != null ? `${r.period + 1} · ${data.config.periodTimes[r.period]}` : "—"}</td><td>{byId(groups, r.groupId)?.name || ""}</td><td>{byId(subjects, r.subjectId)?.name || ""}</td><td>{r.kind}</td><td>{byId(teachers, r.teacherId)?.name || ""}</td><td>{(r.commissionTeacherIds || []).map((id) => byId(teachers, id)?.name).filter(Boolean).join(", ") || "—"}</td><td>{byId(rooms, r.roomId)?.name || "—"}</td><td>{r.note}</td><td className="col-actions"><button className="icon-btn danger" onClick={() => remove(r.id)} title="Удалить"><Trash2 size={15} /></button></td></tr>)}
-          {rows.length === 0 && <tr><td colSpan={10} className="empty-row">На {year} уч. год записей пока нет</td></tr>}
-        </tbody></table></div>
+        <div className="table-wrap attestation-editor-table"><table>
+          <thead><tr><th>Дата</th><th>Начало</th><th>Группа</th><th>Дисциплина</th><th>Форма</th><th>Преподаватель</th><th>Комиссия</th><th>Ауд.</th><th>Примечание</th><th className="col-actions" /></tr></thead>
+          <tbody>
+            {formOpen && <tr className="attestation-add-row">
+              <td><input aria-label="Дата экзамена" type="date" value={form.date} onChange={(e)=>setForm((f)=>({...f,date:e.target.value}))} /></td>
+              <td><input aria-label="Время начала" type="time" step="60" value={form.startTime} onChange={(e)=>setForm((f)=>({...f,startTime:e.target.value}))} /></td>
+              <td><SearchableSelect value={form.groupId} onChange={(v)=>setForm((f)=>({...f,groupId:v}))} options={groups.map((g)=>({value:g.id,label:g.name}))} placeholder="Группа…" /></td>
+              <td><SearchableSelect value={form.subjectId} onChange={(v)=>setForm((f)=>({...f,subjectId:v}))} options={subjects.map((x)=>({value:x.id,label:x.name}))} placeholder="Дисциплина…" /></td>
+              <td><select aria-label="Форма аттестации" value={form.kind} onChange={(e)=>setForm((f)=>({...f,kind:e.target.value}))}>{attestationTypes.map((kind)=><option key={kind} value={kind}>{kind}</option>)}</select></td>
+              <td><SearchableSelect value={form.teacherId} onChange={(v)=>setForm((f)=>({...f,teacherId:v,commissionTeacherIds:(f.commissionTeacherIds||[]).filter((id)=>id!==v)}))} options={teachers.map((t)=>({value:t.id,label:t.name}))} placeholder="Преподаватель…" /></td>
+              <td><button className="btn ghost sm" type="button" onClick={()=>setCommissionOpen((v)=>!v)}><Users size={14}/> {commissionNames.length ? `Выбрано: ${commissionNames.length}` : "Выбрать"}</button></td>
+              <td><SearchableSelect value={form.roomId} onChange={(v)=>setForm((f)=>({...f,roomId:v}))} options={rooms.map((r)=>({value:r.id,label:r.name}))} placeholder="Аудитория…" /></td>
+              <td><input aria-label="Примечание" value={form.note} onChange={(e)=>setForm((f)=>({...f,note:e.target.value}))} placeholder="Примечание…" /></td>
+              <td className="col-actions"><button className="btn primary sm" onClick={addEntry} disabled={!form.groupId || !form.subjectId || !form.teacherId || !form.date || !validTime || formConflicts.length > 0}>Сохранить</button></td>
+            </tr>}
+            {rows.map((r)=><tr key={r.id}><td>{formatRuDateFull(r.date)}</td><td><b>{assessmentTimeLabel(r,data.config)}</b></td><td>{byId(groups,r.groupId)?.name||""}</td><td>{byId(subjects,r.subjectId)?.name||""}</td><td>{r.kind}</td><td>{byId(teachers,r.teacherId)?.name||""}</td><td>{(r.commissionTeacherIds||[]).map((id)=>byId(teachers,id)?.name).filter(Boolean).join(", ")||"—"}</td><td>{byId(rooms,r.roomId)?.name||"—"}</td><td>{r.note}</td><td className="col-actions"><button className="icon-btn danger" onClick={()=>remove(r.id)} title="Удалить"><Trash2 size={15}/></button></td></tr>)}
+            {rows.length===0 && !formOpen && <tr><td colSpan={10} className="empty-row">На {year} уч. год записей пока нет</td></tr>}
+          </tbody>
+        </table></div>
+        {formOpen && <>
+          {commissionOpen && <div className="bulk-panel" style={{marginTop:10}}><div className="config-label">Члены комиссии</div><div className="week-parity-grid">{teachers.filter((t)=>t.id!==form.teacherId).map((t)=>{const selected=(form.commissionTeacherIds||[]).includes(t.id);return <button key={t.id} type="button" className={`week-chip ${selected?"selected odd":""}`} style={{width:"auto",padding:"0 10px"}} onClick={()=>toggleCommission(t.id)}>{t.name}</button>;})}</div></div>}
+          {!validTime && <p className="stream-confirm-text">⚠️ Укажите время начала экзамена.</p>}
+          {formConflicts.length>0 && <div className="notice" style={{marginTop:8}}>{formConflicts.map((c,i)=><div key={i}>⚠️ {c}</div>)}</div>}
+          <small className="muted">Пересечения проверяются на момент начала экзамена. Без времени окончания нельзя определить всю продолжительность занятости.</small>
+        </>}
       </>}
 
       {subtab === "debt" && <>
@@ -25871,7 +25914,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
   const attRows = (data.interimAssessments || [])
     .filter((a) => a.academicYear === currentAttYear)
     .filter((a) => kind === "group" ? a.groupId === viewId : (kind === "teacher" ? a.teacherId === viewId : a.roomId === viewId))
-    .sort((a, b) => (a.date + String(a.period ?? 0)).localeCompare(b.date + String(b.period ?? 0)));
+    .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")) || assessmentTimeLabel(a, data.config).localeCompare(assessmentTimeLabel(b, data.config)));
   const debtRowsForView = (data.debtLiquidations || [])
     .filter((a) => a.academicYear === currentAttYear)
     .filter((a) => kind === "group"
@@ -26006,7 +26049,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
       }
       if (kind === "room") {
         for (const a of (data.interimAssessments || []).filter((x)=>x.date===date && String(x.roomId||"")===String(viewId))) {
-          records.push({day,period:Number(a.period ?? 0),date,groupId:a.groupId,title:`Промежуточная аттестация: ${byId(data.subjects,a.subjectId)?.name || a.kind || ""}`,room:byId(data.rooms,viewId)?.name||"",teacher:byId(data.teachers,a.teacherId)?.name||"",group:byId(data.groups,a.groupId)?.name||""});
+          records.push({day,period:a.startTime ? (periodForExactTime(a.startTime) ?? -1) : Number(a.period ?? 0),date,groupId:a.groupId,isScheduleEvent:!!a.startTime,eventTime:assessmentTimeLabel(a,data.config),title:`Промежуточная аттестация: ${byId(data.subjects,a.subjectId)?.name || a.kind || ""}`,room:byId(data.rooms,viewId)?.name||"",teacher:byId(data.teachers,a.teacherId)?.name||"",group:byId(data.groups,a.groupId)?.name||""});
         }
         for (const a of (data.debtLiquidations || []).filter((x)=>x.date===date && String(x.roomId||"")===String(viewId))) {
           const pp = periodForExactTime(a.time);
@@ -26533,7 +26576,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                           {tp.teacherId && <div className="ev-row"><span className="ev-ico">👤</span> {byId(data.teachers,tp.teacherId)?.name||""}</div>}
                         </div>)}
                         {roomAttestations.map((a)=><div key={`room_att_${a.id}`} className="public-event retake">
-                          <div className="ev-row"><span className="ev-ico">🕐</span> <b>{Number(a.period)+1} пара</b> · {data.config.periodTimes?.[Number(a.period)] || ""}</div>
+                          <div className="ev-row"><span className="ev-ico">🕐</span> <b>{assessmentTimeLabel(a, data.config)}</b></div>
                           <div className="ev-row ev-subject"><span className="ev-ico">🎓</span> Промежуточная аттестация: {byId(data.subjects,a.subjectId)?.name || a.kind || ""}</div>
                           <div className="ev-row"><span className="ev-ico">👥</span> {byId(data.groups,a.groupId)?.name||""}</div>
                           {a.teacherId && <div className="ev-row"><span className="ev-ico">👤</span> {byId(data.teachers,a.teacherId)?.name||""}</div>}
@@ -26707,7 +26750,7 @@ function ReadOnlySchedule({ data, kind, initialViewId = "", initialSpecialtyRout
                       const room = byId(data.rooms, r.roomId)?.name || "";
                       return (
                         <div key={r.id} className="public-event">
-                          <div className="ev-row"><span className="ev-ico">📅</span> {formatRuDateFull(r.date)}{r.period != null ? `, ${data.config.periodTimes[r.period]}` : ""}</div>
+                          <div className="ev-row"><span className="ev-ico">📅</span> {formatRuDateFull(r.date)}, {assessmentTimeLabel(r, data.config)}</div>
                           <div className="ev-row ev-subject"><span className="ev-ico">🎓</span> {subj}, {r.kind}</div>
                           <div className="ev-row"><span className="ev-ico">📍</span> ауд. {room}</div>
                           <div className="ev-row"><span className="ev-ico">👤</span> {kind === "group" ? teacher : group}</div>
