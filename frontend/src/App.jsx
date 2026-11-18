@@ -25166,6 +25166,8 @@ function AttestationPanel({ data, set, onPublish }) {
 
   const [debtSession, setDebtSession] = useState("winter");
   const [debtFormOpen, setDebtFormOpen] = useState(false);
+  const [mainPublishing, setMainPublishing] = useState(false);
+  const [mainPublishMessage, setMainPublishMessage] = useState("");
   const [debtPublishing, setDebtPublishing] = useState(false);
   const [debtPublishMessage, setDebtPublishMessage] = useState("");
   const [debtForm, setDebtForm] = useState({
@@ -25273,12 +25275,28 @@ function AttestationPanel({ data, set, onPublish }) {
     setDebtFormOpen(false);
   };
   const removeDebt = (id) => set("debtLiquidations")((data.debtLiquidations || []).filter((r) => r.id !== id));
+  const publishMain = async () => {
+    if (!onPublish) return;
+    if (!window.confirm(`Опубликовать основную промежуточную аттестацию за ${year} учебный год?\n\nОбновится только основная аттестация этого года. Расписание занятий и ликвидация задолженности не изменятся.`)) return;
+    setMainPublishing(true);
+    setMainPublishMessage("Публикую основную аттестацию…");
+    try {
+      const result = await onPublish({ scope: "interim_attestation", academicYear: year });
+      if (!result?.ok) throw new Error(result?.error || "Публикация не подтверждена");
+      setMainPublishMessage(`✓ Основная аттестация за ${year} учебный год опубликована`);
+    } catch (e) {
+      setMainPublishMessage(`❌ ${e?.message || "Ошибка публикации"}`);
+    } finally {
+      setMainPublishing(false);
+    }
+  };
   const publishDebt = async () => {
     if (!onPublish) return;
     if (!window.confirm(`Опубликовать ликвидацию задолженности за ${debtSession === "winter" ? "зимнюю" : "летнюю"} сессию ${year} уч. года?\n\nБудет обновлён только этот раздел. Обычное расписание и другие недели не перепубликуются.`)) return;
     setDebtPublishing(true); setDebtPublishMessage("Публикую…");
     try {
-      await onPublish({ scope: "debt_liquidation", academicYear: year, session: debtSession });
+      const result = await onPublish({ scope: "debt_liquidation", academicYear: year, session: debtSession });
+      if (!result?.ok) throw new Error(result?.error || "Публикация не подтверждена");
       setDebtPublishMessage(`✓ Опубликовано: ${debtSession === "winter" ? "зимняя" : "летняя"} сессия ${year}`);
     } catch (e) {
       setDebtPublishMessage(`❌ ${e?.message || "Ошибка публикации"}`);
@@ -25305,8 +25323,12 @@ function AttestationPanel({ data, set, onPublish }) {
       {subtab === "main" && <>
         <div className="schedule-toolbar" style={{justifyContent:"space-between"}}>
           <span className="muted">Экзамены в таблице · время начала свободное, без привязки к парам</span>
-          <button className="btn primary sm" onClick={() => setFormOpen((v) => !v)}><Plus size={14} /> {formOpen ? "Скрыть строку" : "Добавить аттестацию"}</button>
+          <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+            <button className="btn primary sm" onClick={() => setFormOpen((v) => !v)}><Plus size={14} /> {formOpen ? "Скрыть строку" : "Добавить аттестацию"}</button>
+            <button className="btn primary sm" disabled={mainPublishing || !onPublish} onClick={publishMain}>{mainPublishing ? "Публикую…" : "📢 Опубликовать"}</button>
+          </div>
         </div>
+        {mainPublishMessage && <div className="notice" style={{marginBottom:10}}>{mainPublishMessage}</div>}
         {formOpen && <div className="quick-add-row" style={{marginBottom:10}}>
           <input value={newAttestationType} onChange={(e)=>setNewAttestationType(e.target.value)} placeholder="Новый вид аттестации…" />
           <button className="btn ghost sm" onClick={addAttestationType} disabled={!newAttestationType.trim()}><Plus size={13}/> Добавить вид</button>
@@ -29562,11 +29584,11 @@ export default function App() {
     // «Опубликовать» immediately after «Отменить», merely waiting for the
     // already-running save chain is not enough: the debounce may not have fired
     // yet. Flush this page first so publication cannot miss the newest change.
-    if (options?.scope === "substitutions_day") {
+    if (["substitutions_day", "interim_attestation", "debt_liquidation"].includes(options?.scope)) {
       try {
         await persistCurrentNow();
       } catch (e) {
-        throw new Error(`Не удалось сохранить замену перед публикацией: ${e?.message || e}`);
+        throw new Error(`Не удалось сохранить изменения перед публикацией: ${e?.message || e}`);
       }
     }
 
@@ -29608,9 +29630,10 @@ export default function App() {
     const requestedWeek = options?.scope === "week" ? Math.max(1, Number(options?.weekNumber || 0)) : 0;
     const requestedWeeks = options?.scope === "weeks" ? [...new Set((options?.weekNumbers || []).map(Number).filter((n)=>Number.isFinite(n)&&n>0))].sort((a,b)=>a-b) : [];
     const requestedSubstitutionDate = options?.scope === "substitutions_day" ? String(options?.date || "") : "";
+    const requestedAttestationYear = options?.scope === "interim_attestation" ? String(options?.academicYear || "") : "";
     const requestedDebtYear = options?.scope === "debt_liquidation" ? String(options?.academicYear || "") : "";
     const requestedDebtSession = options?.scope === "debt_liquidation" ? String(options?.session || "winter") : "";
-    const scope = requestedSubstitutionDate ? "substitutions_day" : (requestedDebtYear ? "debt_liquidation" : (requestedWeeks.length ? "weeks" : (requestedWeek ? "week" : (options?.scope === "group" && options?.groupId ? "group" : "all"))));
+    const scope = requestedSubstitutionDate ? "substitutions_day" : (requestedAttestationYear ? "interim_attestation" : (requestedDebtYear ? "debt_liquidation" : (requestedWeeks.length ? "weeks" : (requestedWeek ? "week" : (options?.scope === "group" && options?.groupId ? "group" : "all")))));
     const groupId = scope === "group" ? options.groupId : "";
     const groupName = groupId ? (current.groups || []).find((g) => g.id === groupId)?.name || "группа" : "";
     // v1892: keep the exact participant set that a group publication actually
@@ -29746,6 +29769,27 @@ export default function App() {
         subjects: JSON.parse(JSON.stringify(current.subjects || previous.subjects || [])),
         lessonTypes: JSON.parse(JSON.stringify(current.lessonTypes || previous.lessonTypes || [])),
         rooms: JSON.parse(JSON.stringify(current.rooms || previous.rooms || [])),
+      };
+    } else if (scope === "interim_attestation") {
+      const previous = current.publishedSnapshot
+        ? JSON.parse(JSON.stringify(current.publishedSnapshot))
+        : JSON.parse(JSON.stringify(publicData));
+      const previousRows = Array.isArray(previous.interimAssessments) ? previous.interimAssessments : [];
+      const currentRows = (current.interimAssessments || []).filter((row) =>
+        String(row?.academicYear || "") === requestedAttestationYear
+      );
+      snapshot = {
+        ...previous,
+        interimAssessments: [
+          ...previousRows.filter((row) => String(row?.academicYear || "") !== requestedAttestationYear),
+          ...JSON.parse(JSON.stringify(currentRows)),
+        ],
+        // Only refresh lookup dictionaries; all published lessons and retakes stay unchanged.
+        groups: JSON.parse(JSON.stringify(current.groups || previous.groups || [])),
+        teachers: JSON.parse(JSON.stringify(current.teachers || previous.teachers || [])),
+        subjects: JSON.parse(JSON.stringify(current.subjects || previous.subjects || [])),
+        rooms: JSON.parse(JSON.stringify(current.rooms || previous.rooms || [])),
+        attestationTypes: JSON.parse(JSON.stringify(current.attestationTypes || previous.attestationTypes || [])),
       };
     } else if (scope === "debt_liquidation") {
       const previous = current.publishedSnapshot
@@ -29937,7 +29981,7 @@ export default function App() {
     snapshot = JSON.parse(JSON.stringify(snapshot));
     const at = new Date().toISOString();
     const by = currentUser?.name || currentUser?.login || "Сотрудник";
-    const note = scope === "substitutions_day" ? `Публикация замен за ${formatDateDM(requestedSubstitutionDate)}` : (scope === "debt_liquidation" ? `Ликвидация задолженности: ${requestedDebtSession === "winter" ? "зимняя" : "летняя"} сессия ${requestedDebtYear}` : (scope === "weeks" ? `Публикация недель ${compactWeekNumbers(requestedWeeks)}` : (scope === "week" ? `Публикация недели ${requestedWeek}` : (scope === "group" ? `Публикация группы ${groupName}` : "Публикация всего расписания"))));
+    const note = scope === "substitutions_day" ? `Публикация замен за ${formatDateDM(requestedSubstitutionDate)}` : (scope === "interim_attestation" ? `Основная аттестация: ${requestedAttestationYear} учебный год` : (scope === "debt_liquidation" ? `Ликвидация задолженности: ${requestedDebtSession === "winter" ? "зимняя" : "летняя"} сессия ${requestedDebtYear}` : (scope === "weeks" ? `Публикация недель ${compactWeekNumbers(requestedWeeks)}` : (scope === "week" ? `Публикация недели ${requestedWeek}` : (scope === "group" ? `Публикация группы ${groupName}` : "Публикация всего расписания")))));
     const version = { id: uid(), at, by, note, snapshot };
     const publishedWeeksNext = scope === "weeks"
       ? requestedWeeks
@@ -29971,7 +30015,7 @@ export default function App() {
           groupIds: scope === "group" ? publicationAffectedGroupIds : (groupId ? [groupId] : []),
           weekNumbers: scope === "week" ? [requestedWeek] : (scope === "weeks" ? requestedWeeks : []),
           date: scope === "substitutions_day" ? requestedSubstitutionDate : "",
-          academicYear: scope === "debt_liquidation" ? requestedDebtYear : "",
+          academicYear: scope === "interim_attestation" ? requestedAttestationYear : (scope === "debt_liquidation" ? requestedDebtYear : ""),
           session: scope === "debt_liquidation" ? requestedDebtSession : "",
         },
       }, {
@@ -30035,7 +30079,7 @@ export default function App() {
       setTimeout(() => setShortcutNote(""), 8000);
       // The substitutions page has its own success/error banner. Previously the
       // error was swallowed here, so that page could misleadingly print ✓.
-      if (scope === "substitutions_day") throw err;
+      if (["substitutions_day", "interim_attestation", "debt_liquidation"].includes(scope)) throw err;
       return { ok:false, error:err?.message || String(err) };
     }
     setData((d) => {
@@ -30056,7 +30100,7 @@ export default function App() {
         changeHistory: [...(base.changeHistory || []).filter((x)=>x?.id!==historyEntry.id), historyEntry].slice(-1000),
       };
     });
-    setShortcutNote(scope === "weeks" ? `Опубликованы недели ${compactWeekNumbers(requestedWeeks)} и проверены на публичной странице ✓` : (scope === "week" ? `Опубликована неделя ${requestedWeek} и проверена ✓` : (scope === "group" ? `Расписание группы ${groupName} опубликовано и проверено ✓` : (scope === "substitutions_day" ? `Замены за ${formatDateDM(requestedSubstitutionDate)} опубликованы и проверены ✓` : "Всё расписание опубликовано и проверено ✓"))));
+    setShortcutNote(scope === "weeks" ? `Опубликованы недели ${compactWeekNumbers(requestedWeeks)} и проверены на публичной странице ✓` : (scope === "week" ? `Опубликована неделя ${requestedWeek} и проверена ✓` : (scope === "group" ? `Расписание группы ${groupName} опубликовано и проверено ✓` : (scope === "substitutions_day" ? `Замены за ${formatDateDM(requestedSubstitutionDate)} опубликованы и проверены ✓` : (scope === "interim_attestation" ? `Основная аттестация за ${requestedAttestationYear} опубликована ✓` : (scope === "debt_liquidation" ? `Ликвидация задолженности за ${requestedDebtYear} опубликована ✓` : "Всё расписание опубликовано и проверено ✓"))))));
     setTimeout(() => setShortcutNote(""), 3000);
     return { ok:true, publishedAt:at, scope };
   };
