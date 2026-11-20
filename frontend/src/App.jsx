@@ -1111,7 +1111,9 @@ function instanceGroupNames(data, inst) {
   const enriched = enrichInstanceStreamGroups(data, inst);
   const ids = [...new Set([enriched?.groupId, ...(enriched?.groupIds || []), ...(enriched?.streamGroupIds || [])].filter(Boolean))];
   const names = ids.map((id) => data.groups.find((g) => g.id === id)?.name).filter(Boolean);
-  if (enriched?.externalGroupName && !names.includes(enriched.externalGroupName)) names.push(enriched.externalGroupName);
+  for (const name of String(enriched?.externalGroupName || "").split(/[,;\n]+/).map((s)=>s.trim()).filter(Boolean)) {
+    if (!names.includes(name)) names.push(name);
+  }
   return names;
 }
 function instanceTeacherIds(inst) {
@@ -1122,9 +1124,12 @@ function instanceTeacherIds(inst) {
   ].filter(Boolean).map(String))];
 }
 function instanceTeacherNames(data, inst) {
-  return instanceTeacherIds(inst)
+  const registered = instanceTeacherIds(inst)
     .map((id) => (data?.teachers || []).find((t) => String(t.id) === String(id))?.name)
     .filter(Boolean);
+  // Внешние ведущие не создают фиктивных записей в справочнике и учебной нагрузке.
+  const external = String(inst?.externalTeacherNames || "").split(/[,;\n]+/).map((name)=>name.trim()).filter(Boolean);
+  return [...new Set([...registered, ...external])];
 }
 
 function clockMinutes(value) {
@@ -1252,7 +1257,9 @@ function publicParticipantGroupLabels(data, inst, combinedSubgroups = null) {
     const concrete = [...new Set(subs.filter((x) => Number(x) > 0).map(Number))].sort((a,b)=>a-b);
     if (!concrete.length) return groupName;
     return `${groupName} (п/г ${concrete.join(", ")})`;
-  }).filter(Boolean);
+  }).filter(Boolean).concat(
+    String(enriched?.externalGroupName || "").split(/[,;\n]+/).map((name)=>name.trim()).filter(Boolean)
+  ).filter((name,index,all)=>all.indexOf(name)===index);
 }
 
 async function sha256Hex(text) {
@@ -16348,6 +16355,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         seriesId,
         title: first.eventTitle || "",
         externalGroupName: first.externalGroupName || "",
+        externalTeacherNames: first.externalTeacherNames || "",
         eventKind: scheduleEventKind(first),
         groupIds: [...new Set(streamGroups(first).map(String))],
         teacherIds: instanceTeacherIds(first),
@@ -16367,6 +16375,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       seriesId: "",
       title: "",
       externalGroupName: "",
+      externalTeacherNames: "",
       eventKind: "event",
       groupIds: groupId ? [String(groupId)] : [],
       teacherIds: [],
@@ -16389,8 +16398,8 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const startM = clockMinutes(d.startTime), endM = clockMinutes(d.endTime);
 
     if (!title) { setManualError("Укажите название."); return; }
-    if (!groupIds.length && !(d.eventKind === "external_class" && String(d.externalGroupName||"").trim())) { setManualError("Выберите группу или впишите группу заочников."); return; }
-    if (!teacherIds.length) { setManualError("Выберите хотя бы одного преподавателя."); return; }
+    if (!groupIds.length && !String(d.externalGroupName||"").trim()) { setManualError("Выберите группу или впишите название группы."); return; }
+    if (!teacherIds.length && !String(d.externalTeacherNames||"").trim()) { setManualError("Выберите преподавателя или впишите стороннего преподавателя."); return; }
     if (!roomId) { setManualError("Выберите аудиторию."); return; }
     if (startM == null || endM == null || endM <= startM) { setManualError("Проверьте время начала и окончания мероприятия."); return; }
     if (week < Number(currentWeekGuess || 1) && week !== 1) { setManualError("Нельзя создавать мероприятие в уже прошедшей неделе."); return; }
@@ -16409,7 +16418,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       .map((x)=>String(x.instId));
 
     const primaryGroupId = groupIds[0] || "";
-    const primaryTeacherId = teacherIds[0];
+    const primaryTeacherId = teacherIds[0] || "";
     const newInstances = [];
     const newAssignments = {};
     const stamp = Date.now().toString(36);
@@ -16422,7 +16431,8 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         isScheduleEvent: true,
         nonEducational: true, // Записи заочников пока не являются записью учебной нагрузки
         eventTitle: title,
-        externalGroupName: d.eventKind === "external_class" ? String(d.externalGroupName||"").trim() : "",
+        externalGroupName: String(d.externalGroupName||"").trim(),
+        externalTeacherNames: String(d.externalTeacherNames||"").trim(),
         eventKind: String(d.eventKind || "event"),
         eventStartTime: String(d.startTime),
         eventEndTime: String(d.endTime),
@@ -22411,7 +22421,7 @@ th{background:#1E3A5F;color:#ffffff;}
             <label className="field"><span>Название</span><input value={scheduleEventEditor.title||""} onChange={(e)=>setScheduleEventEditor((x)=>({...x,title:e.target.value}))} placeholder={scheduleEventEditor.eventKind==="courses"?"Например: Курсы повышения квалификации":"Например: День открытых дверей"}/></label>
           </div>
 
-          {scheduleEventEditor.eventKind==="external_class" && <label className="field"><span>Группа заочников (ввод вручную, если нет в списке)</span><input value={scheduleEventEditor.externalGroupName||""} onChange={(e)=>setScheduleEventEditor((x)=>({...x,externalGroupName:e.target.value}))} placeholder="Например: 2-КТЗ-1"/></label>}
+
           <div className="event-editor-grid">
             <label className="field"><span>Неделя</span><select value={scheduleEventEditor.week} onChange={(e)=>setScheduleEventEditor((x)=>({...x,week:Number(e.target.value)}))}>
               {Array.from({length:totalWeeksInSchedule||0},(_,i)=>i+1).filter((w)=>w>=Number(currentWeekGuess||1)).map((w)=><option key={w} value={w}>Неделя {w}</option>)}
@@ -22425,26 +22435,28 @@ th{background:#1E3A5F;color:#ffffff;}
           </div>
 
           <div className="event-multi-block">
-            <b>Группы из справочника (для заочников можно вместо этого вписать группу выше)</b>
+            <b>Группы из справочника</b>
             <div className="event-check-list">
               {(data.groups||[]).map((g)=>{
                 const checked=(scheduleEventEditor.groupIds||[]).includes(String(g.id));
                 return <label key={g.id} className={`event-check${checked?" selected":""}`}><input type="checkbox" checked={checked} onChange={(e)=>setScheduleEventEditor((x)=>({...x,groupIds:e.target.checked?[...new Set([...(x.groupIds||[]),String(g.id)])]:(x.groupIds||[]).filter((id)=>String(id)!==String(g.id))}))}/><span>{g.name}</span></label>;
               })}
             </div>
+            <label className="field event-manual-field"><span>Другие группы — вписать вручную (по одной в строке или через запятую)</span><textarea rows={2} value={scheduleEventEditor.externalGroupName||""} onChange={(e)=>setScheduleEventEditor((x)=>({...x,externalGroupName:e.target.value}))} placeholder="Например: 2-КТЗ-1, приглашённая группа"/></label>
           </div>
 
           <div className="event-multi-block">
-            <b>Преподаватели</b>
+            <b>Преподаватели из справочника</b>
             <div className="event-check-list">
               {(data.teachers||[]).map((t)=>{
                 const checked=(scheduleEventEditor.teacherIds||[]).includes(String(t.id));
                 return <label key={t.id} className={`event-check${checked?" selected":""}`}><input type="checkbox" checked={checked} onChange={(e)=>setScheduleEventEditor((x)=>({...x,teacherIds:e.target.checked?[...new Set([...(x.teacherIds||[]),String(t.id)])]:(x.teacherIds||[]).filter((id)=>String(id)!==String(t.id))}))}/><span>{t.name}</span></label>;
               })}
             </div>
+            <label className="field event-manual-field"><span>Сторонние преподаватели / ведущие — вписать вручную (по одному в строке или через запятую)</span><textarea rows={2} value={scheduleEventEditor.externalTeacherNames||""} onChange={(e)=>setScheduleEventEditor((x)=>({...x,externalTeacherNames:e.target.value}))} placeholder="Например: Иванов Иван Иванович, приглашённый эксперт"/></label>
           </div>
 
-          <div className="notice event-notice">Время может быть любым. Система сама определит, какие строки учебных пар пересекаются с интервалом, и займёт их у всех выбранных групп, преподавателей и аудитории. В образовательную нагрузку мероприятие не входит. Пары заочников сохраняются как отдельные записи и также пока не учитываются в отчёте фактических часов.</div>
+          <div className="notice event-notice">Время может быть любым. Система сама определит, какие строки учебных пар пересекаются с интервалом, и займёт их у выбранных групп, штатных преподавателей и аудитории. В образовательную нагрузку мероприятие не входит. Пары заочников сохраняются как отдельные записи и также пока не учитываются в отчёте фактических часов.</div>
           <div className="modal-actions">
             {scheduleEventEditor.instId && <button className="btn danger" onClick={()=>{if(window.confirm("Удалить мероприятие из расписания?"))deleteScheduleEvent(scheduleEventEditor.instId);}}>Удалить</button>}
             <span className="spacer"/>
@@ -31501,11 +31513,12 @@ input[type="text"], select { width: 100%; }
 .event-badge{display:inline-flex;margin-left:6px;padding:2px 6px;border-radius:999px;background:#7B61B7;color:#fff;font-size:9px;font-weight:800;vertical-align:middle}
 .slot-event-action{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0 12px;border-bottom:1px solid var(--line);margin-bottom:10px}
 .event-create-btn{background:#EEE8FF!important;border-color:#B9A8E3!important;color:#4C387F!important;font-weight:800}
-.schedule-event-modal{width:min(860px,calc(100vw - 28px));max-width:min(860px,calc(100vw - 28px));max-height:90vh}
+.schedule-event-modal{width:min(1120px,calc(100vw - 28px));max-width:min(1120px,calc(100vw - 28px));max-height:90vh}
 .event-editor-body{display:flex;flex-direction:column;gap:14px}
 .event-editor-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px 14px}
 .event-room-field{grid-column:1/-1}
 .event-multi-block{display:flex;flex-direction:column;gap:7px}
+.event-manual-field{margin-top:6px}.event-manual-field textarea{width:100%;min-height:66px;resize:vertical;box-sizing:border-box}
 .event-check-list{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;max-height:210px;overflow:auto;padding:8px;border:1px solid var(--line);border-radius:9px;background:#fafbfc}
 .event-check{display:flex;align-items:center;gap:7px;padding:6px 8px;border:1px solid transparent;border-radius:7px;font-size:12px;cursor:pointer}
 .event-check.selected{background:#EEE8FF;border-color:#C8B9EA;color:#4C387F;font-weight:700}
