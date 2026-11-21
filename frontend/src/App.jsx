@@ -19020,6 +19020,9 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         unplacedAdd:[],
         unplacedRemove:[instId,selectedId,...(peerId?[peerId]:[])],
         stats,
+        // A manually edited future week may share a source instId with archived
+        // weeks. Keep the archived assignment but permit this week-local split.
+        manualHistoricalOverride:true,
       }
     );
 
@@ -19147,6 +19150,8 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
         unplacedAdd:[],
         unplacedRemove:[instId,selectedId],
         stats,
+        // Only the selected occurrence changes format; past weeks stay put.
+        manualHistoricalOverride:true,
       }
     );
     return {ok:true,newInstId:selectedId,day:Number(oldA.day),period:Number(oldA.period),roomId:restoredRoomId};

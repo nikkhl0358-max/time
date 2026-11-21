@@ -5164,6 +5164,88 @@ def _placed_past_ids_py(project, schedule, only_ids=None):
     return out
 
 
+
+def _safe_future_week_split_ids_py(project, schedule, patch):
+    """Permit a future-only split of a recurring placed row without unlocking history.
+
+    A timetable card may cover both archived and future semester weeks. A
+    client-side week split changes the old instance's recurrence and inserts a
+    fresh instance for the selected future week. The old instance must keep
+    every archived week at EXACTLY its existing placement. This is not a
+    historical edit, even when the old instId occurs in the server's past set.
+
+    Only allow a strictly future subset to leave the old id, require a new
+    matching sibling in the same atomic patch, and prohibit changing the old
+    assignment, lock, unplaced status or lesson semantics. Invalid or partial
+    splits remain blocked and therefore cannot erase past placements.
+    """
+    if not isinstance(patch, dict):
+        return set()
+    cfg = (project or {}).get("config") or {}
+    current_week = int(_current_semester_week_py(cfg))
+    before_by_id = {
+        str(row.get("instId") or ""): row
+        for row in ((schedule or {}).get("instances") or [])
+        if isinstance(row, dict) and str(row.get("instId") or "")
+    }
+    before_assigned = (schedule or {}).get("assignment") or {}
+    after_by_id = {
+        str(sid): row for sid, row in (patch.get("instancesSet") or {}).items()
+        if isinstance(row, dict)
+    }
+    after_assigned = patch.get("assignmentSet") or {}
+    blocked_changes = set(map(str, (patch.get("instancesRemove") or [])))
+    blocked_changes.update(map(str, (patch.get("assignmentRemove") or [])))
+    blocked_changes.update(map(str, (patch.get("lockedRemove") or [])))
+    blocked_changes.update(map(str, (patch.get("unplacedAdd") or [])))
+    # The new sibling must be an actual new id, not a rewrite of an unrelated
+    # existing card, otherwise a concurrent editor's card could be swallowed.
+    newly_created = {
+        sid: row for sid, row in after_by_id.items() if sid not in before_by_id
+    }
+    ignored_split_fields = {
+        "weekPattern", "customWeeks", "weeklyPairs",
+        "blockId", "blockIndex", "blockSize", "blockMode",
+        "manualSplit", "userManualSplit", "weeklyDetached",
+        "splitFromInstId", "splitFamilyId", "manualStreamSnapshot",
+    }
+    identity_fields = ("loadId", "groupId", "teacherId", "subjectId")
+    safe = set()
+    for sid, after in after_by_id.items():
+        before = before_by_id.get(sid)
+        if not isinstance(before, dict) or sid not in before_assigned:
+            continue
+        if sid in blocked_changes or sid in after_assigned:
+            continue
+        before_weeks = set(_instance_weeks_py(cfg, before))
+        after_weeks = set(_instance_weeks_py(cfg, after))
+        historical = {w for w in before_weeks if w < current_week and w != 1}
+        if not historical or not after_weeks:
+            continue
+        removed = before_weeks - after_weeks
+        if not removed or not after_weeks.issubset(before_weeks):
+            continue
+        # Never detach an archived week or a lesson in the current week that
+        # may already have started; this fix is deliberately FUTURE-only.
+        if any(w <= current_week for w in removed):
+            continue
+        if not historical.issubset(after_weeks):
+            continue
+        if any(before.get(k) != after.get(k)
+               for k in (set(before) | set(after)) - ignored_split_fields):
+            continue
+        # The split must retain the removed future occurrences as new cards.
+        # This also prevents a background synchronization from silently
+        # deleting future timetable hours while using this archive exemption.
+        covered = set()
+        for child in newly_created.values():
+            if all(child.get(k) == before.get(k) for k in identity_fields):
+                covered.update(_instance_weeks_py(cfg, child))
+        if not removed.issubset(covered):
+            continue
+        safe.add(sid)
+    return safe
+
 def _preserve_placed_past_schedule_py(project, remote_schedule, candidate_schedule, allow_trim_ids=None):
     """Hard server archive guard for already placed past lessons.
 
@@ -6348,7 +6430,7 @@ def _schedule_patch_batch_loop():
                         # будущие недели, оставив под старым id ТОЧНО все прошлые
                         # недели и прежнее назначение. Это нужно, чтобы менять
                         # текущую неделю, не двигая историю.
-                        safe_trim_ids = set()
+                        safe_trim_ids = _safe_future_week_split_ids_py(project, before_schedule, patch)
                         requested_trim_ids = {str(x) for x in (patch.get("pastTrimIds") or []) if str(x)}
                         if requested_trim_ids:
                             by_before = {
