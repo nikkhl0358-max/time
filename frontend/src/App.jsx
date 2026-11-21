@@ -11290,6 +11290,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
   const [dragOverSlot, setDragOverSlot] = useState(null);
   const [manualMoveRoomPicker, setManualMoveRoomPicker] = useState(null);
   const [openedUnplacedId, setOpenedUnplacedId] = useState("");
+  const [removingUnplacedKey, setRemovingUnplacedKey] = useState(""); // quick X for extra/out-of-graph unplaced cards
   const [serverUnplacedDiag, setServerUnplacedDiag] = useState({});
   const [splitUnplaced, setSplitUnplaced] = useState(null); // {instId,weeks,day,period,roomId}
   const [restorePastUnplaced, setRestorePastUnplaced] = useState(null); // {instId,instIds,week,day,period,roomId}
@@ -12525,11 +12526,11 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     if (!weeklyPlanningMode) return baseVisibleUnplacedIds.filter(notPurging);
     const week = Number(scheduleWeek);
     return baseVisibleUnplacedIds.filter((id) => {
-      if (!notPurging(id)) return false;
+      if (!notPurging(id) || offGraphOccurrencePurgePendingKeys.has(`${String(id)}::${week}`)) return false;
       const inst = scheduleInstById.get(String(id));
       return !!inst && weekNumbersForInstance(data.config, inst).map(Number).includes(week);
     });
-  }, [baseVisibleUnplacedIds, weeklyPlanningMode, scheduleWeek, scheduleInstById, data.config, offGraphPurgePendingIds]);
+  }, [baseVisibleUnplacedIds, weeklyPlanningMode, scheduleWeek, scheduleInstById, data.config, offGraphPurgePendingIds, offGraphOccurrencePurgePendingKeys]);
 
   useEffect(() => {
     if (!offGraphPurgePendingIds.size) return;
@@ -13024,10 +13025,82 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       };
     } else {
       const trimmed = { ...rawInst, weekPattern:"custom", customWeeks:remainingWeeks, updatedAt:new Date().toISOString(), manualGraphOverride:true };
-      delta = { instancesSet:{ [id]:trimmed }, unplacedRemove:[id], offGraphTrimWeeksById:{ [id]:[week] }, manualDeleteWeeksById:{ [id]:[week] },
+      delta = { instancesSet:{ [id]:trimmed },
+        // A still-unplaced recurring row must remain in the unplaced set for its other weeks.
+        offGraphTrimWeeksById:{ [id]:[week] }, manualDeleteWeeksById:{ [id]:[week] },
         explicitManualOccurrenceDelete:true, manualOverride:true, manualHistoricalOverride:true };
     }
     return persistScheduleDeltaWithoutHotRender(delta);
+  };
+
+  // The X on an unplaced card deletes ONLY a graph mismatch, never ordinary
+  // unplaced load. In weekly planning it trims just the shown week; in semester
+  // view it removes only rows whose every week is outside/surplus graph.
+  const deleteUnplacedMismatchCard = async (key, candidateIds, weekOnly, kind) => {
+    if (removingUnplacedKey || !sched) return;
+    const uniqueIds = [...new Set((candidateIds || []).map(String))];
+    if (!uniqueIds.length) return;
+    const source = rawSchedLocalRef.current || rawSched || sched;
+    const byId = new Map((source.instances || []).map((row) => [String(row?.instId || ""), row]));
+    const selectedWeek = Number(scheduleWeek);
+    const delta = {
+      instancesRemove:[], instancesSet:{}, assignmentRemove:[], lockedRemove:[], unplacedRemove:[],
+      offGraphPurgeIds:[], offGraphTrimWeeksById:{}, manualDeleteWeeksById:{},
+      explicitManualOccurrenceDelete:true, manualOverride:true, manualHistoricalOverride:true,
+    };
+    const removedIds = [];
+    const trimmedOccurrenceKeys = [];
+    for (const id of uniqueIds) {
+      const row = byId.get(id);
+      if (!row || source.assignment?.[id]) {
+        setManualError("Можно удалить крестиком только неразмещённую пару вне/сверх графика.");
+        return;
+      }
+      const allWeeks = [...new Set(weekNumbersForInstance(data.config, row).map(Number).filter(Number.isFinite))].sort((a,b)=>a-b);
+      const deleteWeeks = weekOnly ? allWeeks.filter((w)=>w===selectedWeek) : allWeeks;
+      if (!deleteWeeks.length || deleteWeeks.some((w)=>unplacedGraphStatusForInstanceWeek(row, w).kind === "ok")) {
+        setManualError("Пара нужна по графику на одной из недель. Удаление отменено — обычная нагрузка сохранена.");
+        return;
+      }
+      const remainingWeeks = allWeeks.filter((w)=>!deleteWeeks.includes(w));
+      delta.manualDeleteWeeksById[id] = deleteWeeks;
+      delta.offGraphTrimWeeksById[id] = deleteWeeks;
+      if (remainingWeeks.length) {
+        delta.instancesSet[id] = { ...row, weekPattern:"custom", customWeeks:remainingWeeks,
+          updatedAt:new Date().toISOString(), manualGraphOverride:true };
+        // Intentionally no unplacedRemove: the remaining weeks are still unplaced.
+        trimmedOccurrenceKeys.push(...deleteWeeks.map((w)=>`${id}::${w}`));
+      } else {
+        delta.instancesRemove.push(id);
+        delta.assignmentRemove.push(id);
+        delta.lockedRemove.push(id);
+        delta.unplacedRemove.push(id);
+        delta.offGraphPurgeIds.push(id);
+        removedIds.push(id);
+      }
+    }
+    const scopeLabel = weekOnly ? `на ${selectedWeek}-й неделе` : "во всех указанных неделях";
+    const statusLabel = kind === "surplus" ? "сверх графика" : "вне/сверх графика";
+    if (!window.confirm(`Удалить ${uniqueIds.length > 1 ? "выбранные лишние карточки" : "лишнюю карточку"} ${statusLabel} ${scopeLabel}?\n\nНагрузка в графике не изменится. Это удаление технических карточек из расписания, а не снятие плановых часов.`)) return;
+
+    setRemovingUnplacedKey(key);
+    if (removedIds.length) setOffGraphPurgePendingIds((prev)=>new Set([...prev, ...removedIds]));
+    if (trimmedOccurrenceKeys.length) setOffGraphOccurrencePurgePendingKeys((prev)=>new Set([...prev, ...trimmedOccurrenceKeys]));
+    setManualError("Удаляю лишнюю карточку…");
+    let result;
+    try { result = await persistScheduleDeltaWithoutHotRender(delta); }
+    catch (error) { result = { ok:false, error }; }
+    if (result?.ok === false) {
+      if (removedIds.length) setOffGraphPurgePendingIds((prev)=>{ const next=new Set(prev); removedIds.forEach((id)=>next.delete(id)); return next; });
+      if (trimmedOccurrenceKeys.length) setOffGraphOccurrencePurgePendingKeys((prev)=>{ const next=new Set(prev); trimmedOccurrenceKeys.forEach((id)=>next.delete(id)); return next; });
+      setManualError(result?.error?.message || result?.reason || "Не удалось удалить карточку. Изменения не сохранены.");
+      setRemovingUnplacedKey("");
+      return;
+    }
+    setServerUnplacedDiag((prev)=>{ const next={...prev}; delete next[key]; return next; });
+    setOpenedUnplacedId("");
+    setManualError(`✓ Лишняя карточка удалена ${scopeLabel}.`);
+    setRemovingUnplacedKey("");
   };
 
   const removeFromUnplacedOnly = (ids) => {
@@ -22055,12 +22128,19 @@ th{background:#1E3A5F;color:#ffffff;}
                 const row = scheduleInstById.get(String(id));
                 return isObsoleteOffGraphInstance(row) || isRedundantUnplacedOffGraphInstance(row);
               }).map(String);
-              const hasOffGraphCleanup = offGraphCleanupIds.length > 0;
-              const offGraphCleanupKind = hasOffGraphCleanup && offGraphCleanupIds.some((id)=>{
+              // The weekly card is one occurrence, even if its source row also
+              // contains legitimate future weeks. Only remove the visible week.
+              const quickDeleteIds = weeklyPlanningMode ? ids.filter((id)=>{
                 const row = scheduleInstById.get(String(id));
-                return row && weekNumbersForInstance(data.config,row).some((w)=>unplacedGraphStatusForInstanceWeek(row,w).kind === "outside");
+                return row && unplacedGraphStatusForInstanceWeek(row, scheduleWeek).kind !== "ok";
+              }).map(String) : offGraphCleanupIds;
+              const hasOffGraphCleanup = quickDeleteIds.length > 0;
+              const offGraphCleanupKind = hasOffGraphCleanup && quickDeleteIds.some((id)=>{
+                const row = scheduleInstById.get(String(id));
+                const relevantWeeks = weeklyPlanningMode ? [Number(scheduleWeek)] : weekNumbersForInstance(data.config,row);
+                return row && relevantWeeks.some((w)=>unplacedGraphStatusForInstanceWeek(row,w).kind === "outside");
               }) ? "outside" : (hasOffGraphCleanup ? "surplus" : "");
-              return <details className={`unplaced-item${draggingUnplaced?.key===key ? " unplaced-dragging" : ""}${hasOffGraphCleanup ? " unplaced-offgraph" : ""}`} key={key} open={opened} onToggle={(e)=>{const isOpen=e.currentTarget.open;setOpenedUnplacedId(isOpen?key:"");if(isOpen&&!serverUnplacedDiag[key])loadServerUnplacedDiag(key,ids,inst);}}>
+              return <details className={`unplaced-item${draggingUnplaced?.key===key ? " unplaced-dragging" : ""}${hasOffGraphCleanup ? " unplaced-offgraph unplaced-can-purge" : ""}`} key={key} open={opened} onToggle={(e)=>{const isOpen=e.currentTarget.open;setOpenedUnplacedId(isOpen?key:"");if(isOpen&&!serverUnplacedDiag[key])loadServerUnplacedDiag(key,ids,inst);}}>
                 <summary draggable={manualMode && !unplacedDropBusy} onDragStart={(e)=>{
                   if(!manualMode||unplacedDropBusy){e.preventDefault();return;}
                   e.stopPropagation(); setManualError("");
@@ -22073,6 +22153,16 @@ th{background:#1E3A5F;color:#ffffff;}
                   <span className="unplaced-item-main"><span className="unplaced-title-line"><span className="unplaced-drag-handle" title="Перетащить блок в сетку">⋮⋮</span><span className={`unplaced-format-badge ${inst.format === "remote" ? "remote" : "inperson"}`}>{formatLabel}</span>{isCombinedLoad && <span className="unplaced-combined-badge">КОМБИНИРОВАННО</span>}{hasOffGraphCleanup && <span className="unplaced-offgraph-badge">⚠ {offGraphCleanupKind === "outside" ? "ВНЕ ГРАФИКА" : "СВЕРХ ГРАФИКА"}</span>}<b>{group} — {subj}{inst.halfPair ? " · 0,5 пары / 1 ак.ч." : ""}</b></span><span>{transferTeacherText || teacher}{type ? ` · ${type}` : ""}{authoritativeSubgroupForInstance(data, inst) ? ` · п/г ${authoritativeSubgroupForInstance(data, inst)}` : ""}{streamInfo ? <> · <strong>🔗 Поток: {streamInfo}</strong></> : null} · <strong>{weekText}</strong>{blockPeriodText ? <span className="unplaced-period"> ({blockPeriodText})</span> : null}</span></span>
                   <span className={`diag-status ${opened && diag?.optionCount ? "can-place" : ""}`}>{opened ? (diag?.loading ? "считаю…" : diag?.optionCount ? `${diag.optionCount} вариант${diag.optionCount === 1 ? "" : diag.optionCount < 5 ? "а" : "ов"}` : "0 вариантов") : "показать варианты"}</span>
                 </summary>
+                {hasOffGraphCleanup && <button
+                  type="button"
+                  className="unplaced-quick-delete"
+                  aria-label={`Удалить карточку ${offGraphCleanupKind === "surplus" ? "сверх" : "вне"} графика`}
+                  title={`Удалить лишнюю карточку ${offGraphCleanupKind === "surplus" ? "сверх" : "вне"} графика ${weeklyPlanningMode ? `только на ${scheduleWeek}-й неделе` : "за отмеченные недели"}`}
+                  disabled={!!removingUnplacedKey}
+                  onPointerDown={(e)=>e.stopPropagation()}
+                  onDragStart={(e)=>e.preventDefault()}
+                  onClick={(e)=>{ e.preventDefault(); e.stopPropagation(); void deleteUnplacedMismatchCard(key, quickDeleteIds, weeklyPlanningMode, offGraphCleanupKind); }}
+                >{removingUnplacedKey===key ? <Loader2 size={16} className="spin"/> : <X size={17}/>}</button>}
                 {coverageAudit && <div className="diag-impossible" style={{marginTop:8}}><AlertTriangle size={15}/> {coverageAudit.text}</div>}
                 {opened && <div className="diag-body">
                   {inst.halfPair && <div className="diag-available"><b>0,5 пары / 1 ак.ч.</b> — при постановке система сначала использует <b>1-ю часть</b> номера пары; во 2-ю часть ставит только если первая занята.</div>}
@@ -22130,28 +22220,23 @@ th{background:#1E3A5F;color:#ffffff;}
                     }}>↪ Перенести переданную пару на другую неделю</button>}
                     <button className="btn small" onClick={(e)=>{e.preventDefault();e.stopPropagation();setManualError("");const preferredWeek=Number(candidateWeekFilter||((weeklyPlanningMode&&weeks.includes(Number(scheduleWeek)))?scheduleWeek:weeks[0]));setSplitUnplaced({instId:inst.instId,instIds:[...ids],weeks:Number.isFinite(preferredWeek)?[preferredWeek]:[],day:activeDayIndices[0]||0,period:0,roomId:"",moveWeekMode:true});}}>↪ Перенести неделю в другой день</button>
                     <button className="btn small" onClick={(e)=>{e.preventDefault();e.stopPropagation();setManualError("");setSplitUnplaced({instId:inst.instId, instIds:[...ids], weeks:[], day:activeDayIndices[0]||0, period:0, roomId:""});}}>✂ Расщепить блок по неделям</button>
-                    <button className="btn small danger" title={hasOffGraphCleanup ? "Удалить лишнюю техническую пару вне/сверх графика окончательно" : "Убрать только из списка «Не размещено», не удаляя занятие"} onClick={async (e)=>{
+                    <button className="btn small danger" disabled={!!removingUnplacedKey} title={hasOffGraphCleanup ? "Удалить карточку вне/сверх графика, сохранив плановые недели" : "Убрать только из списка «Не размещено», не удаляя занятие"} onClick={async (e)=>{
                       e.preventDefault();e.stopPropagation();
-                      const hasOffGraph = hasOffGraphCleanup;
-                      const question = hasOffGraph
-                        ? "Эта пара больше не требуется графиком. Удалить её техническую копию окончательно? В «Неразмещённые» она больше не вернётся."
-                        : "Удалить эту строку только из списка «Не размещено»? Само занятие и нагрузка сохранятся.";
-                      if(!window.confirm(question)) return;
-                      const purgeNowIds = hasOffGraph ? offGraphCleanupIds : [];
-                      if (purgeNowIds.length) setOffGraphPurgePendingIds((prev)=>new Set([...prev, ...purgeNowIds]));
-                      setManualError(hasOffGraph ? "Удаляю пару вне графика…" : "Убираю из неразмещённых…");
+                      if (hasOffGraphCleanup) {
+                        await deleteUnplacedMismatchCard(key, quickDeleteIds, weeklyPlanningMode, offGraphCleanupKind);
+                        return;
+                      }
+                      if (!window.confirm("Удалить эту строку только из списка «Не размещено»? Само занятие и нагрузка сохранятся.")) return;
+                      setManualError("Убираю из неразмещённых…");
                       const result = await removeFromUnplacedOnly(ids);
-                      if(result?.ok === false){
-                        if (purgeNowIds.length) setOffGraphPurgePendingIds((prev)=>{
-                          const next=new Set(prev); for(const id of purgeNowIds) next.delete(String(id)); return next;
-                        });
-                        setManualError(result?.error?.message || result?.reason || "Не удалось удалить пару");
+                      if (result?.ok === false) {
+                        setManualError(result?.error?.message || result?.reason || "Не удалось убрать пару");
                         return;
                       }
                       setServerUnplacedDiag((m)=>{ const next={...m}; delete next[key]; return next; });
                       setOpenedUnplacedId("");
-                      setManualError(hasOffGraph ? "✓ Пара вне графика удалена окончательно." : "✓ Строка убрана из неразмещённых.");
-                    }}>{hasOffGraphCleanup ? "🗑 Удалить вне графика" : "🗑 Убрать из неразмещённых"}</button>
+                      setManualError("✓ Строка убрана из неразмещённых.");
+                    }}>{hasOffGraphCleanup ? "🗑 Удалить вне/сверх графика" : "🗑 Убрать из неразмещённых"}</button>
                     <span className="muted">Прошедшие недели можно исправлять вручную. В недельном режиме перенос и drag & drop меняют только выбранную неделю, не затрагивая соседние.</span>
                   </div>
                   {diag?.error ? <div className="diag-impossible"><AlertTriangle size={15}/>{diag.error}</div> : null}
@@ -32362,6 +32447,13 @@ input[type="text"], select { width: 100%; }
 .unplaced-diagnostics { display: grid; gap: 8px; margin-top: 12px; }
 .diag-split-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0 10px}.diag-split-row span{font-size:11.5px;color:#765b5b}.split-block-help{padding:10px 12px;background:#f6f8fb;border:1px solid #dfe5ee;border-radius:8px;font-size:12px;line-height:1.45;color:#52606f}.split-block-summary{display:flex;gap:8px 14px;flex-wrap:wrap;margin:12px 0;font-size:12px}.split-week-grid{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.split-week-chip{display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:30px;border:1px solid #cfd8e3;border-radius:7px;background:#fff;cursor:pointer;font-size:12px}.split-week-chip input{display:none}.split-week-chip.selected{background:#dbeafe;border-color:#6aa3dc;color:#164e86;font-weight:700}.split-slot-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.manual-error{display:flex;align-items:flex-start;gap:6px;margin-top:10px;padding:9px 10px;background:#fff1f1;border:1px solid #efc4c4;border-radius:7px;color:#9b2c2c;font-size:12px}@media(max-width:700px){.split-slot-grid{grid-template-columns:1fr}}
 .unplaced-item { background: rgba(255,255,255,.7); border: 1px solid #ead3d3; border-radius: 9px; overflow: hidden; }
+.unplaced-item.unplaced-can-purge{position:relative}
+.unplaced-item.unplaced-can-purge>summary{padding-right:53px}
+.unplaced-quick-delete{position:absolute;right:9px;top:8px;z-index:3;width:31px;height:31px;display:flex;align-items:center;justify-content:center;border-radius:7px;border:1px solid #efcaca;background:#fff6f6;color:#a52d2d;cursor:pointer;box-shadow:0 1px 2px rgba(80,15,15,.08)}
+.unplaced-quick-delete:hover:not(:disabled){background:#fce0e0;border-color:#d84d4d;color:#831919}
+.unplaced-quick-delete:focus-visible{outline:2px solid #c73636;outline-offset:2px}
+.unplaced-quick-delete:disabled{opacity:.6;cursor:wait}
+
 .unplaced-item summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; }
 .unplaced-item summary::-webkit-details-marker { display:none; }
 .unplaced-item-main { display:flex; flex-direction:column; min-width:0; gap:2px; color:#542f2f; font-size:12.5px; }
