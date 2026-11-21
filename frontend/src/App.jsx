@@ -6,6 +6,7 @@ import Papa from "papaparse";
 import * as XLSX from "xlsx-js-style";
 import { planExactBulkWeekCopy } from "./bulkWeekSnapshot.mjs";
 import { planWeekGraphExcess } from "./weekGraphExcess.mjs";
+import { rollbackRejectedSchedulePatch } from "./scheduleRollback.mjs";
 import { storageRememberCellRevisions, storageGet, storageGetStrict, publicBootstrapGet, publicIndexGet, publicScheduleGet, publicStatusGet, publicControlGet, publicControlSet, storageSet, storageGraphMerge, storageGraphPatch, storageScheduleMerge, storageScheduleGroupMerge, storageSchedulePatch, storagePublishWeeks, storagePublicationCommit, storageSectionMerge, storageMeta, storageBackups, storageCreateBackup, storageDownloadBackup, storageRestoreBackup, storageRestorePublishedGroup, storageUndoPublishedGroupRestore, storageVersionGet, CLIENT_BUILD_ID, scheduleArchiveList, scheduleFinalizeWeek, scheduleArchiveGet, scheduleArchiveDownload, presenceHeartbeat, presenceLeave, serverGenerateStart, serverGenerateStatus, serverGenerateCancel, serverAutoGraphStart, serverAutoGraphStatus } from "./storage.js";
 import { MANUAL_POLICY, isGymRoomByPolicy, manualPolicyFlags } from "./manualPolicy.js";
 import { dedupePublicLessonRows } from "./publicLessonDedupe.js";
@@ -14058,7 +14059,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const existing = (data.groupDayBlocks || []).find((b) => b.groupId === viewId && b.date === date);
     if (existing) {
       const removeIds = new Set(existing.addedLockedIds || []);
-      set("schedule")({ ...sched, locked: (sched.locked || []).filter((id) => !removeIds.has(id)) });
+      updateSchedule({ locked: (rawSchedLocalRef.current?.locked || sched.locked || []).filter((id) => !removeIds.has(id)) });
       set("groupDayBlocks")((data.groupDayBlocks || []).filter((b) => b.id !== existing.id));
       return;
     }
@@ -14075,7 +14076,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const before = new Set(sched.locked || []);
     const addedLockedIds = visibleIds.filter((id) => !before.has(id));
     const locked = [...new Set([...(sched.locked || []), ...visibleIds])];
-    set("schedule")({ ...sched, locked });
+    updateSchedule({ locked });
     set("groupDayBlocks")([...(data.groupDayBlocks || []), { id: uid(), groupId: viewId, date, addedLockedIds }]);
   };
 
@@ -14111,7 +14112,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const existing = (data.groupDayFreezes || []).find((b) => b.groupId === viewId && b.date === date);
     if (existing) {
       const removeIds = new Set(existing.addedLockedIds || []);
-      set("schedule")({ ...sched, locked: (sched.locked || []).filter((id) => !removeIds.has(id)) });
+      updateSchedule({ locked: (rawSchedLocalRef.current?.locked || sched.locked || []).filter((id) => !removeIds.has(id)) });
       set("groupDayFreezes")((data.groupDayFreezes || []).filter((b) => b.id !== existing.id));
       return;
     }
@@ -14125,7 +14126,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const before = new Set(sched.locked || []);
     const addedLockedIds = visibleIds.filter((id) => !before.has(id));
     const locked = [...new Set([...(sched.locked || []), ...visibleIds])];
-    set("schedule")({ ...sched, locked });
+    updateSchedule({ locked });
     set("groupDayFreezes")([...(data.groupDayFreezes || []), { id: uid(), groupId: viewId, date, addedLockedIds }]);
   };
 
@@ -14135,7 +14136,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     const existing = (data.groupScheduleFreezes || []).find((x) => x.groupId === viewId);
     if (existing) {
       const removeIds = new Set(existing.addedLockedIds || []);
-      set("schedule")({ ...sched, locked: (sched.locked || []).filter((id) => !removeIds.has(id)) });
+      updateSchedule({ locked: (rawSchedLocalRef.current?.locked || sched.locked || []).filter((id) => !removeIds.has(id)) });
       set("groupScheduleFreezes")((data.groupScheduleFreezes || []).filter((x) => x.id !== existing.id));
       return;
     }
@@ -14147,7 +14148,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     }
     const before = new Set(sched.locked || []);
     const addedLockedIds = groupIds.filter((id) => !before.has(id));
-    set("schedule")({ ...sched, locked: [...new Set([...(sched.locked || []), ...groupIds])] });
+    updateSchedule({ locked: [...new Set([...(rawSchedLocalRef.current?.locked || sched.locked || []), ...groupIds])] });
     set("groupScheduleFreezes")([...(data.groupScheduleFreezes || []), { id: uid(), groupId: viewId, addedLockedIds }]);
   };
 
@@ -14336,16 +14337,18 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
     // periodic sync poll) eventually overwrote it with the real server
     // state, which looked exactly like "a lesson got thrown onto another one
     // / a lesson just vanished on its own".
-    const revertOnFailure = (e) => {
+    const revertOnFailure = (e, failedDelta) => {
       console.error("Immediate timetable cell save failed", e);
-      cancelParentScheduleSync();
-      commitLocalSchedule(previousSchedule, { mirror:false });
-      mirrorScheduleToParentSoon(previousSchedule, 0);
+      // A later drag may already have committed another cell.  Reverting the
+      // entire captured previousSchedule used to erase the operator's work.
+      const current = rawSchedLocalRef.current || nextSchedule;
+      const safe = rollbackRejectedSchedulePatch(current, previousSchedule, nextSchedule, failedDelta);
+      commitLocalSchedule(safe);
       if (e?.details?.staleClient) {
-        setManualError("Редактор обновился на сервере. Перезагружаю страницу…");
+        setManualError("Сервер требует новую версию редактора. Эта операция не сохранена. Обновите страницу после завершения остальных сохранений.");
         return;
       }
-      setManualError(`Ячейка не сохранена сервером: ${e?.message || "ошибка сохранения"}. Изменение отменено — попробуйте ещё раз.`);
+      setManualError(`Не удалось сохранить карточку на сервере: ${e?.message || "ошибка сохранения"}. Отменена только эта операция; остальные изменения не откатывались.`);
     };
 
     // v1565: manual timetable edits are persisted as an immediate atomic delta.
@@ -14387,7 +14390,7 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       if (explicitImmediateDelta) {
         return Promise.resolve(onCellPatch(withBaseCells(explicitImmediateDelta)))
           .then((res) => ({ ok:true, response:res }))
-          .catch((e) => { revertOnFailure(e); return { ok:false, error:e }; });
+          .catch((e) => { revertOnFailure(e, explicitImmediateDelta); return { ok:false, error:e }; });
       }
       const beforeAssignment = previousSchedule?.assignment || {};
       const afterAssignment = nextSchedule.assignment || {};
@@ -14422,12 +14425,13 @@ function SchedulePanel({ data, set, generating, generationStatus, onGenerate, on
       const unplacedAdd = [...afterUnplaced].filter((id) => !beforeUnplaced.has(id));
       const unplacedRemove = [...beforeUnplaced].filter((id) => !afterUnplaced.has(id));
       if (Object.keys(assignmentSet).length || assignmentRemove.length || Object.keys(instancesSet).length || instancesRemove.length || lockedAdd.length || lockedRemove.length || unplacedAdd.length || unplacedRemove.length) {
-        return Promise.resolve(onCellPatch(withBaseCells({
+        const cellDelta = {
           assignmentSet, assignmentRemove, instancesSet, instancesRemove, lockedAdd, lockedRemove, unplacedAdd, unplacedRemove,
           ...(nextSchedule.stats && typeof nextSchedule.stats === "object" ? { stats: nextSchedule.stats } : {}),
-        })))
+        };
+        return Promise.resolve(onCellPatch(withBaseCells(cellDelta)))
           .then((res) => ({ ok:true, response:res }))
-          .catch((e) => { revertOnFailure(e); return { ok:false, error:e }; });
+          .catch((e) => { revertOnFailure(e, cellDelta); return { ok:false, error:e }; });
       }
     }
     return Promise.resolve({ ok:true, localOnly:true });
@@ -27790,7 +27794,7 @@ const TAB_SAVE_KEYS = {
   curriculum: ["curriculumPlan"],
   loads: ["loads"],
   graphs: ["loads","graphState"],
-  schedule: ["schedule","loads","groupDayBlocks","groupSlotBlocks","groupDayFreezes"], // v1489: saved atomically, field/group/slot level
+  schedule: ["schedule","loads","groupDayBlocks","groupSlotBlocks","groupDayFreezes","groupScheduleFreezes"], // v1489: saved atomically, field/group/slot level
   // v1863: substitutions are date overlays; editing/cancelling them does not
   // mutate the base schedule. Shipping the multi-MB schedule on every change
   // made this page unnecessarily slow and could delay publication.
@@ -27943,6 +27947,11 @@ export default function App() {
   // confirmation. Server-sync polling must never replace the visible schedule
   // while an optimistic cell operation is still in flight.
   const schedulePatchInFlightRef = useRef(0);
+  const schedulePatchQueuedRef = useRef(0);
+  const schedulePendingCellIdsRef = useRef(new Set());
+  const schedulePatchErrorRef = useRef("");
+  const [scheduleQueuedSaves, setScheduleQueuedSaves] = useState(0);
+  const [scheduleSaveError, setScheduleSaveError] = useState("");
   const generationCancelRequestedRef = useRef(false);
   const latestDataRef = useRef(null);
   const [passwordModal, setPasswordModal] = useState(null); // 'set' | 'enter' | 'change' | null
@@ -28215,6 +28224,40 @@ export default function App() {
   };
 
   const persistSnapshot = (snapshot, revision, { manual = false, scopeTab = tab, scheduleGroupId = "" } = {}) => {
+    // Cells are saved only by atomic patches.  Save/Ctrl+S must never send an
+    // older full schedule snapshot over confirmed placements.  Non-cell schedule
+    // settings (day/group freezes, blocked slots and explicit load edits) can
+    // still be saved independently as small atomic page-section merges.
+    if (scopeTab === "schedule") {
+      return scheduleCellPatchChainRef.current.catch(() => {}).then(async () => {
+        if (schedulePatchQueuedRef.current > 0) throw new Error("Сохранение карточек ещё выполняется");
+        if (schedulePatchErrorRef.current) throw new Error(`Не все карточки сохранены: ${schedulePatchErrorRef.current}`);
+        let base = {};
+        try { base = lastSavedJson.current ? JSON.parse(lastSavedJson.current) : {}; } catch {}
+        const auxKeys = ["loads", "groupDayBlocks", "groupSlotBlocks", "groupDayFreezes", "groupScheduleFreezes"];
+        const changed = auxKeys.filter((field) =>
+          JSON.stringify(snapshot?.[field] ?? []) !== JSON.stringify(base?.[field] ?? [])
+        );
+        if (!changed.length) return { ok:true, cellPatchesConfirmed:true };
+        const sectionBase = {};
+        const sectionLocal = {};
+        for (const field of changed) {
+          sectionBase[field] = base?.[field] ?? [];
+          sectionLocal[field] = snapshot?.[field] ?? [];
+        }
+        const res = await storageSectionMerge("schedule-data-v2", sectionBase, sectionLocal, {
+          userId: currentUser?.id || "",
+          by: currentUser?.name || currentUser?.login || "Пользователь",
+          scope: "schedule-settings",
+          sessionId: presenceSessionRef.current,
+        });
+        for (const field of changed) base[field] = res?.value?.[field] ?? sectionLocal[field];
+        if (res?.value?._syncMeta) base._syncMeta = res.value._syncMeta;
+        lastSavedJson.current = JSON.stringify(base);
+        if (res?.token) lastSavedTokenRef.current = String(res.token);
+        return { ...res, cellPatchesConfirmed:true };
+      });
+    }
     const required = scopeTab === "__all__" ? EDITOR_SECTIONS : (saveKeysForTab(scopeTab) || []);
     if (editorMissingSections(snapshot, required).length) return Promise.reject(new Error("Раздел ещё загружается; сохранение отложено"));
     const graphEditSerialAtRequest = scopeTab === "graphs" ? graphUserEditSerialRef.current : null;
@@ -28912,9 +28955,17 @@ export default function App() {
     // already go through persistScheduleCellPatchNow; scheduling a second broad
     // autosave here is exactly what caused the grid to "live its own life".
     if (tab === "schedule") {
-      dirtyRef.current = false;
       pendingSaveTabsRef.current.delete("schedule");
-      setSaveState("saved");
+      if (schedulePatchQueuedRef.current > 0) {
+        dirtyRef.current = true;
+        setSaveState("saving");
+      } else if (schedulePatchErrorRef.current) {
+        dirtyRef.current = true;
+        setSaveState("error");
+      } else {
+        dirtyRef.current = false;
+        setSaveState("saved");
+      }
       return;
     }
     dataRevisionRef.current += 1;
@@ -28933,7 +28984,32 @@ export default function App() {
     }, scopeTab === "graphs" ? 650 : scopeTab === "schedule" ? 1000 : 1400);
     pageSaveTimersRef.current.set(scopeTab, timer);
     return () => {}; // таймер страницы не отменяем при переходе на другую страницу
-  }, [data, loaded, currentUser?.id, currentUser?.name, currentUser?.login]);
+  }, [data, loaded, currentUser?.id, currentUser?.name, currentUser?.login, scheduleQueuedSaves, scheduleSaveError]);
+
+  // Day/group freezes and blocked periods are not cell patches.  Save them
+  // separately after the UI changes, without ever resending schedule itself.
+  const scheduleAuxLastRef = useRef(null);
+  useEffect(() => {
+    if (!loaded || role !== "admin" || tab !== "schedule" || !editorReadyForTab) return;
+    const fields = [data?.groupDayBlocks, data?.groupSlotBlocks, data?.groupDayFreezes, data?.groupScheduleFreezes];
+    if (!scheduleAuxLastRef.current) {
+      scheduleAuxLastRef.current = fields;
+      return;
+    }
+    const changed = fields.some((field, i) => field !== scheduleAuxLastRef.current[i]);
+    scheduleAuxLastRef.current = fields;
+    if (!changed) return;
+    const pendingTimer = pageSaveTimersRef.current.get("schedule");
+    if (pendingTimer) clearTimeout(pendingTimer);
+    const timer = setTimeout(() => {
+      pageSaveTimersRef.current.delete("schedule");
+      persistSnapshot(latestDataRef.current || data, dataRevisionRef.current, { scopeTab:"schedule" }).catch((error) => {
+        setSaveState("error");
+        setShortcutNote(`Не удалось сохранить настройки расписания: ${error?.message || error}`);
+      });
+    }, 1400);
+    pageSaveTimersRef.current.set("schedule", timer);
+  }, [loaded, role, tab, editorReadyForTab, data?.groupDayBlocks, data?.groupSlotBlocks, data?.groupDayFreezes, data?.groupScheduleFreezes]);
 
   useEffect(() => () => {
     for (const timer of pageSaveTimersRef.current.values()) clearTimeout(timer);
@@ -29031,9 +29107,14 @@ export default function App() {
   }, [loaded, role, currentUser?.id]);
 
   const reloadFromServer = async () => {
+    if (schedulePatchQueuedRef.current > 0) {
+      setShortcutNote("Дождитесь завершения сохранения карточек перед обновлением данных.");
+      return;
+    }
+    if (schedulePatchErrorRef.current && !window.confirm("Есть ошибки сохранения карточек. Перезагрузка данных с сервера отменит эти локальные изменения. Продолжить?")) return;
     try {
       const res = await storageGet("schedule-data-v2");
-      if (res && res.value) { const parsed = typeof res.value === "string" ? JSON.parse(res.value) : res.value; skipAutosaveRef.current = true; setData(normalizeStoredData(parsed)); lastSavedJson.current = typeof res.value === "string" ? res.value : JSON.stringify(res.value); lastSavedTokenRef.current = syncTokenOf(parsed); setLastConfirmedSaveAt(parsed?._syncMeta?.at || new Date().toISOString()); dirtyRef.current = false; setSaveState("saved"); }
+      if (res && res.value) { const parsed = typeof res.value === "string" ? JSON.parse(res.value) : res.value; skipAutosaveRef.current = true; setData(normalizeStoredData(parsed)); lastSavedJson.current = typeof res.value === "string" ? res.value : JSON.stringify(res.value); lastSavedTokenRef.current = syncTokenOf(parsed); setLastConfirmedSaveAt(parsed?._syncMeta?.at || new Date().toISOString()); schedulePatchErrorRef.current = ""; setScheduleSaveError(""); dirtyRef.current = false; setSaveState("saved"); }
     } catch { /* ignore */ }
     setRemoteChanged(false);
   };
@@ -29355,51 +29436,16 @@ export default function App() {
     };
   }, [loaded, role, currentUser?.id]);
 
-  // v1754: deployment reload is now mandatory for administrator tabs.
-  // A stale admin bundle was one of the reasons different users could see
-  // different timetable totals after a deploy. Once a new build is detected,
-  // give the current request/save a few seconds to finish and then load the new
-  // HTML shell with an explicit cache-busting query parameter. This is
-  // intentionally stronger than the old "only when perfectly clean" rule.
-  useEffect(() => {
-    if (!adminUpdate || role !== "admin") return undefined;
-
-    if (adminUpdateReloadTimerRef.current) {
-      clearTimeout(adminUpdateReloadTimerRef.current);
-      adminUpdateReloadTimerRef.current = null;
-    }
-
-    const forceReload = () => {
-      adminUpdateReloadTimerRef.current = null;
-      const url = new URL(window.location.href);
-      url.searchParams.set("appv", String(adminUpdate.buildId || Date.now()));
-      url.searchParams.set("reload", String(Date.now()));
-      window.location.replace(url.toString());
-    };
-
-    // If an autosave is already in flight, allow a little more time for the
-    // response to return. We still reload even if a tab remains dirty: the
-    // server is the canonical source and all ordinary edits are already sent
-    // independently by section/cell autosave.
-    const busy =
-      saveState === "saving" ||
-      savingRef.current ||
-      generatingRef.current ||
-      pendingSaveTabsRef.current.size > 0;
-    const delay = busy ? 10000 : 4000;
-
-    adminUpdateReloadTimerRef.current = setTimeout(forceReload, delay);
-
-    return () => {
-      if (adminUpdateReloadTimerRef.current) {
-        clearTimeout(adminUpdateReloadTimerRef.current);
-        adminUpdateReloadTimerRef.current = null;
-      }
-    };
-  }, [adminUpdate?.buildId, role, saveState]);
-
+  // Never force-reload an editing session merely because a new frontend was
+  // deployed. A 4–10 second timer used to discard unsaved placed lessons.
+  // The banner below keeps the update visible until the operator reloads.
   const reloadAdminForUpdate = () => {
     if (!adminUpdate) return;
+    if (schedulePatchQueuedRef.current > 0 || savingRef.current || pendingSaveTabsRef.current.size) {
+      setShortcutNote("Сначала дождитесь подтверждения всех сохранений сервером.");
+      return;
+    }
+    if (schedulePatchErrorRef.current && !window.confirm("Есть несохранённые карточки. При обновлении страницы они исчезнут. Всё равно обновить?")) return;
     const url = new URL(window.location.href);
     url.searchParams.set("appv", String(adminUpdate.buildId || Date.now()));
     url.searchParams.set("reload", String(Date.now()));
@@ -29516,6 +29562,14 @@ export default function App() {
     for (const field of ["assignmentRemove","instancesRemove","lockedAdd","lockedRemove","unplacedAdd","unplacedRemove"]) {
       for (const id of (patch?.[field] || [])) if (String(id)) touched.add(String(id));
     }
+    // Two optimistic edits of the *same* lesson cannot share a stale base.
+    // Reject the second locally until the first is acknowledged; edits to
+    // unrelated lessons still queue normally and remain untouched on failure.
+    const alreadySaving = [...touched].filter(id => schedulePendingCellIdsRef.current.has(id));
+    if (alreadySaving.length) {
+      return Promise.reject(new Error("Эта карточка ещё сохраняется. Дождитесь подтверждения сервера перед повторным переносом."));
+    }
+    for (const id of touched) schedulePendingCellIdsRef.current.add(id);
     if (generatingRef.current) for (const id of touched) manualProtectedIdsRef.current.add(id);
     recentLocalSaveRef.current = Date.now();
 
@@ -29547,6 +29601,9 @@ export default function App() {
     // replace another; splitting a multi-cell operation into N sequential
     // requests only caused N complete storage.json serializations + N overlap
     // validations and saturated CPU on Amvera.
+    schedulePatchQueuedRef.current += 1;
+    setScheduleQueuedSaves(schedulePatchQueuedRef.current);
+    setSaveState("saving");
     const task = scheduleCellPatchChainRef.current.catch(() => {}).then(async () => {
       schedulePatchInFlightRef.current += 1;
       try {
@@ -29564,28 +29621,20 @@ export default function App() {
         recentLocalSaveRef.current = Date.now();
         return res;
       } catch (e) {
-        // v1755: a true same-cell concurrent edit is never resolved by "last
-        // writer wins". Pull the canonical server copy immediately so the losing
-        // editor sees what the colleague actually saved and can retry deliberately.
-        if (Number(e?.status || 0) === 409 && String(e?.details?.reason || "") === "concurrent_cell_edit") {
-          try {
-            const fresh = await storageGetStrict("schedule-data-v2", { editorCompact:true, attempts:2, delayMs:200 });
-            if (fresh?.value) {
-              const parsed = typeof fresh.value === "string" ? JSON.parse(fresh.value) : fresh.value;
-              const normalized = normalizeStoredData(parsed);
-              skipAutosaveRef.current = true;
-              latestDataRef.current = normalized;
-              setData(normalized);
-              lastSavedJson.current = typeof fresh.value === "string" ? fresh.value : JSON.stringify(fresh.value);
-              lastSavedTokenRef.current = String(fresh?.token || syncTokenOf(parsed));
-              lastSeenRemoteTokenRef.current = lastSavedTokenRef.current;
-              setLastConfirmedSaveAt(parsed?._syncMeta?.at || new Date().toISOString());
-            }
-          } catch { /* keep original conflict error */ }
-        }
+        // The canonical server may differ for this specific cell.  Do not
+        // replace the entire local project: other drags may still be queued.
+        // The failed cell is reverted in SchedulePanel, and the operator can
+        // explicitly reload remote changes after all pending saves complete.
+        if (Number(e?.status || 0) === 409) setRemoteChanged(true);
+        schedulePatchErrorRef.current = e?.message || "Одна или несколько карточек не сохранились";
+        setScheduleSaveError(schedulePatchErrorRef.current);
+        setSaveState("error");
         throw e;
       } finally {
         schedulePatchInFlightRef.current = Math.max(0, schedulePatchInFlightRef.current - 1);
+        schedulePatchQueuedRef.current = Math.max(0, schedulePatchQueuedRef.current - 1);
+        for (const id of touched) schedulePendingCellIdsRef.current.delete(id);
+        setScheduleQueuedSaves(schedulePatchQueuedRef.current);
       }
     });
     scheduleCellPatchChainRef.current = task;
@@ -31299,14 +31348,14 @@ export default function App() {
           <div className="admin-update-banner">
             <div className="admin-update-copy">
               <b>↻ Доступно обновление системы</b>
-              <span>{(saveState === "saving" || generatingRef.current || pendingSaveTabsRef.current.size > 0)
-                ? "Идёт сохранение или расчёт. После короткой паузы страница всё равно принудительно загрузит новую версию."
-                : "Новая версия будет принудительно загружена примерно через 4 секунды у всех администраторов."}</span>
+              <span>{(saveState === "saving" || scheduleQueuedSaves > 0 || generatingRef.current || pendingSaveTabsRef.current.size > 0)
+                ? "Идёт сохранение или расчёт. Страница не перезагрузится сама; обновите её после завершения операций."
+                : "Новая версия доступна. Обновление — только вручную, чтобы не потерять расставленные карточки."}</span>
             </div>
             <button
               className="btn primary sm"
               onClick={reloadAdminForUpdate}
-              disabled={saveState === "saving" || generatingRef.current}
+              disabled={saveState === "saving" || scheduleQueuedSaves > 0 || generatingRef.current}
               title={(dirtyRef.current || saveState !== "saved") ? "Сначала сохраните текущие изменения" : "Загрузить новую версию сейчас"}
             >
               Обновить сейчас
@@ -31353,7 +31402,7 @@ export default function App() {
             <div className="section-save-bar">
               <div><b>Изменения этой страницы сохраняются отдельно</b><span>Кнопка ниже сразу сохраняет только изменённые разделы, не перезаписывая остальные страницы.</span></div>
               <button className="btn primary section-save-btn" onClick={saveNow} disabled={saveState === "saving" || !editorReadyForTab || editorLoading}>💾 {saveState === "saving" ? "Сохраняю…" : "Сохранить"}</button>
-              <span style={{fontSize:12,fontWeight:700,color:saveState==="error"?"#b91c1c":saveState==="dirty"?"#a16207":saveState==="saving"?"#1d4ed8":"#15803d"}}>{saveState==="error"?"⚠ не удалось сохранить":saveState==="dirty"?"● есть несохранённые изменения":saveState==="saving"?"↻ сохраняю на сервер…":`✓ всё сохранено${lastConfirmedSaveAt ? ` · ${new Date(lastConfirmedSaveAt).toLocaleTimeString("ru-RU", {hour:"2-digit", minute:"2-digit", second:"2-digit"})}` : ""}`}</span>
+              <span style={{fontSize:12,fontWeight:700,color:saveState==="error"?"#b91c1c":saveState==="dirty"?"#a16207":saveState==="saving"?"#1d4ed8":"#15803d"}}>{tab === "schedule" && scheduleSaveError ? `⚠ Ошибка сохранения карточки: ${scheduleSaveError}` : tab === "schedule" && scheduleQueuedSaves > 0 ? `↻ Ожидает сервер: ${scheduleQueuedSaves} операций` : saveState==="error"?"⚠ не удалось сохранить":saveState==="dirty"?"● есть несохранённые изменения":saveState==="saving"?"↻ сохраняю на сервер…":`✓ всё сохранено${lastConfirmedSaveAt ? ` · ${new Date(lastConfirmedSaveAt).toLocaleTimeString("ru-RU", {hour:"2-digit", minute:"2-digit", second:"2-digit"})}` : ""}`}</span>
             </div>
           )}
           {role === "admin" && (!editorReadyForTab || editorLoading) && (
