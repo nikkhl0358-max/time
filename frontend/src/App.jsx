@@ -23796,191 +23796,419 @@ function ActualHoursPanel({data,set}) {
   </div>;
 }
 
-/* Остаток нагрузки по актуальным строкам графика, включая исторические разделения при передаче. */
+/*
+ * Управленческий контроль нагрузки. Источник плана — недельный график строк
+ * loads; источник размещения — реальная сетка schedule.assignment.
+ * Классификация прошедшее/будущее относится к расписанию, НЕ к журналу факта.
+ * Исторические/переданные строки остаются у своих текущих преподавателей.
+ */
 function calculateTeacherLoadBalances(data, cutoff) {
-  const config=data.config||{};
-  const today=String(cutoff||todayISO());
-  const loads=data.loads||[], instances=(data.schedule?.instances||[]).filter(i=>i?.instId&&!i.isScheduleEvent);
-  const assignment=data.schedule?.assignment||{};
-  const teachers=new Map((data.teachers||[]).map(t=>[String(t.id),String(t.name||'')]));
-  const groups=new Map((data.groups||[]).map(g=>[String(g.id),String(g.name||'')]));
-  const subjects=new Map((data.subjects||[]).map(x=>[String(x.id),String(x.name||'')]));
-  const loadById=new Map(loads.filter(l=>l?.id).map(l=>[String(l.id),l]));
-  const lessonsByLoadWeek=new Map();
-  const seen=new Set();
-  for(const inst of instances){
-    const a=assignment[String(inst.instId)];
-    if(!a||a.day==null)continue;
-    const referencedIds=new Set([String(inst.loadId||'')].filter(Boolean));
-    for(const part of streamParticipants(inst)){
-      const resolved=resolveTransferParticipantLoadId(loads,part,inst,[]);
-      if(resolved)referencedIds.add(String(resolved));
-    }
-    const loadIds=[...referencedIds];
-    for(const week of visibleWeeksForAssignedOccurrence(data,inst,a)){
-      const date=dateForWeekDay(config,week,Number(a.day));
-      if(!date)continue;
-      const sub=(data.substitutions||[]).find(x=>String(x.instId||'')===String(inst.instId)&&x.date===date);
-      let occurrenceDate=date;
-      if(sub&&['cancel','cancel_assignment','pending_move','excursion'].includes(sub.type))continue;
-      if(sub?.type==='moved'){
-        if(!sub.targetDate)continue;
-        occurrenceDate=sub.targetDate;
+  const cfg = data.config || {};
+  const asOf = String(cutoff || todayISO());
+  const loadRows = (data.loads || []).filter(l => l && l.id);
+  const loadMap = new Map(loadRows.map(l => [String(l.id), l]));
+  const teacherMap = new Map((data.teachers || []).map(t => [String(t.id), String(t.name || t.id)]));
+  const groupMap = new Map((data.groups || []).map(g => [String(g.id), String(g.name || g.id)]));
+  const subjectMap = new Map((data.subjects || []).map(s => [String(s.id), String(s.name || s.id)]));
+  const typeMap = new Map((data.lessonTypes || []).map(t => [String(t.id), String(t.name || t.id)]));
+  const maxWeeks = totalSemesterWeeks(cfg);
+  const toUnits = n => Math.max(0, Number(n) || 0);
+  const round = n => Math.round((Number(n) || 0) * 100) / 100;
+  const loadWeeks = new Map();
+  const buckets = new Map();
+  const indexByGroup = new Map();
+  for (const load of loadRows) {
+    const id = String(load.id);
+    const values = new Map();
+    const explicit = load.weeklyPairs || {};
+    const hasExplicit = load.weeklyPairs != null || load.weekPattern === 'perWeek'; // даже пустой weeklyPairs — явный график
+    if (hasExplicit) {
+      for (const [wk, quantity] of Object.entries(explicit)) {
+        const week = Number(wk);
+        if (!Number.isInteger(week) || week < 1 || (maxWeeks && week > maxWeeks)) continue;
+        if (toUnits(quantity) > 0) values.set(week, toUnits(quantity));
       }
-      const units=inst.halfPair?0.5:1;
-      for(const id of loadIds){
-        if(!loadById.has(id))continue;
-        const key=[id,week,occurrenceDate,a.day,a.period,inst.halfPair?`half:${a.half??0}`:'full',String(inst.subjectId||''),String(inst.typeId||inst.lessonTypeId||''),inst.format||''].join('|');
-        if(seen.has(key))continue;
-        seen.add(key);
-        const idx=`${id}|${week}`;
-        if(!lessonsByLoadWeek.has(idx))lessonsByLoadWeek.set(idx,[]);
-        lessonsByLoadWeek.get(idx).push({date:occurrenceDate,units});
+    } else {
+      for (let week = 1; week <= maxWeeks; week++) {
+        const mode = String(load.weekPattern || 'all');
+        const enabled = mode === 'all' || (mode === 'custom' && (load.customWeeks || []).map(Number).includes(week)) ||
+          ((mode === 'odd' || mode === 'even') && parityForWeekNumber(cfg, week) === mode);
+        if (enabled && toUnits(load.pairsPerWeek) > 0) values.set(week, toUnits(load.pairsPerWeek));
       }
     }
-  }
-  const byTeacher=new Map();
-  const details=[];
-  const transferredOut=new Map();
-  for(const l of loads){
-    if(l.transferFromTeacherId&&String(l.transferFromTeacherId)!==String(l.teacherId)){
-      const previous=String(l.transferFromTeacherId);
-      const amount=Object.values(l.weeklyPairs||{}).reduce((n,x)=>n+Math.max(0,Number(x)||0),0)*2;
-      transferredOut.set(previous,(transferredOut.get(previous)||0)+amount);
+    loadWeeks.set(id, values);
+    const groupId = String(load.groupId || '');
+    if (!indexByGroup.has(groupId)) indexByGroup.set(groupId, []);
+    indexByGroup.get(groupId).push(load);
+    for (const [week, planned] of values) {
+      const key = `${id}|${week}`;
+      const weekStart = dateForWeekDay(cfg, week, 0);
+      const weekEnd = dateForWeekDay(cfg, week, 6);
+      buckets.set(key, {
+        loadId: id, teacherId: String(load.teacherId || ''), teacher: teacherMap.get(String(load.teacherId)) || 'Не указан',
+        groupId, group: groupMap.get(groupId) || groupId || '—',
+        subgroup: Number(load.subgroup || 0) || 0,
+        subject: subjectMap.get(String(load.subjectId)) || String(load.subjectId || '—'),
+        type: typeMap.get(String(load.typeId)) || String(load.typeId || ''),
+        week, weekStart, weekEnd, planned, entries: new Map(),
+        receivedFrom: load.transferFromTeacherId ? (teacherMap.get(String(load.transferFromTeacherId)) || String(load.transferFromTeacherId)) : '',
+        transferredTo: load.transferToTeacherId ? (teacherMap.get(String(load.transferToTeacherId)) || String(load.transferToTeacherId)) : '',
+      });
     }
   }
-  for(const l of loads){
-    if(!l?.id)continue;
-    const id=String(l.id), teacherId=String(l.teacherId||'');
-    if(!teacherId)continue;
-    let plannedPairs=0, pastPairs=0, futurePlacedPairs=0, unplacedPairs=0;
-    for(const [weekText,raw] of Object.entries(l.weeklyPairs||{})){
-      const week=Number(weekText), planned=Math.max(0,Number(raw)||0);
-      if(!Number.isInteger(week)||week<1||!planned)continue;
-      plannedPairs+=planned;
-      const occ=lessonsByLoadWeek.get(`${id}|${week}`)||[];
-      const past=Math.min(planned,occ.filter(o=>o.date<=today).reduce((n,o)=>n+o.units,0));
-      const future=Math.min(Math.max(0,planned-past),occ.filter(o=>o.date>today).reduce((n,o)=>n+o.units,0));
-      pastPairs+=past;
-      futurePlacedPairs+=future;
-      unplacedPairs+=Math.max(0,planned-past-future);
+  const findParticipants = (inst, week) => {
+    const ids = new Set();
+    const add = id => { if (id && buckets.has(`${id}|${week}`)) ids.add(String(id)); };
+    add(String(inst.loadId || ''));
+    const parts = streamParticipants(inst);
+    for (const part of parts) add(String(part.loadId || ''));
+    const explicit = parts.filter(p => p?.groupId);
+    const listed = new Set(explicit.map(p => String(p.groupId || '')));
+    const groups = [...explicit, ...streamGroups(inst)
+      .filter(gid => !listed.has(String(gid)))
+      .map(groupId => ({groupId, subgroup: inst.subgroup || 0}))];
+    for (const part of groups) {
+      const groupId = String(part.groupId || '');
+      const subgroup = Number(part.subgroup || 0);
+      const already = [...ids].some(id => String(loadMap.get(id)?.groupId) === groupId && Number(loadMap.get(id)?.subgroup || 0) === subgroup);
+      if (already) continue;
+      let matches = (indexByGroup.get(groupId) || []).filter(l =>
+        buckets.has(`${String(l.id)}|${week}`) &&
+        String(l.subjectId || '') === String(inst.subjectId || '') &&
+        String(l.typeId || '') === String(inst.typeId || '') &&
+        Number(l.subgroup || 0) === subgroup
+      );
+      if (matches.length > 1) {
+        const teacherIds = new Set([String(inst.teacherId || ''), ...(inst.teacherIds || []).map(String)]);
+        const named = matches.filter(l => teacherIds.has(String(l.teacherId || '')) ||
+          teacherIds.has(String(l.transferFromTeacherId || '')) || teacherIds.has(String(l.transferToTeacherId || '')));
+        if (named.length) matches = named;
+      }
+      if (matches.length === 1) add(String(matches[0].id));
+      // Не присваиваем часы наугад, если есть несколько похожих строк нагрузки.
     }
-    const item={loadId:id,teacherId,teacher:teachers.get(teacherId)||teacherId,group:groups.get(String(l.groupId))||'—',
-      subject:subjects.get(String(l.subjectId))||'—',subgroup:Number(l.subgroup||0)||'',
-      planned:plannedPairs*2, past:pastPairs*2, future:futurePlacedPairs*2, unplaced:unplacedPairs*2,
-      remaining:Math.max(0,plannedPairs-pastPairs)*2,
-      receivedFrom:l.transferFromTeacherId?teachers.get(String(l.transferFromTeacherId))||String(l.transferFromTeacherId):'',
-      transferredTo:l.transferToTeacherId?teachers.get(String(l.transferToTeacherId))||String(l.transferToTeacherId):'',
-      incoming:l.transferFromTeacherId&&String(l.transferFromTeacherId)!==teacherId?plannedPairs*2:0};
-    details.push(item);
-    if(!byTeacher.has(teacherId))byTeacher.set(teacherId,{teacherId,teacher:item.teacher,planned:0,past:0,future:0,unplaced:0,remaining:0,incoming:0,outgoing:0,loads:0,transfer:false});
-    const target=byTeacher.get(teacherId);
-    for(const f of ['planned','past','future','unplaced','remaining','incoming'])target[f]+=item[f];
-    target.loads++;
-    if(item.receivedFrom||item.transferredTo)target.transfer=true;
+    return [...ids];
+  };
+  const substitutions = new Map();
+  for (const change of data.substitutions || []) {
+    if (change.instId && change.date) substitutions.set(`${change.date}|${change.instId}`, change);
   }
-  for(const [id,value] of transferredOut){
-    if(!byTeacher.has(id))byTeacher.set(id,{teacherId:id,teacher:teachers.get(id)||id,planned:0,past:0,future:0,unplaced:0,remaining:0,incoming:0,outgoing:0,loads:0,transfer:true});
-    byTeacher.get(id).outgoing+=value;
-    byTeacher.get(id).transfer=true;
+  const assigned = data.schedule?.assignment || {};
+  for (const inst of data.schedule?.instances || []) {
+    if (!inst?.instId || inst.isScheduleEvent || inst.carryOverId) continue;
+    const a = assigned[String(inst.instId)];
+    if (!a || a.day == null) continue;
+    const weeks = visibleWeeksForAssignedOccurrence(data, inst, a);
+    for (const week of weeks) {
+      const date = dateForWeekDay(cfg, week, Number(a.day));
+      if (!date) continue;
+      const change = substitutions.get(`${date}|${inst.instId}`);
+      if (change && ['cancel','cancel_assignment','pending_move','excursion'].includes(change.type)) continue;
+      if (change?.type === 'moved' && !change.targetDate) continue;
+      const actualDate = change?.type === 'moved' ? change.targetDate : date;
+      const units = inst.halfPair || (a.half !== undefined && a.half !== null && a.half !== '') ? 0.5 : 1;
+      const slot = `${actualDate}|${Number(change?.newPeriod ?? a.period)}|${a.half ?? (inst.halfPair ? 'half' : 'whole')}|${canonicalRequirementLayer(inst)}|${inst.format || ''}`;
+      for (const id of findParticipants(inst, week)) {
+        const bucket = buckets.get(`${id}|${week}`);
+        if (!bucket || bucket.entries.has(slot)) continue;
+        bucket.entries.set(slot, {date: actualDate, week, period: Number(change?.newPeriod ?? a.period) + 1, units,
+          type: change?.type === 'moved' ? 'Перенос' : change ? 'С заменой' : 'По расписанию',
+          substituteTeacherId: change?.newTeacherId || '', instId: String(inst.instId)});
+      }
+    }
   }
-  for(const teacher of data.teachers||[]){
-    const id=String(teacher.id||'');if(id&&!byTeacher.has(id))byTeacher.set(id,{teacherId:id,teacher:String(teacher.name||id),planned:0,past:0,future:0,unplaced:0,remaining:0,incoming:0,outgoing:0,loads:0,transfer:false});
+  const details = [];
+  const detailsByLoad = new Map();
+  const byWeek = [];
+  const placements = [];
+  const byTeacher = new Map();
+  const empty = (id, name) => ({teacherId:id, teacher:name, planned:0, past:0, future:0, unplaced:0, remaining:0,
+    incoming:0, outgoing:0, transfer:false, loads:0});
+  for (const load of loadRows) {
+    const id = String(load.teacherId || '');
+    if (id && !byTeacher.has(id)) byTeacher.set(id, empty(id, teacherMap.get(id) || id));
   }
-  const summary=[...byTeacher.values()].sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru'));
-  return {summary,details:details.sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru')||a.group.localeCompare(b.group,'ru')||a.subject.localeCompare(b.subject,'ru'))};
+  for (const bucket of buckets.values()) {
+    const ordered = [...bucket.entries.values()].sort((a,b) => a.date.localeCompare(b.date) || a.period - b.period);
+    let free = bucket.planned, past = 0, future = 0;
+    for (const entry of ordered) {
+      if (free <= 0.000001) break;
+      const amount = Math.min(free, entry.units);
+      free -= amount;
+      if (entry.date <= asOf) past += amount; else future += amount;
+      placements.push({...bucket, entries:undefined, ...entry, units:amount, hours:round(amount * 2),
+        status:entry.date <= asOf ? 'По расписанию до даты' : 'Запланировано впереди'});
+    }
+    const result = {...bucket, entries:undefined, planned:round(bucket.planned * 2), past:round(past * 2),
+      future:round(future * 2), unplaced:round(free * 2), remaining:round((bucket.planned - past) * 2)};
+    byWeek.push(result);
+    let row = detailsByLoad.get(bucket.loadId);
+    if (!row) {
+      row = {...result, week:undefined, weekStart:undefined, weekEnd:undefined,
+        planned:0,past:0,future:0,unplaced:0,remaining:0};
+      details.push(row);
+      detailsByLoad.set(bucket.loadId,row);
+    }
+    for (const key of ['planned','past','future','unplaced','remaining']) row[key] = round(row[key] + result[key]);
+    const target = byTeacher.get(bucket.teacherId) || empty(bucket.teacherId, bucket.teacher);
+    if (!byTeacher.has(bucket.teacherId)) byTeacher.set(bucket.teacherId, target);
+    for (const key of ['planned','past','future','unplaced','remaining']) target[key] = round(target[key] + result[key]);
+  }
+  const transferredOut = new Map();
+  for (const load of loadRows) {
+    const source = String(load.transferFromTeacherId || '');
+    const dest = String(load.teacherId || '');
+    if (source && source !== dest) {
+      const transferred = [...(loadWeeks.get(String(load.id)) || new Map()).values()].reduce((s,n) => s+n,0)*2;
+      transferredOut.set(source, round((transferredOut.get(source) || 0) + transferred));
+      const recipient = byTeacher.get(dest) || empty(dest, teacherMap.get(dest) || dest);
+      recipient.incoming = round(recipient.incoming + transferred);recipient.transfer=true;
+      byTeacher.set(dest, recipient);
+    }
+  }
+  for (const [id, amount] of transferredOut) {
+    const source = byTeacher.get(id) || empty(id, teacherMap.get(id) || id);
+    source.outgoing = round(source.outgoing + amount); source.transfer = true;
+    byTeacher.set(id,source);
+  }
+  for (const d of details) {
+    const target = byTeacher.get(d.teacherId);
+    if (target) { target.loads++; if (d.receivedFrom || d.transferredTo) target.transfer = true; }
+  }
+  for (const t of data.teachers || []) {
+    const id = String(t.id || '');
+    if (id && !byTeacher.has(id)) byTeacher.set(id,empty(id,String(t.name || id)));
+  }
+  const summary = [...byTeacher.values()].sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru'));
+  const sortedWeeks = byWeek.sort((a,b)=>a.week-b.week || a.teacher.localeCompare(b.teacher,'ru') || a.group.localeCompare(b.group,'ru'));
+  return {summary, details:details.sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru') || a.group.localeCompare(b.group,'ru')),
+    byWeek:sortedWeeks, unplaced:sortedWeeks.filter(r=>r.unplaced>0),
+    placements:placements.sort((a,b)=>a.date.localeCompare(b.date) || a.teacher.localeCompare(b.teacher,'ru')),
+    totalWeeks:maxWeeks, hasSchedule:!!data.schedule?.instances?.length};
 }
 
-/* ============================== Отчёты / акты ГПХ ============================== */
+/* ============================== Отчёты: план / прошлое / будущее / нерасставленные ============================== */
 function ReportsPanel({data}) {
-  const [kind,setKind]=useState('gph');
-  const [balanceDate,setBalanceDate]=useState(todayISO());
-  const [transfersOnly,setTransfersOnly]=useState(false);
-  const [from,setFrom]=useState(()=>{const d=todayISO();return `${d.slice(0,7)}-01`;});
-  const [to,setTo]=useState(todayISO());
-  const [teacherId,setTeacherId]=useState('');
-  const [contractNumber,setContractNumber]=useState('');
-  const [contractDate,setContractDate]=useState('');
-  const [actNumber,setActNumber]=useState('');
-  const [actDate,setActDate]=useState(todayISO());
-  const [message,setMessage]=useState('');
-  const report=useMemo(()=>kind==='balance'?{detail:[],review:[],totals:[]}:calculateActualHours(data,from,to),[data,from,to,kind]);
-  const balances=useMemo(()=>calculateTeacherLoadBalances(data,balanceDate),[data,balanceDate]);
-  const contractIds=useMemo(()=>new Set((data.employmentTypes||[]).filter(e=>e.id==='contract'||/гпх|гражданско.?правов/i.test(String(e.name||''))).map(e=>String(e.id)).concat('contract')),[data.employmentTypes]);
-  const gphTeachers=useMemo(()=>(data.teachers||[]).filter(t=>contractIds.has(String(t.employmentType||''))).sort((a,b)=>String(a.name||'').localeCompare(String(b.name||''),'ru')),[data.teachers,contractIds]);
-  const eligibleTeachers=kind==='gph'?gphTeachers:(data.teachers||[]).slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||''),'ru'));
-  const eligibleIds=new Set(eligibleTeachers.map(t=>String(t.id)));
-  const rows=(report.detail||[]).filter(r=>eligibleIds.has(String(r.teacherId))&&(!teacherId||String(r.teacherId)===teacherId)).sort((a,b)=>a.date.localeCompare(b.date)||a.teacher.localeCompare(b.teacher,'ru')||String(a.group).localeCompare(String(b.group),'ru'));
-  const totals=useMemo(()=>{
-    const byTeacher=new Map();
-    for(const r of rows){const key=String(r.teacherId);if(!byTeacher.has(key))byTeacher.set(key,{teacherId:key,teacher:r.teacher,hours:0,count:0,subjects:new Map()});const item=byTeacher.get(key);item.hours+=Number(r.hours)||0;item.count++;const subject=String(r.subject||'Дисциплина не указана');if(!item.subjects.has(subject))item.subjects.set(subject,{subject,hours:0,groups:new Set()});const sub=item.subjects.get(subject);sub.hours+=Number(r.hours)||0;sub.groups.add(r.group||'—');}
-    return [...byTeacher.values()].sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru'));
+  const [kind,setKind] = useState('balance');
+  const [balanceDate,setBalanceDate] = useState(todayISO());
+  const [transfersOnly,setTransfersOnly] = useState(false);
+  const [teacherId,setTeacherId] = useState('');
+  const [groupId,setGroupId] = useState('');
+  const [weekFilter,setWeekFilter] = useState('');
+  const [from,setFrom] = useState(() => {
+    const start = data.config?.semesterStart;
+    const today = todayISO();
+    return start && start <= today ? start : `${today.slice(0,7)}-01`;
+  });
+  const [to,setTo] = useState(() => {
+    const now=todayISO(), end=data.config?.semesterEnd;
+    return end && end < now ? end : now;
+  });
+  const [contractNumber,setContractNumber] = useState('');
+  const [contractDate,setContractDate] = useState('');
+  const [actNumber,setActNumber] = useState('');
+  const [actDate,setActDate] = useState(todayISO());
+  const [message,setMessage] = useState('');
+  const teachers = useMemo(() => (data.teachers||[]).slice().sort((a,b) => String(a.name||'').localeCompare(String(b.name||''),'ru')),[data.teachers]);
+  const groups = useMemo(() => (data.groups||[]).slice().sort((a,b) => String(a.name||'').localeCompare(String(b.name||''),'ru')),[data.groups]);
+  const balances = useMemo(() => calculateTeacherLoadBalances(data,balanceDate),[data,balanceDate]);
+  const contractIds = useMemo(() => new Set((data.employmentTypes||[]).filter(x=>x.id==='contract'||/гпх|гражданско.?правов/i.test(String(x.name||''))).map(x=>String(x.id)).concat('contract')),[data.employmentTypes]);
+  const gphTeachers = teachers.filter(t => contractIds.has(String(t.employmentType||'')));
+  // Преподаватель может вести занятия по ГПХ, но тип занятости в справочнике
+  // ещё не заполнен. Не скрываем его и не создаём ошибочно пустой отчёт.
+  const effectiveTo = (kind==='gph'||kind==='all') && to > todayISO() ? todayISO() : to;
+  const report = useMemo(() => (kind==='gph'||kind==='all') ? calculateActualHours(data,from,effectiveTo) : {detail:[],review:[],totals:[]},[data,from,effectiveTo,kind]);
+  const rows = (report.detail||[]).filter(r => !teacherId || String(r.teacherId)===teacherId)
+    .sort((a,b)=>a.date.localeCompare(b.date)||String(a.teacher).localeCompare(String(b.teacher),'ru'));
+  const totals = useMemo(() => {
+    const out = new Map();
+    for(const r of rows){
+      const id=String(r.teacherId);
+      if(!out.has(id))out.set(id,{teacherId:id,teacher:r.teacher,hours:0,count:0,subjects:new Map()});
+      const item=out.get(id); item.hours+=Number(r.hours)||0; item.count++;
+      const name=String(r.subject||'Не указана');
+      if(!item.subjects.has(name))item.subjects.set(name,{subject:name,hours:0,groups:new Set()});
+      const subject=item.subjects.get(name);subject.hours+=Number(r.hours)||0;subject.groups.add(r.group||'—');
+    }
+    return [...out.values()].sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru'));
   },[rows]);
-  const selectedTeacher=eligibleTeachers.find(t=>String(t.id)===teacherId);
-  const esc=(v)=>String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-  const format=(iso)=>iso?formatDateDM(iso):'____________';
-  const actMarkup=(item)=>{
-    const detail=rows.filter(r=>String(r.teacherId)===String(item.teacherId));
-    const subjects=[...item.subjects.values()].sort((a,b)=>a.subject.localeCompare(b.subject,'ru'));
-    return `<section class="act"><h2>АКТ № ${esc(actNumber||'_____')}</h2><p class="center">об оказанных услугах по договору ГПХ № ${esc(contractNumber||'_____')} от ${esc(format(contractDate))}</p><p>Дата составления: ${esc(format(actDate))}. Отчётный период: ${esc(format(from))} — ${esc(format(to))}.</p><p>Заказчик: ${esc(COLLEGE_NAME)}.</p><p>Исполнитель: <b>${esc(item.teacher)}</b>.</p><p>В отчётном периоде по данным расписания и учтённых изменений отражены следующие образовательные услуги:</p><table><thead><tr><th>№</th><th>Дисциплина / вид работы</th><th>Группы</th><th>Академических часов</th></tr></thead><tbody>${subjects.map((s,i)=>`<tr><td>${i+1}</td><td>${esc(s.subject)}</td><td>${esc([...s.groups].sort((a,b)=>a.localeCompare(b,'ru')).join(', '))}</td><td>${s.hours}</td></tr>`).join('')}<tr><th colspan="3">Всего (учёт по группам)</th><th>${item.hours}</th></tr></tbody></table><h3>Детализация занятий</h3><table><thead><tr><th>Дата</th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Ак. ч.</th><th>Основание</th></tr></thead><tbody>${detail.map(r=>`<tr><td>${esc(format(r.date))}</td><td>${esc(r.period||'—')}</td><td>${esc(r.group)}</td><td>${esc(r.subject)}</td><td>${esc(r.hours)}</td><td>${esc(r.kind)}</td></tr>`).join('')}</tbody></table><p><b>Всего:</b> ${item.hours} академических часов по групповому учёту. Итог подлежит проверке на совместные (поточные) занятия и условия договора.</p><p>Объём оказанных услуг подтверждается сторонами после сверки фактического проведения занятий. Расчёт стоимости и сведения об оплате заполняются на основании договора.</p><p>Стоимость услуг: ____________________ руб.</p><div class="signatures"><p>Заказчик: __________________ / __________________</p><p>Исполнитель: __________________ / ${esc(item.teacher)}</p></div><p class="note">Проект акта сформирован из данных расписания и замен. Не является подтверждением оказания услуг без сверки и подписей сторон.</p></section>`;
+  const summary = balances.summary.filter(r => (!teacherId||r.teacherId===teacherId)&&(!transfersOnly||r.transfer));
+  const detail = balances.details.filter(r => (!teacherId||r.teacherId===teacherId)&&(!transfersOnly||balances.summary.find(t=>t.teacherId===r.teacherId)?.transfer));
+  const unplaced = balances.unplaced.filter(r => (!teacherId||r.teacherId===teacherId) && (!groupId||r.groupId===groupId) && (!weekFilter||String(r.week)===weekFilter) &&
+    (!transfersOnly||balances.summary.find(t=>t.teacherId===r.teacherId)?.transfer));
+  const allUnplaced = balances.unplaced;
+  const total = (items,key) => Math.round(items.reduce((sum,r)=>sum+(Number(r[key])||0),0)*100)/100;
+  const sum = (items,field) => total(items,field);
+  const fmt = x => x ? formatDateDM(x) : '—';
+  const esc = x => String(x ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const appendSheet = (book,name,headers,items,widths) => {
+    const ws=XLSX.utils.aoa_to_sheet([headers,...items]);
+    ws['!cols']=(widths||headers.map(()=>22)).map(w=>({wch:w}));
+    if(items.length)ws['!autofilter']={ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:items.length,c:headers.length-1}})};
+    XLSX.utils.book_append_sheet(book,ws,name);
   };
-  const downloadAct=()=>{
+  const labelRange = r => r.weekStart&&r.weekEnd ? `${fmt(r.weekStart)}–${fmt(r.weekEnd)}` : '';
+  const downloadBalances = () => {
+    const book=XLSX.utils.book_new();
+    appendSheet(book,'По преподавателям',['Преподаватель','План, ак. ч.','Прошло по расписанию','Запланировано впереди','Не расставлено','Всего осталось','Получено','Передано'],
+      summary.map(r=>[r.teacher,r.planned,r.past,r.future,r.unplaced,r.remaining,r.incoming,r.outgoing]),[42,19,27,25,19,21,18,18]);
+    appendSheet(book,'По группам и предметам',['Преподаватель','Группа','Подгруппа','Дисциплина','План','Прошло по расписанию','На будущие даты','Не расставлено','Остаток','Получено от','Передано кому'],
+      detail.map(r=>[r.teacher,r.group,r.subgroup,r.subject,r.planned,r.past,r.future,r.unplaced,r.remaining,r.receivedFrom,r.transferredTo]),[40,26,13,43,13,27,23,20,14,39,39]);
+    appendSheet(book,'Понедельно',['Неделя','Даты','Преподаватель','Группа','Дисциплина','План, ч.','До даты, ч.','Впереди, ч.','Не расставлено, ч.'],
+      balances.byWeek.filter(r=>(!teacherId||r.teacherId===teacherId)&&(!transfersOnly||balances.summary.find(t=>t.teacherId===r.teacherId)?.transfer))
+        .map(r=>[r.week,labelRange(r),r.teacher,r.group,r.subject,r.planned,r.past,r.future,r.unplaced]),[12,24,42,26,44,16,17,20,24]);
+    appendSheet(book,'Прошедшие и будущие',['Дата','Неделя графика','Статус','Преподаватель','Группа','Дисциплина','Ак. ч.','Основание'],
+      balances.placements.filter(r=>(!teacherId||r.teacherId===teacherId)&&(!transfersOnly||balances.summary.find(t=>t.teacherId===r.teacherId)?.transfer))
+        .map(r=>[r.date,r.week,r.status,r.teacher,r.group,r.subject,r.hours,r.type]),[17,18,30,42,27,44,14,20]);
+    appendSheet(book,'Пояснения',['Показатель','Значение'],[
+      ['Срез на дату',balanceDate],
+      ['Прошло по расписанию','Все занятия с датой до указанной включительно, кроме отменённых. Это НЕ подтверждённый факт проведения.'],
+      ['Запланировано впереди','Размещённые в сетке занятия на даты позже выбранной.'],
+      ['Не расставлено','Часы недельного графика, которым не соответствует видимое назначенное занятие.'],
+      ['Проверка','План = прошедшее по сетке + будущее по сетке + нерасставленное.'],
+      ['Потоки','Данные по строкам нагрузки групп. Одна общая пара может входить в планы нескольких групп.'],
+      ['Передача','Часы принадлежат текущему преподавателю строки нагрузки; полученные/переданные показываются справочно.'],
+    ],[32,120]);
+    XLSX.writeFile(book,`контроль_нагрузки_${balanceDate}.xlsx`);
+  };
+  const downloadUnplaced = () => {
+    const book=XLSX.utils.book_new();
+    const all=allUnplaced;
+    appendSheet(book,'По неделям',['Неделя','Даты','Группа','Преподаватель','Дисциплина','Вид занятий','Подгруппа','Не расставлено, пар','Не расставлено, ак. ч.','Получено от'],
+      all.map(r=>[r.week,labelRange(r),r.group,r.teacher,r.subject,r.type,r.subgroup,r.unplaced/2,r.unplaced,r.receivedFrom]),[12,23,26,42,45,24,15,24,26,40]);
+    const grouped = (field,other) => {
+      const map = new Map();
+      for(const row of all){
+        const key=`${row.week}|${row[field]}`;
+        if(!map.has(key))map.set(key,{week:row.week,range:labelRange(row),name:row[field],hours:0,related:new Set(),subjects:new Set()});
+        const item=map.get(key);item.hours+=row.unplaced;item.related.add(row[other]);item.subjects.add(row.subject);
+      }
+      return [...map.values()].sort((a,b)=>a.week-b.week||a.name.localeCompare(b.name,'ru'))
+        .map(r=>[r.week,r.range,r.name,Math.round(r.hours*100)/100,r.hours/2,[...r.related].join(', '),[...r.subjects].join('; ')]);
+    };
+    appendSheet(book,'По группам',['Неделя','Даты','Группа','Ак. часов','Пар','Преподаватели','Дисциплины'],grouped('group','teacher'),[12,23,28,16,12,65,75]);
+    appendSheet(book,'По преподавателям',['Неделя','Даты','Преподаватель','Ак. часов','Пар','Группы','Дисциплины'],grouped('teacher','group'),[12,23,42,16,12,65,75]);
+    const weeks=new Map();
+    for(const r of all){if(!weeks.has(r.week))weeks.set(r.week,{week:r.week,range:labelRange(r),hours:0,count:0});const w=weeks.get(r.week);w.hours+=r.unplaced;w.count++;}
+    appendSheet(book,'Итоги по неделям',['Неделя','Даты','Ак. часов по нагрузке','Пар по нагрузке','Строк нагрузки'],
+      [...weeks.values()].sort((a,b)=>a.week-b.week).map(r=>[r.week,r.range,r.hours,r.hours/2,r.count]),[12,24,28,24,20]);
+    appendSheet(book,'Пояснения',['Показатель','Значение'],[
+      ['Объём выгрузки','ВСЕ преподаватели, группы и недели независимо от фильтров на экране.'],
+      ['Единицы','1 пара = 2 академических часа; 0,5 пары = 1 академический час.'],
+      ['Итоги','Сумма по строкам нагрузки. При общем потоке одна физическая пара может учитываться по нескольким группам.'],
+      ['Источник','Недельные графики минус фактически размещённые в сетке интервалы.'],
+    ],[28,120]);
+    XLSX.writeFile(book,'нераcставленные_пары_все_недели_группы_преподаватели.xlsx');
+  };
+  const downloadActivities = () => {
     if(report.error){setMessage(report.error);return;}
-    if(!teacherId||!selectedTeacher){setMessage('Для акта выберите одного преподавателя ГПХ.');return;}
+    const book=XLSX.utils.book_new();
+    appendSheet(book,'Сводка',['Преподаватель','Записей по группам','Ак. часов'],totals.map(t=>[t.teacher,t.count,t.hours]),[42,28,18]);
+    appendSheet(book,'По дисциплинам',['Преподаватель','Дисциплина','Группы','Ак. часов'],
+      totals.flatMap(t=>[...t.subjects.values()].map(s=>[t.teacher,s.subject,[...s.groups].join(', '),s.hours])),[42,47,58,18]);
+    appendSheet(book,'Занятия',['Дата','Пара','Группа','Преподаватель','Дисциплина','Ак. часов','Вид'],
+      rows.map(r=>[r.date,r.period,r.group,r.teacher,r.subject,r.hours,r.kind]),[18,12,28,42,47,16,25]);
+    appendSheet(book,'Требует сверки',['Дата','Группа','Дисциплина','Тип','Причина'],report.review||[],[18,28,45,26,70]);
+    XLSX.writeFile(book,`занятия_${from}_${effectiveTo}.xlsx`);
+  };
+  const downloadAct = () => {
+    if(report.error){setMessage(report.error);return;}
+    if(!teacherId){setMessage('Для проекта акта выберите одного преподавателя.');return;}
+    const person=teachers.find(t=>String(t.id)===teacherId);
     const item=totals.find(t=>t.teacherId===teacherId);
-    if(!item){setMessage('За выбранный период нет учтённых занятий этого преподавателя.');return;}
-    const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Проект акта ГПХ</title><style>body{font-family:'Times New Roman',serif;font-size:12pt;margin:2cm;color:#000}h2,.center{text-align:center}h2{font-size:15pt}h3{font-size:12pt;margin-top:20px}table{border-collapse:collapse;width:100%;font-size:10pt;margin:12px 0}td,th{border:1px solid #333;padding:5px;text-align:left}th{font-weight:bold}.signatures{margin-top:35px;line-height:2}.note{font-size:9pt;color:#555;margin-top:30px}@page{size:A4;margin:18mm}</style></head><body>${actMarkup(item)}</body></html>`;
-    const blob=new Blob(['\ufeff',html],{type:'application/msword;charset=utf-8'});
-    const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`Акт_ГПХ_${String(selectedTeacher.name||'').replace(/[^\p{L}\p{N}-]+/gu,'_')}_${from}_${to}.doc`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);setMessage('Скачан проект акта Word (.doc). Сверьте фактические часы, договор и подписи.');
+    if(!person||!item){setMessage('За указанный период у преподавателя нет занятий по расписанию. Проверьте даты или выберите другого преподавателя.');return;}
+    const subjects=[...item.subjects.values()].sort((a,b)=>a.subject.localeCompare(b.subject,'ru'));
+    const entries=rows.filter(r=>String(r.teacherId)===teacherId);
+    const formatDate=x=>x?formatDateDM(x):'__________';
+    const markup=`<!DOCTYPE html><html><head><meta charset="utf-8"/><style>body{font-family:'Times New Roman',serif;font-size:12pt;color:#000;margin:18mm}h2{text-align:center}table{border-collapse:collapse;width:100%;margin:12pt 0;font-size:10pt}td,th{border:1px solid #333;padding:5px;text-align:left}.note{font-size:10pt}</style></head><body>
+      <h2>ПРОЕКТ АКТА № ${esc(actNumber||'_____')}</h2>
+      <p>К договору ГПХ № ${esc(contractNumber||'_____')} от ${esc(formatDate(contractDate))}</p>
+      <p>Отчётный период: ${esc(formatDate(from))} — ${esc(formatDate(effectiveTo))}. Дата акта: ${esc(formatDate(actDate))}.</p>
+      <p>Заказчик: ${esc(COLLEGE_NAME)}. Исполнитель: <b>${esc(item.teacher)}</b>.</p>
+      <table><thead><tr><th>№</th><th>Дисциплина / работа</th><th>Группы</th><th>Ак. часов</th></tr></thead><tbody>
+      ${subjects.map((s,i)=>`<tr><td>${i+1}</td><td>${esc(s.subject)}</td><td>${esc([...s.groups].join(', '))}</td><td>${s.hours}</td></tr>`).join('')}
+      <tr><th colspan="3">Итого по группам</th><th>${item.hours}</th></tr></tbody></table>
+      <h3>Даты и виды занятий</h3><table><thead><tr><th>Дата</th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Часы</th><th>Основание</th></tr></thead><tbody>
+      ${entries.map(r=>`<tr><td>${esc(formatDate(r.date))}</td><td>${esc(r.period)}</td><td>${esc(r.group)}</td><td>${esc(r.subject)}</td><td>${r.hours}</td><td>${esc(r.kind)}</td></tr>`).join('')}
+      </tbody></table><p><b>По данным расписания:</b> ${item.hours} ак. ч. по групповому учёту.</p>
+      <p class="note">Это ПРОЕКТ: даты в прошлом не доказывают факт проведения занятий. До подписания сверить журнал, переносы, отмены, потоковые часы и условия договора.</p>
+      <p>Стоимость услуг: __________________ руб.</p><p>Заказчик: __________________________</p><p>Исполнитель: __________________________</p></body></html>`;
+    const blob=new Blob(['\ufeff',markup],{type:'application/msword;charset=utf-8'});
+    const url=URL.createObjectURL(blob),a=document.createElement('a');
+    a.href=url;a.download=`проект_акта_ГПХ_${String(person.name||'').replace(/[^\p{L}\p{N}-]+/gu,'_')}_${from}_${effectiveTo}.doc`;
+    document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+    setMessage('Проект акта выгружен. Подтвердите фактические часы перед подписанием.');
   };
-  const downloadExcel=()=>{
-    if(report.error){setMessage(report.error);return;}
-    const wb=XLSX.utils.book_new();
-    const add=(title,head,body,widths)=>{const ws=XLSX.utils.aoa_to_sheet([head,...body]);ws['!cols']=widths.map(w=>({wch:w}));XLSX.utils.book_append_sheet(wb,ws,title);};
-    add('Сводка',['Преподаватель','Статус','Занятий по группам','Ак. часов'],totals.map(t=>[t.teacher,kind==='gph'?'ГПХ':'Все',t.count,t.hours]),[42,18,25,15]);
-    add('Дисциплины',['Преподаватель','Дисциплина','Группы','Ак. часов'],totals.flatMap(t=>[...t.subjects.values()].map(s=>[t.teacher,s.subject,[...s.groups].join(', '),s.hours])),[38,45,45,15]);
-    add('Занятия',['Дата','Пара','Группа','Дисциплина','Преподаватель','Ак. часов','Вид','Примечание'],rows.map(r=>[r.date,r.period,r.group,r.subject,r.teacher,r.hours,r.kind,r.note||'']),[17,9,27,46,38,15,23,40]);
-    add('На проверку',['Дата','Группа','Дисциплина','Тип','Причина'],report.review||[],[17,28,46,24,65]);
-    XLSX.writeFile(wb,`Отчет_${kind==='gph'?'ГПХ':'по_преподавателям'}_${from}_${to}.xlsx`);
-  };
-  const balanceRows=balances.summary.filter(x=>(!teacherId||x.teacherId===teacherId)&&(!transfersOnly||x.transfer));
-  const balanceDetail=balances.details.filter(x=>(!teacherId||x.teacherId===teacherId)&&(!transfersOnly||balances.summary.some(t=>t.teacherId===x.teacherId&&t.transfer)));
-  const downloadBalances=()=>{
-    const wb=XLSX.utils.book_new();
-    const sheet=(name,headers,rows,widths)=>{const ws=XLSX.utils.aoa_to_sheet([headers,...rows]);ws['!cols']=widths.map(w=>({wch:w}));XLSX.utils.book_append_sheet(wb,ws,name);};
-    sheet('Остаток по преподавателям',['Преподаватель','План, ак. ч.','По расписанию до даты, ак. ч.','Осталось, ак. ч.','Из них не размещено','Размещено после даты','Получено при передаче','Передано другим','Были передачи'],
-      balanceRows.map(t=>[t.teacher,t.planned,t.past,t.remaining,t.unplaced,t.future,t.incoming,t.outgoing,t.transfer?'Да':'Нет']),[44,17,30,21,24,24,26,20,18]);
-    sheet('По дисциплинам и группам',['Преподаватель','Группа','Подгруппа','Дисциплина','План, ак. ч.','По расписанию до даты','Осталось','Неразмещено','Запланировано впереди','Получено от','Передано кому'],
-      balanceDetail.map(r=>[r.teacher,r.group,r.subgroup,r.subject,r.planned,r.past,r.remaining,r.unplaced,r.future,r.receivedFrom,r.transferredTo]),[42,25,14,42,20,26,16,18,26,42,42]);
-    sheet('Пояснения',['Показатель','Пояснение'],[['Дата отсечения',balanceDate],['Метод','Учёт по актуальным строкам нагрузки после передачи; 1 пара = 2 ак. часа, половина пары = 1 час.'],['По расписанию до даты','Оценка, а не подтверждённый факт проведения. Сверьте журнал, отмены и перенесённые занятия.'],['Осталось','План после передачи минус занятия, которые стоят в расписании до указанной даты.'],['Неразмещено','План без размещения на дату среза или после неё; сюда могут входить пары прошедших недель.'],['Передача','Полученные часы учитываются у нового преподавателя, историческая часть — у прежнего.']],[32,120]);
-    XLSX.writeFile(wb,`остаток_нагрузки_на_${balanceDate}.xlsx`);
-  };
+  const download = () => kind==='unplaced' ? downloadUnplaced() : kind==='balance' ? downloadBalances() : downloadActivities();
   return <div className="section actual-hours-section">
-    <header className="section-head"><div><h1>Отчёты</h1><p>Отчётность по проведённым занятиям и проект акта по договору ГПХ.</p></div></header>
-    <div className="actual-hours-controls" style={{flexWrap:'wrap',alignItems:'end'}}>
-      <label>Вид отчёта<select value={kind} onChange={e=>{setKind(e.target.value);setTeacherId('');setMessage('');}}><option value="gph">Акты и часы ГПХ</option><option value="all">Нагрузка преподавателей за период</option><option value="balance">Остаток нагрузки и передачи</option></select></label>
-      {kind!=='balance'&&<label>С <input type="date" value={from} onChange={e=>setFrom(e.target.value)}/></label>}
-      {kind!=='balance'&&<label>По <input type="date" value={to} onChange={e=>setTo(e.target.value)}/></label>}
-      <label>Преподаватель<select value={teacherId} onChange={e=>setTeacherId(e.target.value)}><option value="">Все преподаватели</option>{eligibleTeachers.map(t=><option key={t.id} value={String(t.id)}>{t.name}</option>)}</select></label>
-      {kind==='balance'&&<label>Срез на дату<input type="date" value={balanceDate} onChange={e=>setBalanceDate(e.target.value)}/></label>}
-      {kind==='balance'&&<label style={{display:'flex',alignItems:'center',gap:6}}><input type="checkbox" checked={transfersOnly} onChange={e=>setTransfersOnly(e.target.checked)}/> Только с передачей нагрузки</label>}
-      <button className="btn" onClick={kind==='balance'?downloadBalances:downloadExcel}><Download size={14}/> Excel</button>
-      {kind==='gph'&&<button className="btn primary" disabled={!teacherId} onClick={downloadAct}><Download size={14}/> Проект акта Word</button>}
+    <header className="section-head"><div><h1>Отчёты</h1><p>Контроль нагрузки: что прошло по расписанию, что запланировано и что ещё не расставлено.</p></div></header>
+    <div className="actual-hours-tabs" style={{flexWrap:'wrap',marginBottom:14}}>
+      {[
+        ['balance','Контроль нагрузки'],
+        ['unplaced','Нерасставленные пары'],
+        ['gph','Акты ГПХ'],
+        ['all','Занятия за период'],
+      ].map(([id,label])=><button key={id} className={kind===id?'btn primary':'btn ghost'} onClick={()=>{setKind(id);setTeacherId('');setMessage('');}}>{label}</button>)}
     </div>
-    {kind==='gph'&&teacherId&&<div className="actual-hours-controls" style={{flexWrap:'wrap'}}><label>№ акта<input value={actNumber} onChange={e=>setActNumber(e.target.value)} placeholder="По договору"/></label><label>Дата акта<input type="date" value={actDate} onChange={e=>setActDate(e.target.value)}/></label><label>№ договора ГПХ<input value={contractNumber} onChange={e=>setContractNumber(e.target.value)} placeholder="№ договора"/></label><label>Дата договора<input type="date" value={contractDate} onChange={e=>setContractDate(e.target.value)}/></label></div>}
+    <div className="actual-hours-controls" style={{flexWrap:'wrap',alignItems:'end'}}>
+      {(kind==='balance'||kind==='unplaced')&&<label>Состояние на дату<input type="date" value={balanceDate} onChange={e=>setBalanceDate(e.target.value)}/></label>}
+      {(kind==='gph'||kind==='all')&&<><label>С<input type="date" value={from} onChange={e=>setFrom(e.target.value)}/></label><label>По<input type="date" value={to} onChange={e=>setTo(e.target.value)}/></label></>}
+      <label>Преподаватель<select value={teacherId} onChange={e=>setTeacherId(e.target.value)}><option value="">Все преподаватели</option>{teachers.map(t=><option value={String(t.id)} key={t.id}>{t.name}</option>)}</select></label>
+      {kind==='unplaced'&&<><label>Группа<select value={groupId} onChange={e=>setGroupId(e.target.value)}><option value="">Все группы</option>{groups.map(g=><option value={String(g.id)} key={g.id}>{g.name}</option>)}</select></label>
+        <label>Неделя<select value={weekFilter} onChange={e=>setWeekFilter(e.target.value)}><option value="">Все недели</option>{[...new Set(balances.byWeek.map(x=>x.week))].sort((a,b)=>a-b).map(w=><option key={w} value={String(w)}>{w}</option>)}</select></label></>}
+      {(kind==='balance'||kind==='unplaced')&&<label style={{display:'flex',gap:6,alignItems:'center'}}><input type="checkbox" checked={transfersOnly} onChange={e=>setTransfersOnly(e.target.checked)}/> С передачами нагрузки</label>}
+      <button className="btn primary" onClick={download}><Download size={14}/> {kind==='unplaced'?'Excel — все группы и преподаватели':'Экспорт в Excel'}</button>
+      {kind==='gph'&&<button className="btn" disabled={!teacherId} onClick={downloadAct}><Download size={14}/> Проект акта Word</button>}
+    </div>
     {message&&<div className="notice">{message}</div>}
-    {kind!=='balance'&&<><div className="notice">Данные рассчитаны по запланированным занятиям с учётом отмен, переносов, замен и вручную добавленных занятий. Необходимо подтвердить фактическое проведение, сверить часы потоковых занятий и условия договора до подписания акта. Оплата автоматически не рассчитывается.</div>
-    {report.error?<div className="notice">{report.error}</div>:<>
-      {kind==='gph'&&gphTeachers.length===0&&<div className="notice">Нет преподавателей с типом занятости «ГПХ». Укажите его в разделе «Списки → Преподаватели».</div>}
-      <div className="actual-hours-stats"><div><b>{totals.length}</b><span>Преподавателей с занятиями</span></div><div><b>{rows.reduce((n,r)=>n+(Number(r.hours)||0),0)}</b><span>Академических часов (по группам)</span></div><div><b>{rows.length}</b><span>Записей о занятиях</span></div><div><b>{(report.review||[]).length}</b><span>Записей требуют сверки</span></div></div>
-      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>Дисциплины и группы</th><th>Занятий по группам</th><th>Ак. ч.</th></tr></thead><tbody>{totals.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b></td><td>{[...t.subjects.values()].map(s=><div key={s.subject}>{s.subject} — {[...s.groups].join(', ')} ({s.hours} ч.)</div>)}</td><td>{t.count}</td><td><b>{t.hours}</b></td></tr>)}{!totals.length&&<tr><td colSpan={4}>Нет учтённых занятий за выбранный период.</td></tr>}</tbody></table></div>
-    </>}</>}
+    {(kind==='balance'||kind==='unplaced')&&<div className="notice">План считается из понедельных графиков нагрузки, размещение — из сохранённого расписания с учётом отмен и переносов. <b>«Прошло по расписанию» — предварительная оценка, не подтверждённый факт проведения.</b> 1 пара = 2 ак. часа. Для потоков суммы по строкам нагрузки нескольких групп могут включать общую пару несколько раз.</div>}
     {kind==='balance'&&<>
-      <div className="notice">Остаток рассчитан по актуальным недельным графикам нагрузки с учётом передачи часов. Колонка «По расписанию до даты» — <b>предварительная оценка проведённого</b>, а не подтверждение факта. Для окончательного отчёта сверьте журнал, отмены, замены и переносы. Все значения указаны в академических часах.</div>
-      <div className="actual-hours-stats"><div><b>{balanceRows.length}</b><span>Преподавателей</span></div><div><b>{balanceRows.reduce((n,t)=>n+t.remaining,0)}</b><span>Ещё осталось, ак. ч.</span></div><div><b>{balanceRows.reduce((n,t)=>n+t.unplaced,0)}</b><span>Из них не размещено</span></div><div><b>{balanceRows.filter(t=>t.transfer).length}</b><span>С передачами нагрузки</span></div></div>
-      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>План, ч.</th><th>По расписанию до даты, ч.</th><th>Осталось, ч.</th><th>Неразмещено, ч.</th><th>Размещено впереди, ч.</th><th>Получено, ч.</th><th>Передано, ч.</th></tr></thead><tbody>{balanceRows.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b>{t.transfer&&<div className="muted">Передача нагрузки</div>}</td><td>{t.planned}</td><td>{t.past}</td><td><b>{t.remaining}</b></td><td>{t.unplaced}</td><td>{t.future}</td><td>{t.incoming||'—'}</td><td>{t.outgoing||'—'}</td></tr>)}{!balanceRows.length&&<tr><td colSpan={8}>Нет преподавателей по выбранному фильтру.</td></tr>}</tbody></table></div>
+      {!balances.hasSchedule&&<div className="notice">Сохранённого расписания пока нет: часы из графика показаны как нерасставленные. После составления расписания отчёт автоматически разделит их на прошедшие и будущие.</div>}
+      <div className="actual-hours-stats">
+        <div><b>{sum(summary,'planned')}</b><span>План, ак. ч.</span></div>
+        <div><b>{sum(summary,'past')}</b><span>Прошло по расписанию</span></div>
+        <div><b>{sum(summary,'future')}</b><span>Запланировано впереди</span></div>
+        <div><b>{sum(summary,'unplaced')}</b><span>Не расставлено</span></div>
+        <div><b>{sum(summary,'remaining')}</b><span>Всего осталось</span></div>
+      </div>
+      <h3>По преподавателям</h3>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>План, ч.</th><th>Прошло, ч.</th><th>Впереди, ч.</th><th>Не расставлено, ч.</th><th>Осталось, ч.</th><th>Получено, ч.</th><th>Передано, ч.</th></tr></thead><tbody>
+        {summary.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b>{t.transfer&&<div className="muted">Есть передача нагрузки</div>}</td><td>{t.planned}</td><td>{t.past}</td><td>{t.future}</td><td><b>{t.unplaced}</b></td><td><b>{t.remaining}</b></td><td>{t.incoming||'—'}</td><td>{t.outgoing||'—'}</td></tr>)}
+        {!summary.length&&<tr><td colSpan={8}>Нет преподавателей для выбранного фильтра.</td></tr>}
+      </tbody></table></div>
       <h3 style={{marginTop:20}}>По дисциплинам и группам</h3>
-      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>Группа</th><th>Дисциплина</th><th>План, ч.</th><th>Остаток, ч.</th><th>Неразмещено, ч.</th><th>Источник передачи</th></tr></thead><tbody>{balanceDetail.map((r,i)=><tr key={`${r.loadId}-${i}`}><td>{r.teacher}</td><td>{r.group}{r.subgroup?` / п/г ${r.subgroup}`:''}</td><td>{r.subject}</td><td>{r.planned}</td><td><b>{r.remaining}</b></td><td>{r.unplaced}</td><td>{r.receivedFrom||'—'}</td></tr>)}{!balanceDetail.length&&<tr><td colSpan={7}>Нет назначенной нагрузки.</td></tr>}</tbody></table></div>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>Группа</th><th>Дисциплина</th><th>План</th><th>Прошло</th><th>Впереди</th><th>Не расставлено</th><th>Источник передачи</th></tr></thead><tbody>
+        {detail.map(d=><tr key={d.loadId}><td>{d.teacher}</td><td>{d.group}{d.subgroup?` / п/г ${d.subgroup}`:''}</td><td>{d.subject}</td><td>{d.planned}</td><td>{d.past}</td><td>{d.future}</td><td><b>{d.unplaced}</b></td><td>{d.receivedFrom||'—'}</td></tr>)}
+        {!detail.length&&<tr><td colSpan={8}>В недельных графиках нет назначенной нагрузки.</td></tr>}
+      </tbody></table></div>
+      <p className="muted">Проверка расчёта: план = прошло + впереди + не расставлено. «Осталось» = впереди + не расставлено. Для списка конкретных нерасставленных занятий откройте вкладку «Нерасставленные пары» выше.</p>
+    </>}
+    {kind==='unplaced'&&<>
+      <div className="actual-hours-stats"><div><b>{sum(unplaced,'unplaced')}</b><span>Ак. часов не расставлено</span></div><div><b>{sum(unplaced,'unplaced')/2}</b><span>Пар по строкам нагрузки</span></div><div><b>{new Set(unplaced.map(x=>x.groupId)).size}</b><span>Групп</span></div><div><b>{new Set(unplaced.map(x=>x.teacherId)).size}</b><span>Преподавателей</span></div></div>
+      <div className="notice">На экране действуют фильтры. Кнопка Excel выгружает <b>все недели, всех преподавателей и все группы</b> независимо от фильтров, включая листы «По неделям», «По группам», «По преподавателям», «Итоги».</div>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Неделя</th><th>Даты</th><th>Группа</th><th>Преподаватель</th><th>Дисциплина</th><th>Вид</th><th>Не расставлено, пар</th><th>Ак. ч.</th></tr></thead><tbody>
+        {unplaced.slice(0,300).map(r=><tr key={`${r.loadId}-${r.week}`}><td><b>{r.week}</b></td><td>{labelRange(r)}</td><td>{r.group}</td><td>{r.teacher}{r.receivedFrom&&<div className="muted">Получено от {r.receivedFrom}</div>}</td><td>{r.subject}{r.subgroup?` / п/г ${r.subgroup}`:''}</td><td>{r.type}</td><td>{r.unplaced/2}</td><td><b>{r.unplaced}</b></td></tr>)}
+        {!unplaced.length&&<tr><td colSpan={8}>По выбранным фильтрам нет нерасставленных занятий.</td></tr>}
+      </tbody></table></div>
+      {unplaced.length>300&&<p className="muted">Показаны первые 300 строк из {unplaced.length}. Excel содержит полный список без ограничений.</p>}
+    </>}
+    {(kind==='gph'||kind==='all')&&<>
+      {kind==='gph'&&<div className="notice">Проект акта можно сформировать по любому преподавателю, даже если в справочнике ещё не выбран тип «ГПХ». Сейчас преподавателей с отмеченным типом «ГПХ»: {gphTeachers.length}. Для подписания необходимо подтвердить фактическое проведение занятий и исключить двойной учёт потоков.</div>}
+      {kind==='gph'&&teacherId&&<div className="actual-hours-controls" style={{flexWrap:'wrap'}}><label>№ акта<input value={actNumber} onChange={e=>setActNumber(e.target.value)}/></label><label>Дата акта<input type="date" value={actDate} onChange={e=>setActDate(e.target.value)}/></label><label>№ договора<input value={contractNumber} onChange={e=>setContractNumber(e.target.value)}/></label><label>Дата договора<input type="date" value={contractDate} onChange={e=>setContractDate(e.target.value)}/></label></div>}
+      {report.error?<div className="notice">{report.error}</div>:<>
+        <div className="actual-hours-stats"><div><b>{totals.length}</b><span>Преподавателей с занятиями</span></div><div><b>{sum(rows,'hours')}</b><span>Ак. часов по группам</span></div><div><b>{rows.length}</b><span>Записей о занятиях</span></div><div><b>{(report.review||[]).length}</b><span>Требуют сверки</span></div></div>
+        <div className="notice">В таблице показаны занятия на прошедшие даты по сохранённому расписанию с учётом замен. Для отчёта об <b>остатке</b> и будущих занятиях используйте «Контроль нагрузки преподавателей».</div>
+        <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>Дисциплины / группы</th><th>Занятий по группам</th><th>Ак. ч.</th></tr></thead><tbody>
+          {totals.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b></td><td>{[...t.subjects.values()].map(s=><div key={s.subject}>{s.subject} — {[...s.groups].join(', ')} ({s.hours} ч.)</div>)}</td><td>{t.count}</td><td><b>{t.hours}</b></td></tr>)}
+          {!totals.length&&<tr><td colSpan={4}>Нет занятий в периоде {from} — {effectiveTo}. Проверьте даты и сохранённое расписание.</td></tr>}
+        </tbody></table></div>
+        <h3 style={{marginTop:20}}>Занятия по датам</h3>
+        <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Дата</th><th>Пара</th><th>Группа</th><th>Преподаватель</th><th>Дисциплина</th><th>Ак. ч.</th><th>Основание</th></tr></thead><tbody>
+          {rows.slice(0,300).map((r,i)=><tr key={`${r.date}-${r.teacherId}-${i}`}><td>{fmt(r.date)}</td><td>{r.period}</td><td>{r.group}</td><td>{r.teacher}</td><td>{r.subject}</td><td>{r.hours}</td><td>{r.kind}</td></tr>)}
+          {!rows.length&&<tr><td colSpan={7}>Нет записей по выбранным датам.</td></tr>}
+        </tbody></table></div>
+        {rows.length>300&&<p className="muted">Показаны первые 300 записей; Excel содержит все.</p>}
+      </>}
     </>}
   </div>;
 }

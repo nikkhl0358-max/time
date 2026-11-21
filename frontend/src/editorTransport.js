@@ -19,6 +19,7 @@ const TAB_SECTIONS_MAP = {
   graphs: ['loads', 'graphState'],
   schedule: ['loads', 'schedule', 'graphState'],
   actualHours: ['loads', 'schedule'],
+  reports: ['loads', 'schedule'], // отчёты должны получить реальные графики и сетку, а не отложенные пустые поля
   conflicts: ['loads', 'schedule'],
   bulkEdit: ['loads', 'schedule'],
   analytics: ['loads', 'schedule'],
