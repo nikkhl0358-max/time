@@ -188,6 +188,19 @@ function weekDayWithinSemester(config, week, day) {
   return true;
 }
 
+function groupExamWeeks(data, groupId) {
+  const semester = String(data?.config?.semesterStart || "");
+  return (data?.examWeeks || []).filter((entry) => String(entry.groupId) === String(groupId) && String(entry.semesterStart || "") === semester)
+    .flatMap((entry) => (entry.weeks || []).map(Number)).filter((n) => Number.isInteger(n) && n > 0);
+}
+function isGroupExamWeek(data, groupId, week) {
+  return groupExamWeeks(data, groupId).includes(Number(week));
+}
+function isGroupExamDate(data, groupId, date) {
+  if (!date || !data?.config?.semesterStart) return false;
+  return isGroupExamWeek(data, groupId, weekNumberOf(data.config.semesterStart, date));
+}
+
 function isGroupOnPractice(data, groupId, date) {
   return (data?.practices || []).find((p) => p.groupId === groupId && p.dateStart <= date && date <= p.dateEnd) || null;
 }
@@ -771,6 +784,7 @@ function normalizeStoredData(raw) {
     graphState: Object.keys(persistedGraphState).length ? persistedGraphState : graphStateFromLoads(normalizedLoads),
     graphRecoveredRows: recoveredGraphRows,
     attestationTypes: data.attestationTypes?.length ? data.attestationTypes : ["зачёт", "экзамен", "курсовая работа", "дифф. зачёт"],
+    examWeeks: Array.isArray(data.examWeeks) ? data.examWeeks : [],
     practices: (data.practices || []).map((p) => ({ name: "", roomId: "", ...p, roomBookings: Array.isArray(p.roomBookings) ? p.roomBookings : [] })),
     calendarExceptions: data.calendarExceptions || [],
     groupDayBlocks: Array.isArray(data.groupDayBlocks) ? data.groupDayBlocks : [], // {id,groupId,date,addedLockedIds[]}
@@ -9716,7 +9730,8 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
     graphPracticeCache.set(practiceCacheKey, result);
     return result;
   };
-  const practiceBlocksLoadWeek = (load, week) => !!practiceForLoadWeek(load, week)?.fullWeek;
+  const examBlocksLoadWeek = (load, week) => groupIdsForLoad(load).some((gid) => isGroupExamWeek(data, gid, week));
+  const practiceBlocksLoadWeek = (load, week) => examBlocksLoadWeek(load, week) || !!practiceForLoadWeek(load, week)?.fullWeek;
 
   const graphLocked = (load) => !!load?.graphLocked;
   const graphRowLocked = (load) => streamRowsFor(load).some((row) => graphLocked(row));
@@ -9863,7 +9878,7 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
       const date = addDays(monday, day);
       if (date < config.semesterStart || date > config.semesterEnd || isNoClassDate(data, date)) continue;
       nominalDays++;
-      if (isGroupOnPractice(data, gid, date)) practiceBlockedDays++;
+      if (isGroupOnPractice(data, gid, date) || isGroupExamWeek(data, gid, week)) practiceBlockedDays++;
       else availableDays++;
     }
     return { nominalDays, availableDays, practiceBlockedDays };
@@ -10648,10 +10663,10 @@ function GraphsPanel({ data, set, onPersistNow, activeUsers = [], currentUser = 
       {smartGraphResult.problems.length > 0 && <details className="smart-result-details"><summary>Показать причины ({smartGraphResult.problems.length})</summary><div className="smart-result-problems">{smartGraphResult.problems.map((p,i)=><div key={i}>{p}</div>)}</div></details>}
     </div>}
     {totalWeeks===0 ? <div className="notice">Сначала задайте даты семестра во вкладке «Семестр».</div> : !graphHasSelection ? <div className="notice">{viewMode==="filter" ? "Выберите одну или несколько групп и/или преподавателя." : <>Нет доступных вариантов для просмотра по {modeLabel}.</>}</div> : (graphTargetPending || graphFilterPending) ? <div className="notice graph-target-loading"><Loader2 size={16} className="spin"/> Загружаю график…</div> : selectedLoads.length===0 ? <div className="notice">По выбранным фильтрам нагрузка не найдена.</div> : <>
-      <div className="grid-wrap graphs-scroll"><table className="schedule-grid graphs-table"><thead><tr><th className="time-col">Дисциплина / нагрузка</th>{Array.from({length:totalWeeks}).map((_,i)=>{const n=i+1,par=parityForWeekNumber(config,n),cap=viewMode==="group"&&targetId?groupWeekCapacity(targetId,n):null;return <th key={n} className={`${par==="odd"?"gw-odd":"gw-even"}${cap?.overPairs?" graphs-week-over-head":""}${cap?.partialPractice?" graphs-week-partial-practice-head":""}${cap?.fullPractice?" graphs-week-full-practice-head":""}`} title={cap?.practiceBlockedDays?`Практика занимает ${cap.practiceBlockedDays} из ${cap.nominalDays} учебных дней. Доступно для занятий: ${cap.days}. Недельный лимит уменьшен до ${cap.capacityPairs*2} ак.ч.`:""}><div>{n}</div><small>{par==="odd"?"чис.":"знам."}</small><div className="graphs-week-hours-head">{weekHourTotals[i]} ч.{cap?` / ${cap.capacityPairs*2}`:""}</div>{cap?.partialPractice?<small className="graphs-partial-practice-label">ПР частично</small>:cap?.fullPractice?<small className="graphs-partial-practice-label">ПР</small>:null}</th>})}<th>Всего</th><th>Часы</th><th>Расстановка</th></tr></thead>
+      <div className="grid-wrap graphs-scroll"><table className="schedule-grid graphs-table"><thead><tr><th className="time-col">Дисциплина / нагрузка</th>{Array.from({length:totalWeeks}).map((_,i)=>{const n=i+1,par=parityForWeekNumber(config,n),cap=viewMode==="group"&&targetId?groupWeekCapacity(targetId,n):null;return <th key={n} className={`${par==="odd"?"gw-odd":"gw-even"}${cap?.overPairs?" graphs-week-over-head":""}${cap?.partialPractice?" graphs-week-partial-practice-head":""}${cap?.fullPractice?" graphs-week-full-practice-head":""}`} title={cap?.practiceBlockedDays?`Практика или экзаменационная неделя занимает ${cap.practiceBlockedDays} из ${cap.nominalDays} учебных дней. Доступно для занятий: ${cap.days}. Недельный лимит уменьшен до ${cap.capacityPairs*2} ак.ч.`:""}><div>{n}</div><small>{par==="odd"?"чис.":"знам."}</small><div className="graphs-week-hours-head">{weekHourTotals[i]} ч.{cap?` / ${cap.capacityPairs*2}`:""}</div>{cap?.partialPractice?<small className="graphs-partial-practice-label">ПР частично</small>:cap?.fullPractice?<small className="graphs-partial-practice-label">{isGroupExamWeek(data,targetId,n)?"ЭКЗ":"ПР"}</small>:null}</th>})}<th>Всего</th><th>Часы</th><th>Расстановка</th></tr></thead>
       <tbody>{selectedLoads.map((l)=>{const over=overloadInfo(l),pairs=rowTotalPairs(l),limit=autoPairLimit(l),remaining=remainingLoadInfo(l);const loadStatusClass=remaining ? (remaining.remainingPairs < 0 ? "graph-load-row-over" : remaining.remainingPairs > 0 ? "graph-load-row-partial" : "graph-load-row-done") : "";const locked=graphRowLocked(l);return <tr key={l.id} className={`${over.length?"hours-over-row":""} ${loadStatusClass} ${locked?"graph-row-locked":""}`.trim()}>
         <td className="time-col graphs-row-label"><div className="graphs-subject">{byId(subjects,l.subjectId)?.name||"—"}</div><div className="graphs-meta">{rowContext(l)}</div>{scarcityBadge(l)}{limit==null&&<div className="remote-note">Авто недоступно: часы не найдены в учебном плане.</div>}{over.length>0&&<div className="remote-warn">⚠️ Перебор часов: {over.join("; ")}</div>}</td>
-        {Array.from({length:totalWeeks}).map((_,i)=>{const w=i+1,p=practiceForLoadWeek(l,w),cellValue=effectiveCellValue(l,w),peer=graphPeerForCell(l,w),peerInfo=graphPeerHoursInfo(l,w);const practiceTitle=p?(p.fullWeek?`Практика занимает всю доступную учебную неделю. Обычные пары не ставятся.`:`Практика занимает ${p.blockedDays} из ${p.totalDays} доступных учебных дней. Осталось ${p.availableDays} дн. для обычных занятий; недельный лимит уменьшен.`):"";return <td key={w} className={`graphs-cell ${parityForWeekNumber(config,w)==="odd"?"gw-odd-cell":"gw-even-cell"}${p?.fullWeek?" practice-week-cell":p?.partial?" practice-week-partial-cell":""}${peer?" graph-cell-peer-editing":""}`} title={practiceTitle||peer?practiceTitle||`${peer.name||peer.login||"Коллега"} сейчас редактирует эту ячейку`:graphCellHint(cellValue)}>{p?<div className="practice-week-mark">{p.fullWeek?"ПР":"ПР част."}</div>:null}{peer&&<span className="graph-peer-initials" title={`${peer.name||peer.login||"Коллега"} сейчас редактирует`}>{graphPeerInitials(peer)}</span>}<GraphCellNumberInput disabled={!!p?.fullWeek || locked} value={cellValue} onFocus={()=>announceGraphEditing(l,w,true)} onBlur={()=>announceGraphEditing(l,w,false)} onCommit={(next)=>setCell(l.id,w,next)}/>{peerInfo&&<div className="graphs-meta graph-cell-links" title={[...peerInfo.own,...peerInfo.remote].map((x)=>`${x.full}: ${String(x.weekValue).replace('.', ',')} пар на ${w}-й неделе`).join(" · ")}>{peerInfo.own.map((x)=><span key={`own-${x.id}`} className="graph-cell-link-own">{x.short} — {String(x.weekValue).replace('.', ',')}</span>)}{peerInfo.remote.map((x)=><span key={`remote-${x.id}`} className="graph-cell-link-remote">{x.short} — {String(x.weekValue).replace('.', ',')}</span>)}</div>}</td>})}
+        {Array.from({length:totalWeeks}).map((_,i)=>{const w=i+1,p=practiceForLoadWeek(l,w),exam=examBlocksLoadWeek(l,w),cellValue=effectiveCellValue(l,w),peer=graphPeerForCell(l,w),peerInfo=graphPeerHoursInfo(l,w);const practiceTitle=p?(p.fullWeek?`Практика занимает всю доступную учебную неделю. Обычные пары не ставятся.`:`Практика занимает ${p.blockedDays} из ${p.totalDays} доступных учебных дней. Осталось ${p.availableDays} дн. для обычных занятий; недельный лимит уменьшен.`):"";return <td key={w} className={`graphs-cell ${parityForWeekNumber(config,w)==="odd"?"gw-odd-cell":"gw-even-cell"}${exam?" exam-week-cell":""}${p?.fullWeek?" practice-week-cell":p?.partial?" practice-week-partial-cell":""}${peer?" graph-cell-peer-editing":""}`} title={practiceTitle||peer?practiceTitle||`${peer.name||peer.login||"Коллега"} сейчас редактирует эту ячейку`:exam?"Экзаменационная неделя. Обычные занятия не планируются.":graphCellHint(cellValue)}>{exam?<div className="practice-week-mark exam-week-mark">ЭКЗ</div>:p?<div className="practice-week-mark">{p.fullWeek?"ПР":"ПР част."}</div>:null}{peer&&<span className="graph-peer-initials" title={`${peer.name||peer.login||"Коллега"} сейчас редактирует`}>{graphPeerInitials(peer)}</span>}<GraphCellNumberInput disabled={exam || !!p?.fullWeek || locked} value={cellValue} onFocus={()=>announceGraphEditing(l,w,true)} onBlur={()=>announceGraphEditing(l,w,false)} onCommit={(next)=>setCell(l.id,w,next)}/>{peerInfo&&<div className="graphs-meta graph-cell-links" title={[...peerInfo.own,...peerInfo.remote].map((x)=>`${x.full}: ${String(x.weekValue).replace('.', ',')} пар на ${w}-й неделе`).join(" · ")}>{peerInfo.own.map((x)=><span key={`own-${x.id}`} className="graph-cell-link-own">{x.short} — {String(x.weekValue).replace('.', ',')}</span>)}{peerInfo.remote.map((x)=><span key={`remote-${x.id}`} className="graph-cell-link-remote">{x.short} — {String(x.weekValue).replace('.', ',')}</span>)}</div>}</td>})}
         <td className="graphs-total">{String(pairs).replace('.', ',')} пар</td><td className={over.length?"hours-over":""}>{String(pairs*2).replace('.', ',')} ак.ч.</td>
         <td className="graph-row-actions">
           <div className={`graph-mode-badge graph-mode-${graphModeOf(l)}`}>
@@ -20951,6 +20966,96 @@ ${check.reason || "Конфликт расписания"}
     XLSX.writeFile(wb,`raspisanie_Vse_prepodavateli_${scope}.xlsx`,{cellStyles:true});
   };
 
+  // Export the entire semester's outstanding lesson occurrences, independent of
+  // the current group/teacher/week filter. Read-only: does not alter the timetable.
+  const exportUnplacedByWeeksExcel = () => {
+    if (!sched) { window.alert("Расписание ещё не сформировано."); return; }
+    const assignment = sched.assignment || {};
+    const instances = (sched.instances || []).filter((inst)=>inst?.instId && !inst.isScheduleEvent);
+    const assignedRequirementKeys = new Set();
+    const assignedRequirementsIgnoringFormat = new Set();
+    for (const inst of instances) {
+      if (!assignment[String(inst.instId)]) continue;
+      const layer = scheduleRequirementLayer(inst);
+      const format = inst.format === "remote" ? "remote" : "inperson";
+      for (const loadId of scheduleRequirementLoadIds(inst)) {
+        for (const week of weekNumbersForInstance(data.config, inst)) {
+          assignedRequirementKeys.add(`${loadId}|${week}|${layer}|${format}`);
+          assignedRequirementsIgnoringFormat.add(`${loadId}|${week}|${layer}`);
+        }
+      }
+    }
+
+    const seen = new Set();
+    const details = [];
+    for (const inst of instances) {
+      if (assignment[String(inst.instId)]) continue;
+      const layer = scheduleRequirementLayer(inst);
+      const loadIds = scheduleRequirementLoadIds(inst);
+      const format = inst.format === "remote" ? "remote" : "inperson";
+      const names = instanceGroupNames(data, inst);
+      const teachers = instanceTeacherNames(data, inst);
+      const {subj, type} = lessonLabel(inst, data);
+      for (const week of weekNumbersForInstance(data.config, inst)) {
+        const req = loadIds.map((id)=>`${id}|${week}|${layer}|${format}`);
+        const graphReq = loadIds.map((id)=>`${id}|${week}|${layer}`);
+        if (req.length && req.every((key)=>assignedRequirementKeys.has(key))) continue;
+        // If the same educational requirement was deliberately placed in the
+        // other format, it must not be exported as outstanding again.
+        if (graphReq.length && graphReq.every((key)=>assignedRequirementsIgnoringFormat.has(key))) continue;
+        if (inst.loadId && !inst.userManualSplit && !inst.manualFormatOverride &&
+            graphReq.length && !graphReq.every((key)=>canonicalGraphRequirementKeysNoFormat.has(key))) continue;
+        const dedupKey = req.length ? req.slice().sort().join("||") : `${inst.instId}|${week}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
+        const start = dateForWeekDay(data.config, week, 0);
+        const end = dateForWeekDay(data.config, week, 6);
+        details.push({week, range:start && end ? `${formatDateDM(start)}–${formatDateDM(end)}` : "",
+          groups:names.length?names:[byId(data.groups,inst.groupId)?.name||"Группа не указана"],
+          teachers:teachers.length?teachers:["Преподаватель не указан"],
+          subj:subj||"Предмет не указан",type:type||"",format:format==="remote"?"ДО":"Очно",
+          subgroup:Number(inst.subgroup||0)||"", units:inst.halfPair?0.5:1,
+          stream:names.length>1?"Поток":"",instId:String(inst.instId)});
+      }
+    }
+    details.sort((a,b)=>a.week-b.week || a.groups.join(", ").localeCompare(b.groups.join(", "),"ru") || a.teachers.join(", ").localeCompare(b.teachers.join(", "),"ru") || a.subj.localeCompare(b.subj,"ru"));
+
+    const wb = XLSX.utils.book_new();
+    const append = (name, headers, rows, widths) => {
+      const ws = XLSX.utils.aoa_to_sheet([headers,...rows]);
+      ws["!cols"] = widths.map((wch)=>({wch}));
+      ws["!autofilter"] = {ref:XLSX.utils.encode_range({s:{r:0,c:0},e:{r:Math.max(rows.length,1),c:headers.length-1}})};
+      XLSX.utils.book_append_sheet(wb,ws,name);
+    };
+    append("По неделям",["Неделя","Даты","Группа / группы","Преподаватель / преподаватели","Дисциплина","Вид занятия","Формат","Подгруппа","Неразмещено, пар","Поток"],
+      details.map((x)=>[x.week,x.range,x.groups.join(", "),x.teachers.join(", "),x.subj,x.type,x.format,x.subgroup,x.units,x.stream]),
+      [10,20,35,38,40,21,12,12,19,12]);
+
+    const grouped = (dimension) => {
+      const rows=new Map();
+      for (const item of details) {
+        const participants=dimension==="groups"?item.groups:item.teachers;
+        for (const name of [...new Set(participants)]) {
+          const key=`${item.week}|${name}`;
+          if (!rows.has(key)) rows.set(key,{week:item.week,range:item.range,name,count:0,subjects:new Set()});
+          const acc=rows.get(key);
+          acc.count+=item.units;
+          acc.subjects.add(item.subj);
+        }
+      }
+      return [...rows.values()].sort((a,b)=>a.week-b.week||a.name.localeCompare(b.name,"ru"))
+        .map((x)=>[x.week,x.range,x.name,Number(x.count.toFixed(2)),[...x.subjects].sort((a,b)=>a.localeCompare(b,"ru")).join("; ")]);
+    };
+    append("По группам",["Неделя","Даты","Группа","Неразмещено, пар","Дисциплины"],grouped("groups"),[10,20,35,20,70]);
+    append("По преподавателям",["Неделя","Даты","Преподаватель","Неразмещено, пар","Дисциплины"],grouped("teachers"),[10,20,42,20,70]);
+    const weeks = [...new Set(details.map((x)=>x.week))].sort((a,b)=>a-b);
+    append("Итоги",["Неделя","Даты","Неразмещено, пар","Блоков занятий"],weeks.map((week)=>{
+      const rows=details.filter((x)=>x.week===week);
+      return [week,rows[0]?.range||"",Number(rows.reduce((sum,x)=>sum+x.units,0).toFixed(2)),rows.length];
+    }),[12,22,22,22]);
+    XLSX.writeFile(wb,"nerazmeshchennye_pary_po_nedelyam_vse_gruppy_i_prepodavateli.xlsx");
+  };
+
   const exportScheduleExcel = () => {
     if (!sched) return;
     const semester = weekScope === "all" || viewKind === "semesterAll";
@@ -21349,6 +21454,7 @@ th{background:#1E3A5F;color:#ffffff;}
             </div>
             <div className="schedule-secondary-utilities">
               <details className="schedule-actions-details"><summary>Скачать и распечатать</summary><div className="schedule-details-content">            <input type="date" className="date-input" value={subDate} onChange={(e) => setSubDate(e.target.value)} title="Показать замены на дату" />
+            <button className="btn ghost" onClick={exportUnplacedByWeeksExcel} title="Выгрузить все неразмещённые пары за семестр: по неделям, группам и преподавателям. Не зависит от выбранного фильтра."><Download size={15}/> Excel — неразмещённые пары</button>
             {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей. Без выбранного ЦК выгружаются все преподаватели; с фильтром — только найденные." : "Скачать открытое расписание в Excel"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Excel — преподаватели" : "Excel (.xlsx)"}</button>}
             {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportWord} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей в Word" : "Скачать открытое расписание в Word"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Word — преподаватели" : "Word (.doc)"}</button>}
             {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
@@ -23690,6 +23796,195 @@ function ActualHoursPanel({data,set}) {
   </div>;
 }
 
+/* Остаток нагрузки по актуальным строкам графика, включая исторические разделения при передаче. */
+function calculateTeacherLoadBalances(data, cutoff) {
+  const config=data.config||{};
+  const today=String(cutoff||todayISO());
+  const loads=data.loads||[], instances=(data.schedule?.instances||[]).filter(i=>i?.instId&&!i.isScheduleEvent);
+  const assignment=data.schedule?.assignment||{};
+  const teachers=new Map((data.teachers||[]).map(t=>[String(t.id),String(t.name||'')]));
+  const groups=new Map((data.groups||[]).map(g=>[String(g.id),String(g.name||'')]));
+  const subjects=new Map((data.subjects||[]).map(x=>[String(x.id),String(x.name||'')]));
+  const loadById=new Map(loads.filter(l=>l?.id).map(l=>[String(l.id),l]));
+  const lessonsByLoadWeek=new Map();
+  const seen=new Set();
+  for(const inst of instances){
+    const a=assignment[String(inst.instId)];
+    if(!a||a.day==null)continue;
+    const referencedIds=new Set([String(inst.loadId||'')].filter(Boolean));
+    for(const part of streamParticipants(inst)){
+      const resolved=resolveTransferParticipantLoadId(loads,part,inst,[]);
+      if(resolved)referencedIds.add(String(resolved));
+    }
+    const loadIds=[...referencedIds];
+    for(const week of visibleWeeksForAssignedOccurrence(data,inst,a)){
+      const date=dateForWeekDay(config,week,Number(a.day));
+      if(!date)continue;
+      const sub=(data.substitutions||[]).find(x=>String(x.instId||'')===String(inst.instId)&&x.date===date);
+      let occurrenceDate=date;
+      if(sub&&['cancel','cancel_assignment','pending_move','excursion'].includes(sub.type))continue;
+      if(sub?.type==='moved'){
+        if(!sub.targetDate)continue;
+        occurrenceDate=sub.targetDate;
+      }
+      const units=inst.halfPair?0.5:1;
+      for(const id of loadIds){
+        if(!loadById.has(id))continue;
+        const key=[id,week,occurrenceDate,a.day,a.period,inst.halfPair?`half:${a.half??0}`:'full',String(inst.subjectId||''),String(inst.typeId||inst.lessonTypeId||''),inst.format||''].join('|');
+        if(seen.has(key))continue;
+        seen.add(key);
+        const idx=`${id}|${week}`;
+        if(!lessonsByLoadWeek.has(idx))lessonsByLoadWeek.set(idx,[]);
+        lessonsByLoadWeek.get(idx).push({date:occurrenceDate,units});
+      }
+    }
+  }
+  const byTeacher=new Map();
+  const details=[];
+  const transferredOut=new Map();
+  for(const l of loads){
+    if(l.transferFromTeacherId&&String(l.transferFromTeacherId)!==String(l.teacherId)){
+      const previous=String(l.transferFromTeacherId);
+      const amount=Object.values(l.weeklyPairs||{}).reduce((n,x)=>n+Math.max(0,Number(x)||0),0)*2;
+      transferredOut.set(previous,(transferredOut.get(previous)||0)+amount);
+    }
+  }
+  for(const l of loads){
+    if(!l?.id)continue;
+    const id=String(l.id), teacherId=String(l.teacherId||'');
+    if(!teacherId)continue;
+    let plannedPairs=0, pastPairs=0, futurePlacedPairs=0, unplacedPairs=0;
+    for(const [weekText,raw] of Object.entries(l.weeklyPairs||{})){
+      const week=Number(weekText), planned=Math.max(0,Number(raw)||0);
+      if(!Number.isInteger(week)||week<1||!planned)continue;
+      plannedPairs+=planned;
+      const occ=lessonsByLoadWeek.get(`${id}|${week}`)||[];
+      const past=Math.min(planned,occ.filter(o=>o.date<=today).reduce((n,o)=>n+o.units,0));
+      const future=Math.min(Math.max(0,planned-past),occ.filter(o=>o.date>today).reduce((n,o)=>n+o.units,0));
+      pastPairs+=past;
+      futurePlacedPairs+=future;
+      unplacedPairs+=Math.max(0,planned-past-future);
+    }
+    const item={loadId:id,teacherId,teacher:teachers.get(teacherId)||teacherId,group:groups.get(String(l.groupId))||'—',
+      subject:subjects.get(String(l.subjectId))||'—',subgroup:Number(l.subgroup||0)||'',
+      planned:plannedPairs*2, past:pastPairs*2, future:futurePlacedPairs*2, unplaced:unplacedPairs*2,
+      remaining:Math.max(0,plannedPairs-pastPairs)*2,
+      receivedFrom:l.transferFromTeacherId?teachers.get(String(l.transferFromTeacherId))||String(l.transferFromTeacherId):'',
+      transferredTo:l.transferToTeacherId?teachers.get(String(l.transferToTeacherId))||String(l.transferToTeacherId):'',
+      incoming:l.transferFromTeacherId&&String(l.transferFromTeacherId)!==teacherId?plannedPairs*2:0};
+    details.push(item);
+    if(!byTeacher.has(teacherId))byTeacher.set(teacherId,{teacherId,teacher:item.teacher,planned:0,past:0,future:0,unplaced:0,remaining:0,incoming:0,outgoing:0,loads:0,transfer:false});
+    const target=byTeacher.get(teacherId);
+    for(const f of ['planned','past','future','unplaced','remaining','incoming'])target[f]+=item[f];
+    target.loads++;
+    if(item.receivedFrom||item.transferredTo)target.transfer=true;
+  }
+  for(const [id,value] of transferredOut){
+    if(!byTeacher.has(id))byTeacher.set(id,{teacherId:id,teacher:teachers.get(id)||id,planned:0,past:0,future:0,unplaced:0,remaining:0,incoming:0,outgoing:0,loads:0,transfer:true});
+    byTeacher.get(id).outgoing+=value;
+    byTeacher.get(id).transfer=true;
+  }
+  for(const teacher of data.teachers||[]){
+    const id=String(teacher.id||'');if(id&&!byTeacher.has(id))byTeacher.set(id,{teacherId:id,teacher:String(teacher.name||id),planned:0,past:0,future:0,unplaced:0,remaining:0,incoming:0,outgoing:0,loads:0,transfer:false});
+  }
+  const summary=[...byTeacher.values()].sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru'));
+  return {summary,details:details.sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru')||a.group.localeCompare(b.group,'ru')||a.subject.localeCompare(b.subject,'ru'))};
+}
+
+/* ============================== Отчёты / акты ГПХ ============================== */
+function ReportsPanel({data}) {
+  const [kind,setKind]=useState('gph');
+  const [balanceDate,setBalanceDate]=useState(todayISO());
+  const [transfersOnly,setTransfersOnly]=useState(false);
+  const [from,setFrom]=useState(()=>{const d=todayISO();return `${d.slice(0,7)}-01`;});
+  const [to,setTo]=useState(todayISO());
+  const [teacherId,setTeacherId]=useState('');
+  const [contractNumber,setContractNumber]=useState('');
+  const [contractDate,setContractDate]=useState('');
+  const [actNumber,setActNumber]=useState('');
+  const [actDate,setActDate]=useState(todayISO());
+  const [message,setMessage]=useState('');
+  const report=useMemo(()=>kind==='balance'?{detail:[],review:[],totals:[]}:calculateActualHours(data,from,to),[data,from,to,kind]);
+  const balances=useMemo(()=>calculateTeacherLoadBalances(data,balanceDate),[data,balanceDate]);
+  const contractIds=useMemo(()=>new Set((data.employmentTypes||[]).filter(e=>e.id==='contract'||/гпх|гражданско.?правов/i.test(String(e.name||''))).map(e=>String(e.id)).concat('contract')),[data.employmentTypes]);
+  const gphTeachers=useMemo(()=>(data.teachers||[]).filter(t=>contractIds.has(String(t.employmentType||''))).sort((a,b)=>String(a.name||'').localeCompare(String(b.name||''),'ru')),[data.teachers,contractIds]);
+  const eligibleTeachers=kind==='gph'?gphTeachers:(data.teachers||[]).slice().sort((a,b)=>String(a.name||'').localeCompare(String(b.name||''),'ru'));
+  const eligibleIds=new Set(eligibleTeachers.map(t=>String(t.id)));
+  const rows=(report.detail||[]).filter(r=>eligibleIds.has(String(r.teacherId))&&(!teacherId||String(r.teacherId)===teacherId)).sort((a,b)=>a.date.localeCompare(b.date)||a.teacher.localeCompare(b.teacher,'ru')||String(a.group).localeCompare(String(b.group),'ru'));
+  const totals=useMemo(()=>{
+    const byTeacher=new Map();
+    for(const r of rows){const key=String(r.teacherId);if(!byTeacher.has(key))byTeacher.set(key,{teacherId:key,teacher:r.teacher,hours:0,count:0,subjects:new Map()});const item=byTeacher.get(key);item.hours+=Number(r.hours)||0;item.count++;const subject=String(r.subject||'Дисциплина не указана');if(!item.subjects.has(subject))item.subjects.set(subject,{subject,hours:0,groups:new Set()});const sub=item.subjects.get(subject);sub.hours+=Number(r.hours)||0;sub.groups.add(r.group||'—');}
+    return [...byTeacher.values()].sort((a,b)=>a.teacher.localeCompare(b.teacher,'ru'));
+  },[rows]);
+  const selectedTeacher=eligibleTeachers.find(t=>String(t.id)===teacherId);
+  const esc=(v)=>String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  const format=(iso)=>iso?formatDateDM(iso):'____________';
+  const actMarkup=(item)=>{
+    const detail=rows.filter(r=>String(r.teacherId)===String(item.teacherId));
+    const subjects=[...item.subjects.values()].sort((a,b)=>a.subject.localeCompare(b.subject,'ru'));
+    return `<section class="act"><h2>АКТ № ${esc(actNumber||'_____')}</h2><p class="center">об оказанных услугах по договору ГПХ № ${esc(contractNumber||'_____')} от ${esc(format(contractDate))}</p><p>Дата составления: ${esc(format(actDate))}. Отчётный период: ${esc(format(from))} — ${esc(format(to))}.</p><p>Заказчик: ${esc(COLLEGE_NAME)}.</p><p>Исполнитель: <b>${esc(item.teacher)}</b>.</p><p>В отчётном периоде по данным расписания и учтённых изменений отражены следующие образовательные услуги:</p><table><thead><tr><th>№</th><th>Дисциплина / вид работы</th><th>Группы</th><th>Академических часов</th></tr></thead><tbody>${subjects.map((s,i)=>`<tr><td>${i+1}</td><td>${esc(s.subject)}</td><td>${esc([...s.groups].sort((a,b)=>a.localeCompare(b,'ru')).join(', '))}</td><td>${s.hours}</td></tr>`).join('')}<tr><th colspan="3">Всего (учёт по группам)</th><th>${item.hours}</th></tr></tbody></table><h3>Детализация занятий</h3><table><thead><tr><th>Дата</th><th>Пара</th><th>Группа</th><th>Дисциплина</th><th>Ак. ч.</th><th>Основание</th></tr></thead><tbody>${detail.map(r=>`<tr><td>${esc(format(r.date))}</td><td>${esc(r.period||'—')}</td><td>${esc(r.group)}</td><td>${esc(r.subject)}</td><td>${esc(r.hours)}</td><td>${esc(r.kind)}</td></tr>`).join('')}</tbody></table><p><b>Всего:</b> ${item.hours} академических часов по групповому учёту. Итог подлежит проверке на совместные (поточные) занятия и условия договора.</p><p>Объём оказанных услуг подтверждается сторонами после сверки фактического проведения занятий. Расчёт стоимости и сведения об оплате заполняются на основании договора.</p><p>Стоимость услуг: ____________________ руб.</p><div class="signatures"><p>Заказчик: __________________ / __________________</p><p>Исполнитель: __________________ / ${esc(item.teacher)}</p></div><p class="note">Проект акта сформирован из данных расписания и замен. Не является подтверждением оказания услуг без сверки и подписей сторон.</p></section>`;
+  };
+  const downloadAct=()=>{
+    if(report.error){setMessage(report.error);return;}
+    if(!teacherId||!selectedTeacher){setMessage('Для акта выберите одного преподавателя ГПХ.');return;}
+    const item=totals.find(t=>t.teacherId===teacherId);
+    if(!item){setMessage('За выбранный период нет учтённых занятий этого преподавателя.');return;}
+    const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Проект акта ГПХ</title><style>body{font-family:'Times New Roman',serif;font-size:12pt;margin:2cm;color:#000}h2,.center{text-align:center}h2{font-size:15pt}h3{font-size:12pt;margin-top:20px}table{border-collapse:collapse;width:100%;font-size:10pt;margin:12px 0}td,th{border:1px solid #333;padding:5px;text-align:left}th{font-weight:bold}.signatures{margin-top:35px;line-height:2}.note{font-size:9pt;color:#555;margin-top:30px}@page{size:A4;margin:18mm}</style></head><body>${actMarkup(item)}</body></html>`;
+    const blob=new Blob(['\ufeff',html],{type:'application/msword;charset=utf-8'});
+    const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`Акт_ГПХ_${String(selectedTeacher.name||'').replace(/[^\p{L}\p{N}-]+/gu,'_')}_${from}_${to}.doc`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);setMessage('Скачан проект акта Word (.doc). Сверьте фактические часы, договор и подписи.');
+  };
+  const downloadExcel=()=>{
+    if(report.error){setMessage(report.error);return;}
+    const wb=XLSX.utils.book_new();
+    const add=(title,head,body,widths)=>{const ws=XLSX.utils.aoa_to_sheet([head,...body]);ws['!cols']=widths.map(w=>({wch:w}));XLSX.utils.book_append_sheet(wb,ws,title);};
+    add('Сводка',['Преподаватель','Статус','Занятий по группам','Ак. часов'],totals.map(t=>[t.teacher,kind==='gph'?'ГПХ':'Все',t.count,t.hours]),[42,18,25,15]);
+    add('Дисциплины',['Преподаватель','Дисциплина','Группы','Ак. часов'],totals.flatMap(t=>[...t.subjects.values()].map(s=>[t.teacher,s.subject,[...s.groups].join(', '),s.hours])),[38,45,45,15]);
+    add('Занятия',['Дата','Пара','Группа','Дисциплина','Преподаватель','Ак. часов','Вид','Примечание'],rows.map(r=>[r.date,r.period,r.group,r.subject,r.teacher,r.hours,r.kind,r.note||'']),[17,9,27,46,38,15,23,40]);
+    add('На проверку',['Дата','Группа','Дисциплина','Тип','Причина'],report.review||[],[17,28,46,24,65]);
+    XLSX.writeFile(wb,`Отчет_${kind==='gph'?'ГПХ':'по_преподавателям'}_${from}_${to}.xlsx`);
+  };
+  const balanceRows=balances.summary.filter(x=>(!teacherId||x.teacherId===teacherId)&&(!transfersOnly||x.transfer));
+  const balanceDetail=balances.details.filter(x=>(!teacherId||x.teacherId===teacherId)&&(!transfersOnly||balances.summary.some(t=>t.teacherId===x.teacherId&&t.transfer)));
+  const downloadBalances=()=>{
+    const wb=XLSX.utils.book_new();
+    const sheet=(name,headers,rows,widths)=>{const ws=XLSX.utils.aoa_to_sheet([headers,...rows]);ws['!cols']=widths.map(w=>({wch:w}));XLSX.utils.book_append_sheet(wb,ws,name);};
+    sheet('Остаток по преподавателям',['Преподаватель','План, ак. ч.','По расписанию до даты, ак. ч.','Осталось, ак. ч.','Из них не размещено','Размещено после даты','Получено при передаче','Передано другим','Были передачи'],
+      balanceRows.map(t=>[t.teacher,t.planned,t.past,t.remaining,t.unplaced,t.future,t.incoming,t.outgoing,t.transfer?'Да':'Нет']),[44,17,30,21,24,24,26,20,18]);
+    sheet('По дисциплинам и группам',['Преподаватель','Группа','Подгруппа','Дисциплина','План, ак. ч.','По расписанию до даты','Осталось','Неразмещено','Запланировано впереди','Получено от','Передано кому'],
+      balanceDetail.map(r=>[r.teacher,r.group,r.subgroup,r.subject,r.planned,r.past,r.remaining,r.unplaced,r.future,r.receivedFrom,r.transferredTo]),[42,25,14,42,20,26,16,18,26,42,42]);
+    sheet('Пояснения',['Показатель','Пояснение'],[['Дата отсечения',balanceDate],['Метод','Учёт по актуальным строкам нагрузки после передачи; 1 пара = 2 ак. часа, половина пары = 1 час.'],['По расписанию до даты','Оценка, а не подтверждённый факт проведения. Сверьте журнал, отмены и перенесённые занятия.'],['Осталось','План после передачи минус занятия, которые стоят в расписании до указанной даты.'],['Неразмещено','План без размещения на дату среза или после неё; сюда могут входить пары прошедших недель.'],['Передача','Полученные часы учитываются у нового преподавателя, историческая часть — у прежнего.']],[32,120]);
+    XLSX.writeFile(wb,`остаток_нагрузки_на_${balanceDate}.xlsx`);
+  };
+  return <div className="section actual-hours-section">
+    <header className="section-head"><div><h1>Отчёты</h1><p>Отчётность по проведённым занятиям и проект акта по договору ГПХ.</p></div></header>
+    <div className="actual-hours-controls" style={{flexWrap:'wrap',alignItems:'end'}}>
+      <label>Вид отчёта<select value={kind} onChange={e=>{setKind(e.target.value);setTeacherId('');setMessage('');}}><option value="gph">Акты и часы ГПХ</option><option value="all">Нагрузка преподавателей за период</option><option value="balance">Остаток нагрузки и передачи</option></select></label>
+      {kind!=='balance'&&<label>С <input type="date" value={from} onChange={e=>setFrom(e.target.value)}/></label>}
+      {kind!=='balance'&&<label>По <input type="date" value={to} onChange={e=>setTo(e.target.value)}/></label>}
+      <label>Преподаватель<select value={teacherId} onChange={e=>setTeacherId(e.target.value)}><option value="">Все преподаватели</option>{eligibleTeachers.map(t=><option key={t.id} value={String(t.id)}>{t.name}</option>)}</select></label>
+      {kind==='balance'&&<label>Срез на дату<input type="date" value={balanceDate} onChange={e=>setBalanceDate(e.target.value)}/></label>}
+      {kind==='balance'&&<label style={{display:'flex',alignItems:'center',gap:6}}><input type="checkbox" checked={transfersOnly} onChange={e=>setTransfersOnly(e.target.checked)}/> Только с передачей нагрузки</label>}
+      <button className="btn" onClick={kind==='balance'?downloadBalances:downloadExcel}><Download size={14}/> Excel</button>
+      {kind==='gph'&&<button className="btn primary" disabled={!teacherId} onClick={downloadAct}><Download size={14}/> Проект акта Word</button>}
+    </div>
+    {kind==='gph'&&teacherId&&<div className="actual-hours-controls" style={{flexWrap:'wrap'}}><label>№ акта<input value={actNumber} onChange={e=>setActNumber(e.target.value)} placeholder="По договору"/></label><label>Дата акта<input type="date" value={actDate} onChange={e=>setActDate(e.target.value)}/></label><label>№ договора ГПХ<input value={contractNumber} onChange={e=>setContractNumber(e.target.value)} placeholder="№ договора"/></label><label>Дата договора<input type="date" value={contractDate} onChange={e=>setContractDate(e.target.value)}/></label></div>}
+    {message&&<div className="notice">{message}</div>}
+    {kind!=='balance'&&<><div className="notice">Данные рассчитаны по запланированным занятиям с учётом отмен, переносов, замен и вручную добавленных занятий. Необходимо подтвердить фактическое проведение, сверить часы потоковых занятий и условия договора до подписания акта. Оплата автоматически не рассчитывается.</div>
+    {report.error?<div className="notice">{report.error}</div>:<>
+      {kind==='gph'&&gphTeachers.length===0&&<div className="notice">Нет преподавателей с типом занятости «ГПХ». Укажите его в разделе «Списки → Преподаватели».</div>}
+      <div className="actual-hours-stats"><div><b>{totals.length}</b><span>Преподавателей с занятиями</span></div><div><b>{rows.reduce((n,r)=>n+(Number(r.hours)||0),0)}</b><span>Академических часов (по группам)</span></div><div><b>{rows.length}</b><span>Записей о занятиях</span></div><div><b>{(report.review||[]).length}</b><span>Записей требуют сверки</span></div></div>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>Дисциплины и группы</th><th>Занятий по группам</th><th>Ак. ч.</th></tr></thead><tbody>{totals.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b></td><td>{[...t.subjects.values()].map(s=><div key={s.subject}>{s.subject} — {[...s.groups].join(', ')} ({s.hours} ч.)</div>)}</td><td>{t.count}</td><td><b>{t.hours}</b></td></tr>)}{!totals.length&&<tr><td colSpan={4}>Нет учтённых занятий за выбранный период.</td></tr>}</tbody></table></div>
+    </>}</>}
+    {kind==='balance'&&<>
+      <div className="notice">Остаток рассчитан по актуальным недельным графикам нагрузки с учётом передачи часов. Колонка «По расписанию до даты» — <b>предварительная оценка проведённого</b>, а не подтверждение факта. Для окончательного отчёта сверьте журнал, отмены, замены и переносы. Все значения указаны в академических часах.</div>
+      <div className="actual-hours-stats"><div><b>{balanceRows.length}</b><span>Преподавателей</span></div><div><b>{balanceRows.reduce((n,t)=>n+t.remaining,0)}</b><span>Ещё осталось, ак. ч.</span></div><div><b>{balanceRows.reduce((n,t)=>n+t.unplaced,0)}</b><span>Из них не размещено</span></div><div><b>{balanceRows.filter(t=>t.transfer).length}</b><span>С передачами нагрузки</span></div></div>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>План, ч.</th><th>По расписанию до даты, ч.</th><th>Осталось, ч.</th><th>Неразмещено, ч.</th><th>Размещено впереди, ч.</th><th>Получено, ч.</th><th>Передано, ч.</th></tr></thead><tbody>{balanceRows.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b>{t.transfer&&<div className="muted">Передача нагрузки</div>}</td><td>{t.planned}</td><td>{t.past}</td><td><b>{t.remaining}</b></td><td>{t.unplaced}</td><td>{t.future}</td><td>{t.incoming||'—'}</td><td>{t.outgoing||'—'}</td></tr>)}{!balanceRows.length&&<tr><td colSpan={8}>Нет преподавателей по выбранному фильтру.</td></tr>}</tbody></table></div>
+      <h3 style={{marginTop:20}}>По дисциплинам и группам</h3>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>Группа</th><th>Дисциплина</th><th>План, ч.</th><th>Остаток, ч.</th><th>Неразмещено, ч.</th><th>Источник передачи</th></tr></thead><tbody>{balanceDetail.map((r,i)=><tr key={`${r.loadId}-${i}`}><td>{r.teacher}</td><td>{r.group}{r.subgroup?` / п/г ${r.subgroup}`:''}</td><td>{r.subject}</td><td>{r.planned}</td><td><b>{r.remaining}</b></td><td>{r.unplaced}</td><td>{r.receivedFrom||'—'}</td></tr>)}{!balanceDetail.length&&<tr><td colSpan={7}>Нет назначенной нагрузки.</td></tr>}</tbody></table></div>
+    </>}
+  </div>;
+}
+
 /* ============================== Замены ============================== */
 
 function SubstitutionsPanel({ data, set, onPublish }) {
@@ -25161,6 +25456,52 @@ function assessmentIntervalsOverlap(first, second) {
   return first[0] != null && first[1] != null && second[0] != null && second[1] != null && first[0] < second[1] && second[0] < first[1];
 }
 
+function ExamWeeksPanel({ data, set }) {
+  const semesterStart = String(data.config?.semesterStart || "");
+  const count = totalSemesterWeeks(data.config);
+  const groups = (data.groups || []).slice().sort((a,b)=>String(a.name || "").localeCompare(String(b.name || ""), "ru", {numeric:true}));
+  const [selectedGroups, setSelectedGroups] = useState([]);
+  const [selectedWeeks, setSelectedWeeks] = useState([]);
+  const [message, setMessage] = useState("");
+  const entries = (data.examWeeks || []).filter((x)=>String(x.semesterStart || "") === semesterStart);
+  const toggle = (values, setter, value) => setter((prev)=>prev.includes(value)?prev.filter((x)=>x!==value):[...prev,value]);
+  const save = () => {
+    if (!semesterStart || !selectedGroups.length || !selectedWeeks.length) { setMessage("Выберите группы и хотя бы одну неделю в настроенном семестре."); return; }
+    const next = (data.examWeeks || []).filter((r)=>String(r.semesterStart || "") !== semesterStart || !selectedGroups.includes(String(r.groupId)));
+    for (const groupId of selectedGroups) {
+      const oldWeeks = entries.filter((r)=>String(r.groupId) === groupId).flatMap((r)=>r.weeks || []);
+      next.push({groupId,semesterStart,weeks:[...new Set([...oldWeeks,...selectedWeeks].map(Number))].sort((a,b)=>a-b)});
+    }
+    set("examWeeks")(next);
+    setMessage(`Сохранено: ${selectedGroups.length} групп, недели ${selectedWeeks.slice().sort((a,b)=>a-b).join(", ")}.`);
+  };
+  const removeWeek = (groupId, week) => {
+    const next = (data.examWeeks || []).flatMap((r)=> {
+      if (String(r.semesterStart || "") !== semesterStart || String(r.groupId) !== String(groupId)) return [r];
+      const weeks = (r.weeks || []).filter((n)=>Number(n)!==Number(week));
+      return weeks.length?[{...r,weeks}]:[];
+    });
+    set("examWeeks")(next);
+  };
+  return <div className="exam-weeks-panel">
+    <p className="muted">Укажите недели по нумерации текущего семестра. Они появятся в «Графиках» с отметкой <b>ЭКЗ</b> и будут закрыты для обычной учебной нагрузки. Уже назначенные экзамены сохраняются отдельно.</p>
+    {!semesterStart && <div className="notice">Сначала укажите дату начала семестра в настройках.</div>}
+    <div className="bulk-panel">
+      <h3>Массовое назначение</h3>
+      <div className="schedule-toolbar"><button className="btn ghost sm" onClick={()=>setSelectedGroups(groups.map((g)=>String(g.id)))}>Выбрать все группы</button><button className="btn ghost sm" onClick={()=>setSelectedGroups([])}>Снять выбор</button><span className="muted">Выбрано: {selectedGroups.length}</span></div>
+      <div className="exam-groups-picker">{groups.map((g)=><label key={g.id}><input type="checkbox" checked={selectedGroups.includes(String(g.id))} onChange={()=>toggle(selectedGroups,setSelectedGroups,String(g.id))}/>{g.name}</label>)}</div>
+      <h4>Недели семестра</h4>
+      <div className="exam-weeks-picker">{Array.from({length:count},(_,i)=>i+1).map((n)=><label key={n} className={selectedWeeks.includes(n)?"selected":""}><input type="checkbox" checked={selectedWeeks.includes(n)} onChange={()=>toggle(selectedWeeks,setSelectedWeeks,n)}/>{n}</label>)}</div>
+      <div className="schedule-toolbar"><button className="btn primary sm" onClick={save} disabled={!semesterStart || !selectedGroups.length || !selectedWeeks.length}>Применить к выбранным группам</button><button className="btn ghost sm" onClick={()=>setSelectedWeeks([])}>Очистить выбор недель</button></div>
+      {message && <div className="notice">{message}</div>}
+    </div>
+    <h3>Назначенные экзаменационные недели</h3>
+    <div className="table-wrap"><table><thead><tr><th>Группа</th><th>Экзаменационные недели</th></tr></thead><tbody>
+      {groups.map((g)=>{const weeks=[...new Set(entries.filter((r)=>String(r.groupId)===String(g.id)).flatMap((r)=>r.weeks || []))].sort((a,b)=>a-b);return <tr key={g.id}><td><b>{g.name}</b></td><td>{weeks.length?weeks.map((n)=><button key={n} className="exam-week-tag" title={`Убрать ${n}-ю неделю у группы ${g.name}`} onClick={()=>removeWeek(g.id,n)}>{n} ×</button>):<span className="muted">Не назначены</span>}</td></tr>;})}
+    </tbody></table></div>
+  </div>;
+}
+
 function AttestationPanel({ data, set, onPublish }) {
   const { groups, subjects, teachers, rooms } = data;
   const years = [...new Set([
@@ -25325,6 +25666,7 @@ function AttestationPanel({ data, set, onPublish }) {
       <div className="public-tabs" style={{marginBottom:14}}>
         <button className={"pill" + (subtab === "main" ? " on" : "")} onClick={() => setSubtab("main")}>Основная аттестация</button>
         <button className={"pill" + (subtab === "debt" ? " on" : "")} onClick={() => setSubtab("debt")}>Ликвидация задолженности</button>
+        <button className={"pill" + (subtab === "weeks" ? " on" : "")} onClick={() => setSubtab("weeks")}>Экзаменационные недели</button>
       </div>
 
       <div className="schedule-toolbar">
@@ -25332,6 +25674,7 @@ function AttestationPanel({ data, set, onPublish }) {
         {years.length > 0 && <select value={year} onChange={(e) => setYear(e.target.value)} style={{ width: "auto" }}>{!years.includes(year) && <option value={year}>{year} (новый)</option>}{years.map((y) => <option key={y} value={y}>{y}</option>)}</select>}
       </div>
 
+      {subtab === "weeks" && <ExamWeeksPanel data={data} set={set} />}
       {subtab === "main" && <>
         <div className="schedule-toolbar" style={{justifyContent:"space-between"}}>
           <span className="muted">Экзамены в таблице · время начала свободное, без привязки к парам</span>
@@ -26872,6 +27215,7 @@ const ADMIN_TABS = [
   { key: "schedule", label: "Расписание", icon: Wand2 },
   { key: "substitutions", label: "Замены", icon: Repeat },
   { key: "actualHours", label: "Фактические часы", icon: ClipboardList },
+  { key: "reports", label: "Отчёты", icon: ClipboardList },
   { key: "scenarios", label: "Сценарии замен", icon: Repeat },
   { key: "attestation", label: "Промежуточная аттестация", icon: GraduationCap },
   { key: "practices", label: "Практики", icon: Repeat },
@@ -26902,10 +27246,11 @@ const TAB_SAVE_KEYS = {
   // made this page unnecessarily slow and could delay publication.
   substitutions: ["substitutions"],
   actualHours: ["substitutions"],
+  reports: [],
   // Scenarios can create substitutions/retakes as well as the scenario record.
   scenarios: ["absenceScenarios","substitutions","retakes"],
   retakes: ["retakes"],
-  attestation: ["interimAssessments","debtLiquidations"],
+  attestation: ["interimAssessments","debtLiquidations","examWeeks"],
   practices: ["practices"],
   conflicts: ["schedule","loads"],
   bulkEdit: ["schedule","loads","groups","teachers","rooms","subjects"],
@@ -30498,6 +30843,7 @@ export default function App() {
               }} />}
               {tab === "substitutions" && <SubstitutionsPanel data={data} set={set} onPublish={publishSchedule} />}
               {tab === "actualHours" && <ActualHoursPanel data={data} set={set} />}
+              {tab === "reports" && <ReportsPanel data={data} />}
               {tab === "scenarios" && <SubstitutionScenariosPanel data={data} set={set} />}
               {tab === "attestation" && <AttestationPanel data={data} set={set} onPublish={publishSchedule} />}
               {tab === "practices" && <PracticesPanel data={data} set={set} />}
@@ -31610,6 +31956,13 @@ input[type="text"], select { width: 100%; }
 .group-graph-save-status.dirty{color:#9a5b00;font-weight:700}
 @media(max-width:900px){.modal.group-graph-quick-modal{width:98vw!important;max-width:98vw!important;height:94vh}.group-graph-quick-table .time-col{width:250px!important;min-width:250px!important;max-width:250px!important}}
 .modal { background: #fff; border-radius: 12px; width: 420px; max-width: 90vw; max-height: 80vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+.modal.schedule-event-modal{width:min(1200px,calc(100vw - 32px))!important;max-width:min(1200px,calc(100vw - 32px))!important;max-height:92vh!important}
+.exam-groups-picker{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:7px;max-height:220px;overflow:auto;margin:10px 0 16px}
+.exam-groups-picker label,.exam-weeks-picker label{display:flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:8px;padding:8px;cursor:pointer;background:#fff}
+.exam-weeks-picker{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 14px}.exam-weeks-picker label{min-width:52px;justify-content:center}.exam-weeks-picker label.selected{background:#dceafe;border-color:#9bbbe8;color:#204f92;font-weight:700}
+.exam-week-tag{border:1px solid #a8c4eb;border-radius:7px;background:#eaf2ff;color:#234e8e;padding:5px 9px;margin:2px 5px 2px 0;cursor:pointer}
+.graphs-cell.exam-week-cell{background:#eaf2ff!important}.exam-week-mark{background:#d2e5ff;color:#194e94;font-weight:800;border-radius:4px;padding:3px}
+
 .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--line); }
 .modal-head h3 { font-size: 15px; font-weight: 800; margin: 0; }
 .modal.load-transfer-modal{width:min(760px,94vw);max-width:760px;}
