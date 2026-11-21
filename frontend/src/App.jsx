@@ -20972,6 +20972,7 @@ ${check.reason || "Конфликт расписания"}
     if (!sched) { window.alert("Расписание ещё не сформировано."); return; }
     const assignment = sched.assignment || {};
     const instances = (sched.instances || []).filter((inst)=>inst?.instId && !inst.isScheduleEvent);
+    const offGraphRows = collectOutsideGraphScheduleRows(data);
     const assignedRequirementKeys = new Set();
     const assignedRequirementsIgnoringFormat = new Set();
     for (const inst of instances) {
@@ -21049,10 +21050,15 @@ ${check.reason || "Конфликт расписания"}
     append("По группам",["Неделя","Даты","Группа","Неразмещено, пар","Дисциплины"],grouped("groups"),[10,20,35,20,70]);
     append("По преподавателям",["Неделя","Даты","Преподаватель","Неразмещено, пар","Дисциплины"],grouped("teachers"),[10,20,42,20,70]);
     const weeks = [...new Set(details.map((x)=>x.week))].sort((a,b)=>a-b);
-    append("Итоги",["Неделя","Даты","Неразмещено, пар","Блоков занятий"],weeks.map((week)=>{
+    const allWeeks = [...new Set([...weeks,...offGraphRows.map(x=>x.week)])].sort((a,b)=>a-b);
+    append("Итоги",["Неделя","Даты","Неразмещено, пар","Блоков занятий","Вне графика, пар","Вне графика, ак. ч."],allWeeks.map((week)=>{
       const rows=details.filter((x)=>x.week===week);
-      return [week,rows[0]?.range||"",Number(rows.reduce((sum,x)=>sum+x.units,0).toFixed(2)),rows.length];
-    }),[12,22,22,22]);
+      const extras=offGraphRows.filter((x)=>x.week===week);
+      const range=rows[0]?.range || (extras[0]?.weekStart ? `${formatDateDM(extras[0].weekStart)}–${formatDateDM(extras[0].weekEnd)}` : '');
+      return [week,range,Number(rows.reduce((sum,x)=>sum+x.units,0).toFixed(2)),rows.length,
+        Number(extras.reduce((sum,x)=>sum+x.units,0).toFixed(2)),Number(extras.reduce((sum,x)=>sum+x.hours,0).toFixed(2))];
+    }),[12,22,22,22,22,25]);
+    appendOutsideGraphExcelSheets(append,offGraphRows);
     XLSX.writeFile(wb,"nerazmeshchennye_pary_po_nedelyam_vse_gruppy_i_prepodavateli.xlsx");
   };
 
@@ -21454,7 +21460,7 @@ th{background:#1E3A5F;color:#ffffff;}
             </div>
             <div className="schedule-secondary-utilities">
               <details className="schedule-actions-details"><summary>Скачать и распечатать</summary><div className="schedule-details-content">            <input type="date" className="date-input" value={subDate} onChange={(e) => setSubDate(e.target.value)} title="Показать замены на дату" />
-            <button className="btn ghost" onClick={exportUnplacedByWeeksExcel} title="Выгрузить все неразмещённые пары за семестр: по неделям, группам и преподавателям. Не зависит от выбранного фильтра."><Download size={15}/> Excel — неразмещённые пары</button>
+            <button className="btn ghost" onClick={exportUnplacedByWeeksExcel} title="Выгрузить все неразмещённые пары за семестр по неделям, группам и преподавателям, плюс отдельные листы «Вне графика». Не зависит от выбранного фильтра."><Download size={15}/> Excel — неразмещённые пары</button>
             {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей. Без выбранного ЦК выгружаются все преподаватели; с фильтром — только найденные." : "Скачать открытое расписание в Excel"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Excel — преподаватели" : "Excel (.xlsx)"}</button>}
             {viewKind !== "semesterAll" && <button className="btn ghost" onClick={exportWord} title={(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Скачать расписание преподавателей в Word" : "Скачать открытое расписание в Word"}><Download size={15} /> {(viewKind === "allTeachers" || (viewKind === "teacher" && !viewId)) ? "Word — преподаватели" : "Word (.doc)"}</button>}
             {viewKind === "semesterAll" && <button className="btn ghost" onClick={exportScheduleExcel}><Download size={15} /> Excel (.xlsx)</button>}
@@ -23802,6 +23808,124 @@ function ActualHoursPanel({data,set}) {
  * Классификация прошедшее/будущее относится к расписанию, НЕ к журналу факта.
  * Исторические/переданные строки остаются у своих текущих преподавателей.
  */
+// Отдельный аудит карточек «Вне графика». Это не остаток учебного плана:
+// график не предусматривает такие занятия на соответствующей неделе.
+// Одна строка = одно техническое занятие за одну неделю; поток считается
+// одной карточкой, но отображается у каждой участвующей группы/преподавателя.
+function collectOutsideGraphScheduleRows(data) {
+  const cfg = data?.config || {};
+  const loads = (data?.loads || []).filter(x => x?.id);
+  const loadsById = new Map(loads.map(x => [String(x.id), x]));
+  const teachersById = new Map((data?.teachers || []).map(x => [String(x.id), String(x.name || x.id)]));
+  const groupsById = new Map((data?.groups || []).map(x => [String(x.id), String(x.name || x.id)]));
+  const subjectsById = new Map((data?.subjects || []).map(x => [String(x.id), String(x.name || x.id)]));
+  const typesById = new Map((data?.lessonTypes || []).map(x => [String(x.id), String(x.name || x.id)]));
+  const semantic = x => [String(x?.groupId || ''), String(x?.subjectId || ''),
+    String(x?.teacherId || ''), String(x?.typeId || ''), String(Number(x?.subgroup || 0))].join('¦');
+  const expected = new Map();
+  const totalWeeks = totalSemesterWeeks(cfg);
+  const pairsOnWeek = (load, week) => {
+    const pattern = String(load?.weekPattern || 'all');
+    if (pattern === 'perWeek') return Math.max(0, Number(load?.weeklyPairs?.[week] ?? load?.weeklyPairs?.[String(week)] ?? 0) || 0);
+    if (pattern === 'custom') return (load?.customWeeks || []).map(Number).includes(week) ? Math.max(0, Number(load?.pairsPerWeek) || 0) : 0;
+    if (pattern === 'odd' || pattern === 'even') return parityForWeekNumber(cfg, week) === pattern ? Math.max(0, Number(load?.pairsPerWeek) || 0) : 0;
+    return Math.max(0, Number(load?.pairsPerWeek) || 0);
+  };
+  for (const load of loads) {
+    const key = semantic(load);
+    for (let week = 1; week <= totalWeeks; week++) {
+      const count = pairsOnWeek(load, week);
+      if (count > 0) expected.set(`${key}|W${week}`, (expected.get(`${key}|W${week}`) || 0) + count);
+    }
+  }
+  const assignment = data?.schedule?.assignment || {};
+  const rows = [];
+  for (const inst of (data?.schedule?.instances || [])) {
+    if (!inst?.instId || inst.isScheduleEvent || inst.carryOverId) continue;
+    const matched = new Map();
+    const resolveLoad = id => {
+      const load = loadsById.get(String(id || ''));
+      if (load) matched.set(String(load.id), load);
+    };
+    resolveLoad(inst.loadId);
+    const participants = streamParticipants(inst);
+    for (const part of participants) {
+      resolveLoad(part?.loadId);
+      if (part?.loadId) continue;
+      // Как и в расписании, сопоставляем поток только по полному составу полей.
+      for (const load of loads) {
+        if (String(load.groupId || '') !== String(part?.groupId || '')) continue;
+        if (String(load.subjectId || '') !== String(inst.subjectId || '')) continue;
+        if (String(load.teacherId || '') !== String(inst.teacherId || '')) continue;
+        if (String(load.typeId || '') !== String(inst.typeId || '')) continue;
+        if (Number(load.subgroup || 0) !== Number(part?.subgroup || 0)) continue;
+        matched.set(String(load.id), load);
+      }
+    }
+    const semantics = [...new Set([...matched.values()].map(semantic))];
+    if (!semantics.length) {
+      // Для старых строк без loadId — осторожное сопоставление по тем же полям,
+      // что использует диагностическая метка в редакторе расписания.
+      for (const part of participants) {
+        if (!part?.groupId || !inst.subjectId || !inst.teacherId || !inst.typeId) continue;
+        semantics.push(semantic({groupId:part.groupId, subjectId:inst.subjectId,
+          teacherId:inst.teacherId, typeId:inst.typeId, subgroup:part.subgroup ?? inst.subgroup}));
+      }
+    }
+    if (!semantics.length) continue; // неизвестные записи не объявляем ошибочными
+    const a = assignment[String(inst.instId)];
+    const visible = a ? new Set(visibleWeeksForAssignedOccurrence(data, inst, a)) : new Set();
+    const groupIds = [...new Set(streamGroups(inst).filter(Boolean).map(String))];
+    // При передаче нагрузки владельцем является преподаватель актуальной
+    // строки нагрузки. Не добавляем прежнего преподавателя из старой карточки.
+    const owningTeacherIds = [...matched.values()].map(x => x.teacherId).filter(Boolean);
+    const teacherIds = [...new Set((owningTeacherIds.length ? owningTeacherIds :
+      [inst.teacherId, ...(inst.teacherIds || [])]).filter(Boolean).map(String))];
+    const groupNames = groupIds.map(id => groupsById.get(id) || id);
+    const teacherNames = teacherIds.map(id => teachersById.get(id) || id);
+    for (const week of [...new Set(weekNumbersForInstance(cfg, inst).map(Number))]) {
+      if (!Number.isInteger(week) || week < 1) continue;
+      if (!semantics.every(key => Number(expected.get(`${key}|W${week}`) || 0) <= 1e-9)) continue;
+      const placed = visible.has(week);
+      const date = a?.day != null ? dateForWeekDay(cfg, week, Number(a.day)) : '';
+      const units = inst.halfPair || (a?.half !== undefined && a?.half !== null && a?.half !== '') ? 0.5 : 1;
+      rows.push({instId:String(inst.instId), week, weekStart:dateForWeekDay(cfg,week,0),
+        weekEnd:dateForWeekDay(cfg,week,6), date:date || '',
+        period:a?.period != null ? Number(a.period)+1 : '',
+        status:placed ? 'Размещено' : a ? 'Назначено, но не видно в сетке' : 'Не размещено',
+        groupIds, groups:groupNames, teacherIds, teachers:teacherNames,
+        subject:subjectsById.get(String(inst.subjectId)) || String(inst.subjectId || '—'),
+        type:typesById.get(String(inst.typeId)) || String(inst.typeId || '—'),
+        format:inst.format === 'remote' ? 'ДО' : 'Очно',
+        subgroup:Number(inst.subgroup || 0) || '',
+        units, hours:units*2, stream:groupIds.length > 1 ? 'Поток' : ''});
+    }
+  }
+  return rows.sort((a,b)=>a.week-b.week || a.groups.join(', ').localeCompare(b.groups.join(', '),'ru') || a.subject.localeCompare(b.subject,'ru'));
+}
+
+function appendOutsideGraphExcelSheets(append, rows) {
+  const fmtWeek = row => row.weekStart && row.weekEnd ? `${formatDateDM(row.weekStart)}–${formatDateDM(row.weekEnd)}` : '';
+  append('Вне графика', ['Неделя','Даты недели','Дата назначения','Пара','Статус','Группа / группы','Преподаватель / преподаватели','Дисциплина','Вид','Формат','Подгруппа','Пар','Ак. ч.','Поток','ID занятия'],
+    rows.map(r => [r.week,fmtWeek(r),r.date,r.period,r.status,r.groups.join(', '),r.teachers.join(', '),r.subject,r.type,r.format,r.subgroup,r.units,r.hours,r.stream,r.instId]),
+    [12,25,19,10,34,42,48,48,24,12,14,12,13,12,34]);
+  for (const [name,key] of [['Вне графика по группам','groups'],['Вне графика по препод.','teachers']]) {
+    const aggregated = new Map();
+    for (const row of rows) {
+      for (const member of new Set(row[key])) {
+        const k = `${row.week}|${member}`;
+        if (!aggregated.has(k)) aggregated.set(k,{week:row.week,range:fmtWeek(row),member,units:0,hours:0,subjects:new Set()});
+        const item = aggregated.get(k);
+        item.units += row.units; item.hours += row.hours; item.subjects.add(row.subject);
+      }
+    }
+    append(name,['Неделя','Даты','Группа / преподаватель','Пар вне графика','Ак. ч. вне графика','Дисциплины'],
+      [...aggregated.values()].sort((a,b)=>a.week-b.week || a.member.localeCompare(b.member,'ru'))
+        .map(r=>[r.week,r.range,r.member,Number(r.units.toFixed(2)),Number(r.hours.toFixed(2)),[...r.subjects].join('; ')]),
+      [12,24,45,21,25,80]);
+  }
+}
+
 function calculateTeacherLoadBalances(data, cutoff) {
   const cfg = data.config || {};
   const asOf = String(cutoff || todayISO());
@@ -24012,6 +24136,12 @@ function ReportsPanel({data}) {
   const teachers = useMemo(() => (data.teachers||[]).slice().sort((a,b) => String(a.name||'').localeCompare(String(b.name||''),'ru')),[data.teachers]);
   const groups = useMemo(() => (data.groups||[]).slice().sort((a,b) => String(a.name||'').localeCompare(String(b.name||''),'ru')),[data.groups]);
   const balances = useMemo(() => calculateTeacherLoadBalances(data,balanceDate),[data,balanceDate]);
+  const outsideGraph = useMemo(() => collectOutsideGraphScheduleRows(data),[data]);
+  const outsideByTeacher = useMemo(() => {
+    const out = new Map();
+    for (const row of outsideGraph) for (const id of row.teacherIds) out.set(id,(out.get(id)||0)+row.hours);
+    return out;
+  },[outsideGraph]);
   const contractIds = useMemo(() => new Set((data.employmentTypes||[]).filter(x=>x.id==='contract'||/гпх|гражданско.?правов/i.test(String(x.name||''))).map(x=>String(x.id)).concat('contract')),[data.employmentTypes]);
   const gphTeachers = teachers.filter(t => contractIds.has(String(t.employmentType||'')));
   // Преподаватель может вести занятия по ГПХ, но тип занятости в справочнике
@@ -24037,6 +24167,9 @@ function ReportsPanel({data}) {
   const unplaced = balances.unplaced.filter(r => (!teacherId||r.teacherId===teacherId) && (!groupId||r.groupId===groupId) && (!weekFilter||String(r.week)===weekFilter) &&
     (!transfersOnly||balances.summary.find(t=>t.teacherId===r.teacherId)?.transfer));
   const allUnplaced = balances.unplaced;
+  const filteredOutside = outsideGraph.filter(r=>(!teacherId||r.teacherIds.includes(teacherId)) &&
+    (!groupId||r.groupIds.includes(groupId)) && (!weekFilter||String(r.week)===weekFilter) &&
+    (!transfersOnly||r.teacherIds.some(id=>balances.summary.find(t=>t.teacherId===id)?.transfer)));
   const total = (items,key) => Math.round(items.reduce((sum,r)=>sum+(Number(r[key])||0),0)*100)/100;
   const sum = (items,field) => total(items,field);
   const fmt = x => x ? formatDateDM(x) : '—';
@@ -24050,8 +24183,8 @@ function ReportsPanel({data}) {
   const labelRange = r => r.weekStart&&r.weekEnd ? `${fmt(r.weekStart)}–${fmt(r.weekEnd)}` : '';
   const downloadBalances = () => {
     const book=XLSX.utils.book_new();
-    appendSheet(book,'По преподавателям',['Преподаватель','План, ак. ч.','Прошло по расписанию','Запланировано впереди','Не расставлено','Всего осталось','Получено','Передано'],
-      summary.map(r=>[r.teacher,r.planned,r.past,r.future,r.unplaced,r.remaining,r.incoming,r.outgoing]),[42,19,27,25,19,21,18,18]);
+    appendSheet(book,'По преподавателям',['Преподаватель','План, ак. ч.','Прошло по расписанию','Запланировано впереди','Не расставлено','Всего осталось','Вне графика, ак. ч.','Получено','Передано'],
+      summary.map(r=>[r.teacher,r.planned,r.past,r.future,r.unplaced,r.remaining,outsideByTeacher.get(r.teacherId)||0,r.incoming,r.outgoing]),[42,19,27,25,19,21,23,18,18]);
     appendSheet(book,'По группам и предметам',['Преподаватель','Группа','Подгруппа','Дисциплина','План','Прошло по расписанию','На будущие даты','Не расставлено','Остаток','Получено от','Передано кому'],
       detail.map(r=>[r.teacher,r.group,r.subgroup,r.subject,r.planned,r.past,r.future,r.unplaced,r.remaining,r.receivedFrom,r.transferredTo]),[40,26,13,43,13,27,23,20,14,39,39]);
     appendSheet(book,'Понедельно',['Неделя','Даты','Преподаватель','Группа','Дисциплина','План, ч.','До даты, ч.','Впереди, ч.','Не расставлено, ч.'],
@@ -24068,7 +24201,9 @@ function ReportsPanel({data}) {
       ['Проверка','План = прошедшее по сетке + будущее по сетке + нерасставленное.'],
       ['Потоки','Данные по строкам нагрузки групп. Одна общая пара может входить в планы нескольких групп.'],
       ['Передача','Часы принадлежат текущему преподавателю строки нагрузки; полученные/переданные показываются справочно.'],
+      ['Вне графика','Отдельные фактически существующие карточки, для которых в графике на данную неделю 0 пар. Не входят в план/остаток; могут быть размещены или не размещены.'],
     ],[32,120]);
+    appendOutsideGraphExcelSheets((...args)=>appendSheet(book,...args),outsideGraph);
     XLSX.writeFile(book,`контроль_нагрузки_${balanceDate}.xlsx`);
   };
   const downloadUnplaced = () => {
@@ -24092,11 +24227,13 @@ function ReportsPanel({data}) {
     for(const r of all){if(!weeks.has(r.week))weeks.set(r.week,{week:r.week,range:labelRange(r),hours:0,count:0});const w=weeks.get(r.week);w.hours+=r.unplaced;w.count++;}
     appendSheet(book,'Итоги по неделям',['Неделя','Даты','Ак. часов по нагрузке','Пар по нагрузке','Строк нагрузки'],
       [...weeks.values()].sort((a,b)=>a.week-b.week).map(r=>[r.week,r.range,r.hours,r.hours/2,r.count]),[12,24,28,24,20]);
+    appendOutsideGraphExcelSheets((...args)=>appendSheet(book,...args),outsideGraph);
     appendSheet(book,'Пояснения',['Показатель','Значение'],[
       ['Объём выгрузки','ВСЕ преподаватели, группы и недели независимо от фильтров на экране.'],
       ['Единицы','1 пара = 2 академических часа; 0,5 пары = 1 академический час.'],
       ['Итоги','Сумма по строкам нагрузки. При общем потоке одна физическая пара может учитываться по нескольким группам.'],
       ['Источник','Недельные графики минус фактически размещённые в сетке интервалы.'],
+      ['Вне графика','Карточки на неделе с 0 пар по графику. Показаны на отдельных листах и не суммируются с нерасставленным планом.'],
     ],[28,120]);
     XLSX.writeFile(book,'нераcставленные_пары_все_недели_группы_преподаватели.xlsx');
   };
@@ -24170,27 +24307,35 @@ function ReportsPanel({data}) {
         <div><b>{sum(summary,'future')}</b><span>Запланировано впереди</span></div>
         <div><b>{sum(summary,'unplaced')}</b><span>Не расставлено</span></div>
         <div><b>{sum(summary,'remaining')}</b><span>Всего осталось</span></div>
+        <div><b>{sum(outsideGraph.filter(r=>!teacherId||r.teacherIds.includes(teacherId)),'hours')}</b><span>Вне графика (отдельно)</span></div>
       </div>
       <h3>По преподавателям</h3>
-      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>План, ч.</th><th>Прошло, ч.</th><th>Впереди, ч.</th><th>Не расставлено, ч.</th><th>Осталось, ч.</th><th>Получено, ч.</th><th>Передано, ч.</th></tr></thead><tbody>
-        {summary.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b>{t.transfer&&<div className="muted">Есть передача нагрузки</div>}</td><td>{t.planned}</td><td>{t.past}</td><td>{t.future}</td><td><b>{t.unplaced}</b></td><td><b>{t.remaining}</b></td><td>{t.incoming||'—'}</td><td>{t.outgoing||'—'}</td></tr>)}
-        {!summary.length&&<tr><td colSpan={8}>Нет преподавателей для выбранного фильтра.</td></tr>}
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>План, ч.</th><th>Прошло, ч.</th><th>Впереди, ч.</th><th>Не расставлено, ч.</th><th>Осталось, ч.</th><th>Вне графика, ч.</th><th>Получено, ч.</th><th>Передано, ч.</th></tr></thead><tbody>
+        {summary.map(t=><tr key={t.teacherId}><td><b>{t.teacher}</b>{t.transfer&&<div className="muted">Есть передача нагрузки</div>}</td><td>{t.planned}</td><td>{t.past}</td><td>{t.future}</td><td><b>{t.unplaced}</b></td><td><b>{t.remaining}</b></td><td>{outsideByTeacher.get(t.teacherId)||'—'}</td><td>{t.incoming||'—'}</td><td>{t.outgoing||'—'}</td></tr>)}
+        {!summary.length&&<tr><td colSpan={9}>Нет преподавателей для выбранного фильтра.</td></tr>}
       </tbody></table></div>
       <h3 style={{marginTop:20}}>По дисциплинам и группам</h3>
       <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Преподаватель</th><th>Группа</th><th>Дисциплина</th><th>План</th><th>Прошло</th><th>Впереди</th><th>Не расставлено</th><th>Источник передачи</th></tr></thead><tbody>
         {detail.map(d=><tr key={d.loadId}><td>{d.teacher}</td><td>{d.group}{d.subgroup?` / п/г ${d.subgroup}`:''}</td><td>{d.subject}</td><td>{d.planned}</td><td>{d.past}</td><td>{d.future}</td><td><b>{d.unplaced}</b></td><td>{d.receivedFrom||'—'}</td></tr>)}
         {!detail.length&&<tr><td colSpan={8}>В недельных графиках нет назначенной нагрузки.</td></tr>}
       </tbody></table></div>
-      <p className="muted">Проверка расчёта: план = прошло + впереди + не расставлено. «Осталось» = впереди + не расставлено. Для списка конкретных нерасставленных занятий откройте вкладку «Нерасставленные пары» выше.</p>
+      <p className="muted">Проверка расчёта: план = прошло + впереди + не расставлено. «Осталось» = впереди + не расставлено. «Вне графика» не входит в план и показано отдельно; карточки можно посмотреть во вкладке «Нерасставленные пары», где Excel содержит отдельные листы.</p>
     </>}
     {kind==='unplaced'&&<>
-      <div className="actual-hours-stats"><div><b>{sum(unplaced,'unplaced')}</b><span>Ак. часов не расставлено</span></div><div><b>{sum(unplaced,'unplaced')/2}</b><span>Пар по строкам нагрузки</span></div><div><b>{new Set(unplaced.map(x=>x.groupId)).size}</b><span>Групп</span></div><div><b>{new Set(unplaced.map(x=>x.teacherId)).size}</b><span>Преподавателей</span></div></div>
-      <div className="notice">На экране действуют фильтры. Кнопка Excel выгружает <b>все недели, всех преподавателей и все группы</b> независимо от фильтров, включая листы «По неделям», «По группам», «По преподавателям», «Итоги».</div>
+      <div className="actual-hours-stats"><div><b>{sum(unplaced,'unplaced')}</b><span>Ак. часов не расставлено</span></div><div><b>{sum(unplaced,'unplaced')/2}</b><span>Пар по строкам нагрузки</span></div><div><b>{new Set(unplaced.map(x=>x.groupId)).size}</b><span>Групп</span></div><div><b>{new Set(unplaced.map(x=>x.teacherId)).size}</b><span>Преподавателей</span></div><div><b>{sum(filteredOutside,'hours')}</b><span>Вне графика, ак. ч. (отдельно)</span></div></div>
+      <div className="notice">На экране действуют фильтры. Кнопка Excel выгружает <b>все недели, всех преподавателей и все группы</b> независимо от фильтров, включая отдельные листы «Вне графика», «Вне графика по группам» и «Вне графика по препод.».</div>
       <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Неделя</th><th>Даты</th><th>Группа</th><th>Преподаватель</th><th>Дисциплина</th><th>Вид</th><th>Не расставлено, пар</th><th>Ак. ч.</th></tr></thead><tbody>
         {unplaced.slice(0,300).map(r=><tr key={`${r.loadId}-${r.week}`}><td><b>{r.week}</b></td><td>{labelRange(r)}</td><td>{r.group}</td><td>{r.teacher}{r.receivedFrom&&<div className="muted">Получено от {r.receivedFrom}</div>}</td><td>{r.subject}{r.subgroup?` / п/г ${r.subgroup}`:''}</td><td>{r.type}</td><td>{r.unplaced/2}</td><td><b>{r.unplaced}</b></td></tr>)}
         {!unplaced.length&&<tr><td colSpan={8}>По выбранным фильтрам нет нерасставленных занятий.</td></tr>}
       </tbody></table></div>
       {unplaced.length>300&&<p className="muted">Показаны первые 300 строк из {unplaced.length}. Excel содержит полный список без ограничений.</p>}
+      <h3 style={{marginTop:20}}>Вне графика — отдельно от нерасставленной нагрузки</h3>
+      <p className="muted">Пары, для которых в графике на эту неделю стоит 0. В Excel включены и уже размещённые, и неразмещённые карточки.</p>
+      <div className="actual-hours-table-wrap"><table className="actual-hours-table"><thead><tr><th>Неделя</th><th>Группа</th><th>Преподаватель</th><th>Дисциплина</th><th>Статус</th><th>Пар</th><th>Ак. ч.</th></tr></thead><tbody>
+        {filteredOutside.slice(0,300).map(r=><tr key={`${r.instId}-${r.week}`}><td>{r.week}</td><td>{r.groups.join(', ')}</td><td>{r.teachers.join(', ')}</td><td>{r.subject}</td><td>{r.status}</td><td>{r.units}</td><td><b>{r.hours}</b></td></tr>)}
+        {!filteredOutside.length&&<tr><td colSpan={7}>Занятий вне графика по выбранным фильтрам нет.</td></tr>}
+      </tbody></table></div>
+      {filteredOutside.length>300&&<p className="muted">Показаны первые 300 карточек вне графика. В Excel — все.</p>}
     </>}
     {(kind==='gph'||kind==='all')&&<>
       {kind==='gph'&&<div className="notice">Проект акта можно сформировать по любому преподавателю, даже если в справочнике ещё не выбран тип «ГПХ». Сейчас преподавателей с отмеченным типом «ГПХ»: {gphTeachers.length}. Для подписания необходимо подтвердить фактическое проведение занятий и исключить двойной учёт потоков.</div>}
